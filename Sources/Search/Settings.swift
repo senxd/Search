@@ -239,7 +239,7 @@ struct SettingsPanel: View {
                 }
             }
             Rule()
-            Line("Tabs show", "Beside the title, and on a pinned square") {
+            Line("Tabs show", "The mark beside a loose tab's title — pinned tabs always wear the site's icon; a spinner stands in while the page loads") {
                 Segmented(options: Glyph.allCases.map { ($0, $0.title) }, selection: $prefs.glyph)
             }
             Rule()

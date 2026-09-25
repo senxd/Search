@@ -411,6 +411,7 @@ final class Bench {
             out["peeking"] = browser.peeking
             out["sideHides"] = browser.prefs.sideHides
             out["lightsHidden"] = Fold.titlebar?.isHidden ?? false
+            out["groups"] = groupList(browser)
             answer(out)
 
         case "press":
@@ -548,6 +549,28 @@ final class Bench {
                 }
                 return
             }
+            if request["right"] as? Bool == true {
+                // A right press on a group's chip, handed straight to the
+                // view that catches the right button over it (GroupMenuCatch
+                // in GroupMenu.swift) — a probe's window is in the back, and
+                // the menu it raises is built but never popped, so the
+                // answer is what the menu would have said.
+                guard Store.testing else { answer(["error": "hit … right only works on a --test run"]); return }
+                func catcher(in view: NSView) -> NSView? {
+                    for sub in view.subviews.reversed() { if let found = catcher(in: sub) { return found } }
+                    guard String(reflecting: type(of: view)).contains("GroupMenuCatch") else { return nil }
+                    return view.convert(view.bounds, to: nil).contains(point) ? view : nil
+                }
+                guard let target = catcher(in: frame) else { answer(["error": "no group's chip there"]); return }
+                guard let down = NSEvent.mouseEvent(
+                    with: .rightMouseDown, location: point, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1
+                ) else { answer(["error": "no event"]); return }
+                target.rightMouseDown(with: down)
+                answer(["menu": GroupMenu.shown.map(describeMenu) ?? []])
+                return
+            }
             if request["double"] as? Bool == true {
                 // A double-click there, handed to the view under it — through
                 // the window it would never arrive, the probe being in the
@@ -586,6 +609,22 @@ final class Bench {
             else { answer(["error": "place needs a tab id and an index"]); return }
             browser.move(tab, to: to)
             answer(["at": browser.tabs.firstIndex { $0.id == tab.id } ?? -1])
+
+        case "pin":
+            // Pinning carries the tab into the pinned block at the head of
+            // the row, which the bench never does to someone using it: only
+            // on a SEARCH_PROBE run.
+            guard Store.testing else {
+                answer(["error": "pin only works on a --test run — it would rearrange your row"])
+                return
+            }
+            guard let tab = find(request, in: browser) else { answer(missing(request)); return }
+            if request["on"] as? Bool ?? true { browser.pin(tab) } else { browser.unpin(tab) }
+            var out = describe(tab)
+            out["pinned"] = tab.pin != nil
+            out["pin"] = tab.pin ?? ""
+            out["at"] = browser.tabs.firstIndex { $0.id == tab.id } ?? -1
+            answer(out)
 
         case "film":
             // The whole window, title bar and lights included, drawn every few
@@ -750,6 +789,134 @@ final class Bench {
                 }
             }
 
+        case "group":
+            // The tab groups, from the shell: made, named, filled, folded,
+            // bookmarked, closed, sent to a space. Test runs only — it
+            // rearranges your row.
+            guard Store.testing else {
+                answer(["error": "group only works on a --test run — it would rearrange your row"])
+                return
+            }
+            let noGroup = ["error": "no such group — see group list"]
+            switch request["action"] as? String ?? "list" {
+            case "list":
+                answer([
+                    "groups": groupList(browser, members: true),
+                    // The flattened row the bars draw — a folded group is
+                    // its chip alone, an open one chip then members.
+                    "items": browser.visibleItems.map(\.id),
+                ])
+            case "new":
+                guard let tab = find(request, in: browser) else { answer(missing(request)); return }
+                guard let group = browser.createGroup(from: tab) else {
+                    answer(["error": "not groupable — pinned or already in a group"])
+                    return
+                }
+                if let name = request["name"] as? String, !name.isEmpty {
+                    browser.renameGroup(group.id, to: name)
+                }
+                answer(["groups": groupList(browser)])
+            case "add":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                guard let tab = find(request, in: browser) else { answer(missing(request)); return }
+                browser.add(tab, to: group.id)
+                answer(["groups": groupList(browser)])
+            case "out":
+                guard let tab = find(request, in: browser) else { answer(missing(request)); return }
+                browser.removeFromGroup(tab)
+                answer(["groups": groupList(browser)])
+            case "fold":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                // on folds it to its chip; off opens it again. No `on` at
+                // all just turns it over.
+                if let on = request["on"] as? Bool {
+                    if browser.groups.first(where: { $0.id == group.id })?.expanded == on {
+                        browser.toggleGroup(group.id)
+                    }
+                } else {
+                    browser.toggleGroup(group.id)
+                }
+                answer(["groups": groupList(browser)])
+            case "rename":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.renameGroup(group.id, to: request["name"] as? String ?? "")
+                answer(["groups": groupList(browser)])
+            case "renameui":
+                // The chip's name field, up (`renameui G`) or down (`renameui`).
+                if let ref = request["group"], !(ref as? String ?? "").isEmpty {
+                    guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                    browser.beginGroupRename(group.id)
+                } else {
+                    browser.endGroupRename()
+                }
+                answer([
+                    "groups": groupList(browser),
+                    "renaming": browser.renamingGroup?.uuidString.lowercased() ?? "",
+                ])
+            case "colour":
+                guard let group = findGroup(request, in: browser), let colour = request["colour"] as? Int
+                else { answer(["error": "colour needs a group and a number"]); return }
+                browser.colourGroup(group.id, with: colour)
+                answer(["groups": groupList(browser)])
+            case "icon":
+                guard let group = findGroup(request, in: browser), let icon = request["icon"] as? String
+                else { answer(["error": "icon needs a group and a symbol name"]); return }
+                browser.iconGroup(group.id, to: icon)
+                answer(["groups": groupList(browser)])
+            case "newtab":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.newTabInGroup(group.id)
+                answer(["groups": groupList(browser), "tab": browser.active.map { Bench.short($0) } ?? ""])
+            case "move":
+                guard let group = findGroup(request, in: browser), let index = request["index"] as? Int
+                else { answer(["error": "move needs a group and an index"]); return }
+                browser.moveGroup(group.id, toTabIndex: index)
+                answer(["groups": groupList(browser), "items": browser.visibleItems.map(\.id)])
+            case "ungroup":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.ungroup(group.id)
+                answer(["groups": groupList(browser)])
+            case "close":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.closeGroup(group.id)
+                answer(["groups": groupList(browser), "tabs": browser.tabs.count])
+            case "reopen":
+                browser.reopen()
+                answer(["groups": groupList(browser), "tabs": browser.tabs.count])
+            case "bookmark":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.bookmarkGroup(group.id, named: request["name"] as? String ?? "")
+                answer(["groups": groupList(browser), "bookmarks": browser.bookmarks.count])
+            case "space":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.moveGroupToNewSpace(group.id)
+                answer([
+                    "groups": groupList(browser),
+                    "spaces": browser.spaces.map(\.name),
+                    "current": browser.space.name,
+                    "tabs": browser.tabs.count,
+                ])
+            case "menu":
+                // The menu a chip's right-click builds, described — and its
+                // hand-made views drawn to a picture, since a menu itself
+                // can't be drawn off screen but its views can.
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                let menu = GroupMenu.make(for: browser, group: group)
+                var out: [String: Any] = ["items": describeMenu(menu)]
+                if let path = request["path"] as? String, !path.isEmpty {
+                    guard let data = menuPicture(menu)?.representation(using: .png, properties: [:]) else {
+                        answer(["error": "nothing drawn"]); return
+                    }
+                    do {
+                        try data.write(to: URL(fileURLWithPath: path))
+                        out["saved"] = path
+                    } catch { out["error"] = error.localizedDescription }
+                }
+                answer(out)
+            default:
+                answer(["error": "unknown group action — list, new, add, out, fold, rename, renameui, colour, icon, newtab, move, ungroup, close, reopen, bookmark, space, menu"])
+            }
+
         case "ui":
             // Open or close the app's own panels, to reproduce what a person
             // did without a person.
@@ -785,7 +952,7 @@ final class Bench {
 
         default:
             answer(["error": "unknown command “\(verb)”", "commands": [
-                "tabs", "open", "go", "close", "wait", "sleep", "select", "text", "eval", "click", "type", "submit", "shot", "probe", "key", "resize", "hit", "film", "place", "space", "strip", "column", "ui",
+                "tabs", "open", "go", "close", "wait", "sleep", "select", "text", "eval", "click", "type", "submit", "shot", "probe", "key", "resize", "hit", "film", "place", "pin", "space", "group", "strip", "column", "ui",
             ]])
         }
     }
@@ -910,6 +1077,9 @@ final class Bench {
             "url": tab.address?.absoluteString ?? "",
             "title": tab.title,
             "name": tab.name ?? "",
+            "group": tab.groupID
+                .flatMap { id in browser?.groups.first { $0.id == id } }
+                .map { browser?.groupTitle($0) ?? "" } ?? "",
             "loading": tab.loading,
             "hollow": tab.hollow,
             "view": tab.built?.url?.absoluteString ?? "",
@@ -917,6 +1087,97 @@ final class Bench {
             "active": tab.id == browser?.activeID,
             "asleep": tab.asleep,
         ]
+    }
+
+    /// The groups as `probe` and every `group` answer report them; `list`
+    /// adds each one's member tabs.
+    private func groupList(_ browser: Browser, members: Bool = false) -> [[String: Any]] {
+        browser.orderedGroups.map { group in
+            var out: [String: Any] = [
+                "id": group.id.uuidString.lowercased(),
+                "title": browser.groupTitle(group),
+                "colour": group.colour,
+                "icon": group.icon,
+                "expanded": group.expanded,
+                "count": browser.groupCount(group),
+            ]
+            if members {
+                out["tabs"] = browser.tabs.filter { $0.groupID == group.id }.map(Bench.short)
+            }
+            return out
+        }
+    }
+
+    /// A menu's items as plain data — its titles, which are views or hold a
+    /// submenu — so the bench can say what a right-click would have shown
+    /// without a menu ever going up on anyone's screen.
+    private func describeMenu(_ menu: NSMenu) -> [[String: Any]] {
+        menu.items.map { item in
+            var out: [String: Any] = ["title": item.title, "enabled": item.isEnabled]
+            if item.isSeparatorItem { out["title"] = "—" }
+            if let view = item.view { out["view"] = String(reflecting: type(of: view)) }
+            if let submenu = item.submenu { out["submenu"] = describeMenu(submenu) }
+            return out
+        }
+    }
+
+    /// The picture box is flipped so a stack laid out from the top lands
+    /// that way in the bitmap too — cacheDisplay draws an unflipped view
+    /// bottom-first, which is how the hosting views' pictures elsewhere in
+    /// this file already come out the right way up. Its ground is drawn,
+    /// not a layer's: a cgColor resolves once against whatever appearance
+    /// happens to be ambient, while drawing resolves with the window's.
+    private final class Flipped: NSView {
+        override var isFlipped: Bool { true }
+        override func draw(_: NSRect) { NSColor.controlBackgroundColor.setFill(); bounds.fill() }
+    }
+
+    /// A menu's custom views stacked into one picture, for `group menu` —
+    /// the closest thing to drawing the menu itself, which can't be done
+    /// off screen. The views leave the menu for the drawing; it's a probe's
+    /// menu, never shown.
+    private func menuPicture(_ menu: NSMenu) -> NSBitmapImageRep? {
+        var views: [NSView] = []
+        for item in menu.items + (menu.items.compactMap(\.submenu).flatMap(\.items)) {
+            guard let view = item.view else { continue }
+            // Take the view away from its item before moving it: an item
+            // watches its view's frame and puts it back — a frame set while
+            // the item still owns it doesn't stick.
+            item.view = nil
+            views.append(view)
+        }
+        guard !views.isEmpty else { return nil }
+        let width: CGFloat = 240
+        let height = views.reduce(CGFloat(10)) { $0 + $1.frame.height + 10 }
+        let box = Flipped(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        var y: CGFloat = 10
+        for view in views {
+            // Reparent first, then place — and put autoresizing back on the
+            // frame: a menu lays its item views out with constraints, so a
+            // frame set while the view is still the menu's doesn't stick.
+            box.addSubview(view)
+            view.translatesAutoresizingMaskIntoConstraints = true
+            view.frame = NSRect(x: 0, y: y, width: width, height: view.frame.height)
+            y += view.frame.height + 10
+        }
+        let window = NSWindow(contentRect: box.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.appearance = NSApp.effectiveAppearance
+        window.contentView = box
+        box.layoutSubtreeIfNeeded()
+        guard let picture = box.bitmapImageRepForCachingDisplay(in: box.bounds) else { return nil }
+        box.cacheDisplay(in: box.bounds, to: picture)
+        return picture
+    }
+
+    /// A `group` argument: a 1-based number in `group list` order, or the
+    /// first characters of a group's id, as `id` is for tabs.
+    private func findGroup(_ request: [String: Any], in browser: Browser) -> TabGroup? {
+        let ref = ((request["group"] as? String) ?? (request["group"] as? Int).map(String.init))?.lowercased() ?? ""
+        guard !ref.isEmpty else { return nil }
+        if let n = Int(ref), browser.orderedGroups.indices.contains(n - 1) {
+            return browser.orderedGroups[n - 1]
+        }
+        return browser.groups.first { $0.id.uuidString.lowercased().hasPrefix(ref) }
     }
 
     static func short(_ tab: Tab) -> String {

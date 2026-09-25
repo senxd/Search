@@ -237,6 +237,10 @@ final class Tab: ObservableObject, Identifiable {
     /// is all you need for the five or six pages you keep open all day.
     @Published var pin: String?
 
+    /// The group it sits in, when it does. Never on a pinned tab: a pin is
+    /// already a place kept for a page, which is all a group is.
+    @Published var groupID: UUID?
+
     /// A name you gave it, in place of whatever the page calls itself. It
     /// stays through navigation: a tab you named is a tab you are keeping for
     /// a job, not for a page.

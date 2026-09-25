@@ -9,6 +9,9 @@ import Combine
 @MainActor
 final class Browser: NSObject, ObservableObject {
     @Published private(set) var tabs: [Tab] = []
+    /// The named runs inside the row. Written here alone — the "tab groups"
+    /// extension below is the same file, so the setter stays private.
+    @Published private(set) var groups: [TabGroup] = []
     @Published var activeID: Tab.ID? {
         didSet {
             // The tab just left is the tab just looked at. Whether a tab has
@@ -502,6 +505,13 @@ final class Browser: NSObject, ObservableObject {
 
     func pin(_ tab: Tab) {
         if tab.pin == nil {
+            // Out of any group first: a pin is a place kept of its own, and
+            // the row needs telling since clearing that alone moves nothing.
+            if tab.groupID != nil {
+                tab.groupID = nil
+                objectWillChange.send()
+                removeEmptyGroups()
+            }
             tab.pin = tab.monogram
             // Pinned tabs live at the head of the row, in the order they were
             // pinned, so their letters never move under your hand.
@@ -565,6 +575,11 @@ final class Browser: NSObject, ObservableObject {
     /// Set while that field is being used to name the tab rather than to go
     /// somewhere: the same field, the same keys, a different thing at the end.
     @Published private(set) var renamingTab = false
+
+    /// The group whose chip is showing its name field instead of its title —
+    /// same lifetime as `editingPin`: set when the field goes up, cleared
+    /// when it comes down or the group goes away.
+    @Published private(set) var renamingGroup: UUID?
 
     func beginTabEdit(_ tab: Tab) {
         guard let url = tab.address else {
@@ -660,8 +675,16 @@ final class Browser: NSObject, ObservableObject {
         let url: URL
         let title: String
         let index: Int
+        /// The group the tab was in, so reopening can put it back there —
+        /// when the group is still alive to take it.
+        var groupID: UUID?
+        /// A whole group closed at once: reopening restores every member.
+        var closedGroup: ClosedGroup?
 
-        var label: String { title.isEmpty ? Address.pretty(url) : title }
+        var label: String {
+            if closedGroup != nil { return "Group: \(title)" }
+            return title.isEmpty ? Address.pretty(url) : title
+        }
     }
 
     private var bag = Set<AnyCancellable>()
@@ -676,6 +699,9 @@ final class Browser: NSObject, ObservableObject {
     private var hush: DispatchWorkItem?
     private var zoomShown = 100
     private var remembering = false
+    /// While a whole group is closing, its members don't each leave a ghost
+    /// — the group leaves a single one that can bring all of them back.
+    private var burying = false
     /// Spaces (see Spaces.swift): every one, the one on screen, and the
     /// rows of tabs of the others.
     @Published var spaces = Spaces.read() {
@@ -811,12 +837,17 @@ final class Browser: NSObject, ObservableObject {
             prepare(tab)
             tab.restore(url: url, title: entry.title, name: entry.name)
             tab.pin = entry.pin
+            if entry.pin == nil { tab.groupID = entry.groupID }
             tabs.append(tab)
         }
         guard !tabs.isEmpty else {
             adopt(Tab())
             return
         }
+        // The groups the restored tabs still name; a tab naming one that
+        // isn't here is simply not in a group.
+        groups = (saved.groups ?? []).filter { group in tabs.contains { $0.groupID == group.id } }
+        Browser.normalizeGroups(&tabs, groups: groups)
         let here = min(max(0, saved.active), tabs.count - 1)
         activeID = tabs[here].id
         // Only the one you were looking at actually loads.
@@ -915,23 +946,29 @@ final class Browser: NSObject, ObservableObject {
     }
 
     func writeSession(now: Bool = false) {
+        let entries = tabs.compactMap { tab -> Session.Entry? in
+            guard !tab.shy, !tab.bench else { return nil }
+            // A sleeping tab holds its address in `pending`; asking for
+            // it there too means a pin can never be written out of
+            // existence by whatever its web view happens to be showing.
+            guard let url = tab.pending ?? tab.address,
+                  url.scheme?.hasPrefix("http") == true
+            else { return nil }
+            return Session.Entry(
+                url: url.absoluteString, title: tab.title, pin: tab.pin,
+                name: tab.name, groupID: tab.groupID
+            )
+        }
+        // A group whose members are all shy or bench leaves nothing behind:
+        // only ids a kept entry still names are worth writing.
+        let kept = Set(entries.compactMap(\.groupID))
         Session.write(
             now: now,
             space: spaceID,
             .init(
-                tabs: tabs.compactMap { tab in
-                    guard !tab.shy, !tab.bench else { return nil }
-                    // A sleeping tab holds its address in `pending`; asking for
-                    // it there too means a pin can never be written out of
-                    // existence by whatever its web view happens to be showing.
-                    guard let url = tab.pending ?? tab.address,
-                          url.scheme?.hasPrefix("http") == true
-                    else { return nil }
-                    return Session.Entry(
-                        url: url.absoluteString, title: tab.title, pin: tab.pin, name: tab.name
-                    )
-                },
-                active: tabs.firstIndex { $0.id == activeID } ?? 0
+                tabs: entries,
+                active: tabs.firstIndex { $0.id == activeID } ?? 0,
+                groups: orderedGroups.filter { kept.contains($0.id) }
             )
         )
     }
@@ -966,8 +1003,9 @@ final class Browser: NSObject, ObservableObject {
         // Never two empty tabs. One already open anywhere in the row comes to
         // its end and is the one opened, with whatever was typed into it and
         // never gone to cleared away — a row of identical empty tabs is what
-        // pressing ⌘T twice, or holding it, used to leave.
-        if let blank = tabs.last(where: { $0.isBlank && !$0.bench && !$0.shy }) {
+        // pressing ⌘T twice, or holding it, used to leave. A blank inside a
+        // group is the group's — ⌘T here is not how you leave it.
+        if let blank = tabs.last(where: { $0.isBlank && !$0.bench && !$0.shy && $0.groupID == nil }) {
             if let end = tabs.indices.last, tabs.firstIndex(where: { $0.id == blank.id }) != end {
                 move(blank, to: end)
             }
@@ -1000,6 +1038,7 @@ final class Browser: NSObject, ObservableObject {
         let url = Browser.page(url)
         let page = Tab(configuration: Browser.extensionConfiguration(for: url))
         prepare(page)
+        page.groupID = tab.groupID
         tabs[index] = page
         page.go(to: url)
         if activeID == tab.id { activeID = page.id; editing = false }
@@ -1009,6 +1048,9 @@ final class Browser: NSObject, ObservableObject {
         cancelTabEdit()
         summoning = false
         suggesting = nil
+        // Picking a tab inside a folded group opens the fold — a selection
+        // you can't see isn't one.
+        if let group = group(for: tab), !group.expanded { toggleGroup(group.id) }
         guard tab.id != activeID else { return }
         // Coming back to the tab whose video is out brings it home first, so
         // it is never lifted and landed in the same breath.
@@ -1058,7 +1100,10 @@ final class Browser: NSObject, ObservableObject {
         }
 
         if tabs.count == 1 {
-            if tab.isBlank {
+            // A blank last tab closes the window — except mid-burial, where
+            // closeGroup is still walking its members and the row needs
+            // somewhere to land: it gets the same fresh blank instead.
+            if tab.isBlank && !burying {
                 NSApp.keyWindow?.performClose(nil)
             } else {
                 let fresh = Tab()
@@ -1068,6 +1113,7 @@ final class Browser: NSObject, ObservableObject {
                 tabs = [fresh]
                 activeID = fresh.id
                 typed = ""
+                removeEmptyGroups()
             }
             return
         }
@@ -1075,6 +1121,7 @@ final class Browser: NSObject, ObservableObject {
         remember(tab, at: index)
         tab.close()
         tabs.remove(at: index)
+        removeEmptyGroups()
         if activeID == tab.id {
             // The neighbour on the right, or the last one if there is no
             // right — through select(), same as everywhere else you land on
@@ -1094,6 +1141,7 @@ final class Browser: NSObject, ObservableObject {
             close(tab)
         }
         select(keep)
+        removeEmptyGroups()
     }
 
     /// A link let go of over the tabs becomes a tab among them.
@@ -1126,10 +1174,62 @@ final class Browser: NSObject, ObservableObject {
     /// One of them by name, from the History menu.
     func reopen(_ ghost: Ghost) {
         ghosts.removeAll { $0.id == ghost.id }
+        // A group closed whole comes back whole — the group, then every tab
+        // that was in it, where the run began.
+        if let closed = ghost.closedGroup {
+            var group = closed.group
+            // Its id was unique when it closed; if a group wearing it exists
+            // anyway — the same ghost reopened twice — this one is new.
+            if groups.contains(where: { $0.id == group.id }) { group.id = UUID() }
+            var made: [Tab] = []
+            for entry in closed.entries {
+                guard let url = URL(string: entry.url) else { continue }
+                let tab = Tab()
+                prepare(tab)
+                tab.restore(url: url, title: entry.title, name: entry.name)
+                tab.groupID = group.id
+                made.append(tab)
+            }
+            guard !made.isEmpty else { return }
+            groups.append(group)
+            // Not inside somebody else's run — that would split it. Where the
+            // spot fell mid-run, the group lands just past the run's end, the
+            // same call moveGroup makes for a drop there.
+            var at = min(max(pinnedCount, ghost.index), tabs.count)
+            if at > 0, at < tabs.count,
+               let owner = tabs[at - 1].groupID, tabs[at].groupID == owner {
+                while at < tabs.count, tabs[at].groupID == owner { at += 1 }
+            }
+            tabs.insert(contentsOf: made, at: at)
+            select(made[0])
+            // select() opens a fold to reveal what was picked — put it back:
+            // a group comes back the way it went away.
+            if !group.expanded { toggleGroup(group.id) }
+            return
+        }
         let tab = Tab()
         prepare(tab)
         leaving()
-        tabs.insert(tab, at: min(ghost.index, tabs.count))
+        // Never inside the pinned block — a ghost was always a loose tab.
+        let at = min(max(pinnedCount, ghost.index), tabs.count)
+        tabs.insert(tab, at: at)
+        // Back into its group, at the run's end — when the group outlived it.
+        // Failing that, a landing strictly inside another run joins that run:
+        // the same call a drag to that spot makes, and what keeps every run
+        // in one piece. A fold it lands in opens — the tab is about to be on
+        // screen, and can't be hidden inside a chip.
+        if let id = ghost.groupID, groups.contains(where: { $0.id == id }) {
+            add(tab, to: id)
+        } else {
+            let before = at > 0 ? tabs[at - 1].groupID : nil
+            let after = at + 1 < tabs.count ? tabs[at + 1].groupID : nil
+            if let shared = before, shared == after {
+                tab.groupID = shared
+                if let fold = groups.firstIndex(where: { $0.id == shared && !$0.expanded }) {
+                    groups[fold].expanded = true
+                }
+            }
+        }
         activeID = tab.id
         editing = false
         typed = ""
@@ -1137,8 +1237,8 @@ final class Browser: NSObject, ObservableObject {
     }
 
     private func remember(_ tab: Tab, at index: Int) {
-        guard !tab.shy, let url = tab.address else { return }
-        ghosts.append(Ghost(url: url, title: tab.title, index: index))
+        guard !burying, !tab.shy, let url = tab.address else { return }
+        ghosts.append(Ghost(url: url, title: tab.title, index: index, groupID: tab.groupID))
         if ghosts.count > 12 { ghosts.removeFirst() }
     }
 
@@ -1153,6 +1253,24 @@ final class Browser: NSObject, ObservableObject {
         if tab.pin != nil, index >= pinned { return }
         if tab.pin == nil, index < pinned { return }
         tabs.move(fromOffsets: IndexSet(integer: here), toOffset: index > here ? index + 1 : index)
+        // A moved tab may change groups below; the row draws from
+        // `visibleItems`, not `tabs` alone, so it needs telling directly.
+        objectWillChange.send()
+        // Membership is re-read from where it landed: still touching one of
+        // its own it keeps its group; dropped strictly inside another run it
+        // joins that one; anywhere else it belongs to nothing. This is what
+        // keeps a group one unbroken run — a run is only ever joined, here,
+        // where it already wraps the dropped tab.
+        let before = index > 0 ? tabs[index - 1].groupID : nil
+        let after = index + 1 < tabs.count ? tabs[index + 1].groupID : nil
+        if let own = tab.groupID, own == before || own == after {
+            // Still home.
+        } else if let other = before, other == after {
+            tab.groupID = other
+        } else {
+            tab.groupID = nil
+        }
+        removeEmptyGroups()
         rememberSession()
     }
 
@@ -1179,6 +1297,9 @@ final class Browser: NSObject, ObservableObject {
         prepare(tab)
         let here = atEnd ? nil : tabs.firstIndex { $0.id == activeID }
         tabs.insert(tab, at: here.map { $0 + 1 } ?? tabs.count)
+        // Opened beside a grouped tab, it belongs to the group it came from.
+        // At the end of the row it belongs to nothing, whatever is there.
+        if !atEnd, let here { tab.groupID = tabs[here].groupID }
         tab.go(to: url)
         if foreground {
             leaving()
@@ -1199,6 +1320,7 @@ final class Browser: NSObject, ObservableObject {
         guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
         let fresh = Tab(bench: tab.bench, configuration: Browser.extensionConfiguration(for: url))
         prepare(fresh)
+        fresh.groupID = tab.groupID
         let wasActive = activeID == tab.id
         tabs[index] = fresh
         fresh.go(to: url)
@@ -1316,17 +1438,26 @@ final class Browser: NSObject, ObservableObject {
             prepare(tab)
             tab.restore(url: url, title: entry.title, name: entry.name)
             tab.pin = entry.pin
+            if entry.pin == nil { tab.groupID = entry.groupID }
             row.append(tab)
         }
+        // The groups the row still names; a tab naming one that isn't here
+        // is simply not in a group — same rule restoreSession applies.
+        let groups = (saved.groups ?? []).filter { group in row.contains { $0.groupID == group.id } }
+        Browser.normalizeGroups(&row, groups: groups)
         let active = row.indices.contains(saved.active) ? row[saved.active].id : row.first?.id
-        return Parked(tabs: row, active: active)
+        return Parked(tabs: row, active: active, groups: groups)
     }
 
     /// Another space's row put on screen in place of this one (see
     /// Spaces.swift) — empty, for one that restores its own.
-    func showRow(_ row: [Tab], active: Tab.ID?) {
+    func showRow(_ row: [Tab], active: Tab.ID?, groups: [TabGroup] = []) {
         tabs = row
+        self.groups = groups
         activeID = active ?? row.first?.id
+        if let naming = renamingGroup, !groups.contains(where: { $0.id == naming }) {
+            renamingGroup = nil
+        }
     }
 
     private func adopt(_ tab: Tab) {
@@ -1690,6 +1821,345 @@ final class Browser: NSObject, ObservableObject {
     func forward() { active?.forward() }
 }
 
+// MARK: - tab groups
+
+// A group is its tabs, in a run. Everything here keeps that true: tabs are
+// never reordered without the run closing ranks, and a group with no
+// members left is let go rather than left floating over nothing.
+
+extension Browser {
+    /// The groups in the order their first member sits in the row — the
+    /// order both bars and the bench list them in.
+    var orderedGroups: [TabGroup] {
+        var seen: Set<UUID> = []
+        var found: [TabGroup] = []
+        for tab in tabs {
+            guard let id = tab.groupID, seen.insert(id).inserted,
+                  let group = groups.first(where: { $0.id == id })
+            else { continue }
+            found.append(group)
+        }
+        return found
+    }
+
+    /// The row flattened to what is actually drawn. A group contributes its
+    /// chip where its first member sits and, while it is open, each member
+    /// in place; folded, the chip is all of it.
+    var visibleItems: [TabItem] {
+        var out: [TabItem] = []
+        var headed: Set<UUID> = []
+        for tab in tabs {
+            guard let group = group(for: tab) else {
+                out.append(.tab(tab))
+                continue
+            }
+            if headed.insert(group.id).inserted { out.append(.group(group)) }
+            if group.expanded { out.append(.tab(tab)) }
+        }
+        return out
+    }
+
+    func group(for tab: Tab) -> TabGroup? {
+        guard let id = tab.groupID else { return nil }
+        return groups.first { $0.id == id }
+    }
+
+    /// What the group is called: its name, or "Group N" — its number among
+    /// the groups still unnamed, in row order.
+    func groupTitle(_ group: TabGroup) -> String {
+        if let name = group.name, !name.isEmpty { return name }
+        let unnamed = orderedGroups.filter { $0.name?.isEmpty != false }
+        guard let at = unnamed.firstIndex(where: { $0.id == group.id }) else { return "Group" }
+        return "Group \(at + 1)"
+    }
+
+    func groupCount(_ group: TabGroup) -> Int {
+        tabs.reduce(0) { $0 + ($1.groupID == group.id ? 1 : 0) }
+    }
+
+    /// Whether the tab on screen is in this group — for the mark a chip
+    /// wears while you are looking at one of its pages.
+    func groupHasActiveTab(_ group: TabGroup) -> Bool {
+        active?.groupID == group.id
+    }
+
+    /// The id a tab contributes to the strip's scroll-reveal: its own, or
+    /// while its group is folded, the chip's — the only place it has.
+    func visibleID(for tab: Tab) -> String {
+        if let group = group(for: tab), !group.expanded {
+            return TabItem.group(group).id
+        }
+        return TabItem.tab(tab).id
+    }
+
+    /// The tab becomes a group of one. Only a loose tab not already in one
+    /// qualifies — a pin is a place of its own, and a tab in a group moves
+    /// between groups with `add`.
+    @discardableResult
+    func createGroup(from tab: Tab) -> TabGroup? {
+        guard tab.groupID == nil, tab.pin == nil else { return nil }
+        let group = TabGroup(colour: groups.count % Groups.colours.count, icon: "folder")
+        groups.append(group)
+        tab.groupID = group.id
+        objectWillChange.send()
+        rememberSession()
+        return group
+    }
+
+    /// The tab into the group, at the end of its run — the one place it can
+    /// land without the run breaking, and the group opens to show it.
+    func add(_ tab: Tab, to groupID: UUID) {
+        guard tab.groupID != groupID, tab.pin == nil,
+              let at = tabs.firstIndex(where: { $0.id == tab.id }),
+              groups.contains(where: { $0.id == groupID })
+        else { return }
+        // The run's end, the tab itself not counted: standing past that end
+        // already, it must not answer as its own destination — the run would
+        // stay split in two pieces wearing one id.
+        let last = tabs.lastIndex { $0.id != tab.id && $0.groupID == groupID }
+        tab.groupID = groupID
+        if let last, at != last + 1 {
+            tabs.move(fromOffsets: IndexSet(integer: at), toOffset: last + 1)
+        }
+        if let group = groups.firstIndex(where: { $0.id == groupID }) {
+            groups[group].expanded = true
+        }
+        objectWillChange.send()
+        // The group it left may have given its last member.
+        removeEmptyGroups()
+        rememberSession()
+    }
+
+    /// Out of its group — and out of the run, since a tab left standing
+    /// between the group's tabs would still look like one of them.
+    func removeFromGroup(_ tab: Tab) {
+        guard let id = tab.groupID else { return }
+        tab.groupID = nil
+        if let at = tabs.firstIndex(where: { $0.id == tab.id }),
+           let last = tabs.lastIndex(where: { $0.groupID == id }), at < last {
+            tabs.move(fromOffsets: IndexSet(integer: at), toOffset: last + 1)
+        }
+        objectWillChange.send()
+        removeEmptyGroups()
+        rememberSession()
+    }
+
+    func toggleGroup(_ id: UUID) {
+        guard let at = groups.firstIndex(where: { $0.id == id }) else { return }
+        groups[at].expanded.toggle()
+        rememberSession()
+    }
+
+    /// The chip's name field goes up; committing lands in `renameGroup`.
+    func beginGroupRename(_ id: UUID) {
+        guard groups.contains(where: { $0.id == id }) else { return }
+        renamingGroup = id
+    }
+
+    func endGroupRename() {
+        renamingGroup = nil
+    }
+
+    /// An empty name hands the group back its number. Applying one also
+    /// lowers the field it was typed into.
+    func renameGroup(_ id: UUID, to name: String) {
+        guard let at = groups.firstIndex(where: { $0.id == id }) else { return }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        groups[at].name = name.isEmpty ? nil : name
+        if renamingGroup == id { renamingGroup = nil }
+        rememberSession()
+    }
+
+    /// `colour` is an index into `Groups.colours`; out of range reads as
+    /// grey, so anything the palette keeps is accepted.
+    func colourGroup(_ id: UUID, with colour: Int) {
+        guard let at = groups.firstIndex(where: { $0.id == id }),
+              Groups.colours.indices.contains(colour)
+        else { return }
+        groups[at].colour = colour
+        rememberSession()
+    }
+
+    /// One of `Groups.icons`, or nothing happens — a name the list doesn't
+    /// have would draw nothing at all.
+    func iconGroup(_ id: UUID, to icon: String) {
+        guard let at = groups.firstIndex(where: { $0.id == id }),
+              Groups.icons.contains(icon)
+        else { return }
+        groups[at].icon = icon
+        rememberSession()
+    }
+
+    /// A fresh tab at the end of the group's run, selected — ⌘T inside a
+    /// group, in effect, with the same field raised.
+    func newTabInGroup(_ id: UUID) {
+        guard let group = groups.firstIndex(where: { $0.id == id }) else { return }
+        let tab = Tab()
+        prepare(tab)
+        tab.groupID = id
+        if let last = tabs.lastIndex(where: { $0.groupID == id }) {
+            tabs.insert(tab, at: last + 1)
+        } else {
+            tabs.append(tab)
+        }
+        groups[group].expanded = true
+        leaving()
+        activeID = tab.id
+        summoning = false
+        typed = ""
+        editing = false
+        focusRequest += 1
+        rememberSession()
+        if #available(macOS 15.4, *) { Extensions.shared.offerNewTabPage(into: tab) }
+    }
+
+    /// The tabs stay where they are; the group is gone.
+    func ungroup(_ id: UUID) {
+        guard groups.contains(where: { $0.id == id }) else { return }
+        for tab in tabs where tab.groupID == id { tab.groupID = nil }
+        groups.removeAll { $0.id == id }
+        if renamingGroup == id { renamingGroup = nil }
+        objectWillChange.send()
+        rememberSession()
+    }
+
+    /// Every member closed — landing on the nearest survivor by the same
+    /// logic ⌘W uses — and the group remembered as one ghost, so ⌘⇧T brings
+    /// back the whole thing rather than its last tab.
+    func closeGroup(_ id: UUID) {
+        guard let group = groups.first(where: { $0.id == id }) else { return }
+        let members = tabs.filter { $0.groupID == id }
+        let title = groupTitle(group)
+        let index = tabs.firstIndex { $0.groupID == id } ?? tabs.count
+        // The members that can come back, in row order — shy and never-kept
+        // tabs leave nothing, as they never do.
+        let entries = members.compactMap { tab -> Session.Entry? in
+            guard !tab.shy, let url = tab.pending ?? tab.address,
+                  url.scheme?.hasPrefix("http") == true
+            else { return nil }
+            return Session.Entry(
+                url: url.absoluteString, title: tab.title, pin: nil, name: tab.name
+            )
+        }
+        burying = true
+        for tab in members {
+            tab.groupID = nil
+            close(tab)
+        }
+        burying = false
+        groups.removeAll { $0.id == id }
+        if renamingGroup == id { renamingGroup = nil }
+        if !entries.isEmpty, let url = URL(string: entries[0].url) {
+            ghosts.append(Ghost(
+                url: url, title: title, index: index,
+                closedGroup: ClosedGroup(group: group, entries: entries)
+            ))
+            if ghosts.count > 12 { ghosts.removeFirst() }
+        }
+        writeSession(now: true)
+    }
+
+    /// The whole group as a folder of bookmarks, named as asked — the row
+    /// loses nothing; the bookmarks gain the set.
+    func bookmarkGroup(_ id: UUID, named name: String) {
+        guard let group = groups.first(where: { $0.id == id }) else { return }
+        let pages = tabs.filter { $0.groupID == id }.compactMap { tab -> Bookmark? in
+            guard !tab.shy, let url = tab.pending ?? tab.address,
+                  url.scheme?.hasPrefix("http") == true
+            else { return nil }
+            return .site(tab.name ?? tab.title, url)
+        }
+        guard !pages.isEmpty else {
+            announce("Nothing to save in \(groupTitle(group))")
+            return
+        }
+        bookmarks.insert(.folder(name.isEmpty ? groupTitle(group) : name, pages), into: nil)
+        announce("Saved \(pages.count) \(pages.count == 1 ? "page" : "pages") to bookmarks")
+    }
+
+    /// The group becomes a space of its own, named and wearing what the
+    /// group did, and is entered holding the same tab objects — web views
+    /// and all — rather than copies that would reload everything. Spaces
+    /// are the mechanism, so the switch is turned on rather than refused;
+    /// this menu item is how it is discovered.
+    func moveGroupToNewSpace(_ id: UUID) {
+        guard let group = groups.first(where: { $0.id == id }) else { return }
+        let members = tabs.filter { $0.groupID == id }
+        guard !members.isEmpty else { return }
+        if !prefs.usesSpaces { prefs.usesSpaces = true }
+        let made = Space(
+            id: UUID(), name: groupTitle(group), colour: 0,
+            icon: Spaces.icons.contains(group.icon) ? group.icon : freeIcon,
+            sharesSignIns: true
+        )
+        makingSpace = false
+        spaces.append(made)
+        Spaces.write(spaces)
+        // The members leave this row before enter() can park it with them —
+        // parked under the space being made, the switch finds them waiting
+        // as the row it shows.
+        let going = Set(members.map(\.id))
+        tabs.removeAll { going.contains($0.id) }
+        for tab in members { tab.groupID = nil }
+        groups.removeAll { $0.id == id }
+        if renamingGroup == id { renamingGroup = nil }
+        if !tabs.contains(where: { $0.id == activeID }) { activeID = tabs.last?.id }
+        parked[made.id] = Parked(tabs: members, active: members.first?.id)
+        switchSpace(to: made.id)
+    }
+
+    /// The whole run moved at once, as dragging its chip does. `index` is
+    /// the place the first member lands, counted over the row with the
+    /// group's own tabs lifted out — so 0 is first among the loose tabs, and
+    /// a run can never land among the pins.
+    func moveGroup(_ id: UUID, toTabIndex index: Int) {
+        let members = tabs.filter { $0.groupID == id }
+        guard !members.isEmpty else { return }
+        var rest = tabs.filter { $0.groupID != id }
+        var at = min(max(index, pinnedCount), rest.count)
+        // Dropped strictly inside another run would split it: land the
+        // group just past that run's end instead.
+        if at > 0, at < rest.count,
+           let neighbour = rest[at - 1].groupID, rest[at].groupID == neighbour {
+            while at < rest.count, rest[at].groupID == neighbour { at += 1 }
+        }
+        rest.insert(contentsOf: members, at: at)
+        tabs = rest
+        rememberSession()
+    }
+
+    /// A group with no tabs left in it is let go — otherwise it would only
+    /// be a chip floating over nothing.
+    private func removeEmptyGroups() {
+        let alive = Set(tabs.compactMap(\.groupID))
+        groups.removeAll { !alive.contains($0.id) }
+        if let naming = renamingGroup, !alive.contains(naming) { renamingGroup = nil }
+    }
+
+    /// A session file can be hand-edited into something the row never holds
+    /// live: groups scattered through it, ids naming nothing, pins wearing
+    /// membership. Walk the row once — a tab not pinned and naming a kept
+    /// group keeps it, anything else goes loose — and gather each group's
+    /// members into one unbroken run where its first member stood.
+    private static func normalizeGroups(_ row: inout [Tab], groups: [TabGroup]) {
+        let alive = Set(groups.map(\.id))
+        var emitted: Set<UUID> = []
+        var flat: [Tab] = []
+        flat.reserveCapacity(row.count)
+        for tab in row {
+            guard let id = tab.groupID, tab.pin == nil, alive.contains(id) else {
+                tab.groupID = nil
+                flat.append(tab)
+                continue
+            }
+            if emitted.insert(id).inserted {
+                flat.append(contentsOf: row.filter { $0.groupID == id })
+            }
+        }
+        row = flat
+    }
+}
+
 // MARK: - WebKit
 
 extension Browser: WKNavigationDelegate, WKUIDelegate {
@@ -1780,6 +2250,12 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         let tab = Tab(shy: tab(for: webView)?.shy ?? false, configuration: configuration)
         adopt(tab)
         tab.opener = from
+        // It landed at the row's end; if the page that opened it was the
+        // last thing in its group's run, the new tab grew out of the group.
+        if let from, let at = tabs.firstIndex(where: { $0.id == from }),
+           at + 2 == tabs.count {
+            tab.groupID = tabs[at].groupID
+        }
         activeID = tab.id
         editing = false
         // Returning the view is what makes it the target. WebKit loads the

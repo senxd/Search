@@ -39,10 +39,31 @@
                                        switch to the Nth, delete this one,
                                        two fingers DX points sideways over the column (hold: not let go yet),
                                        move this one to Nth
-    ./bench hit X Y [double|middle]    what a press at X Y (points from the window's top left) lands on,
+    ./bench group list                 test run: the groups, each with its member tabs
+    ./bench group new ID [NAME]        test run: a tab becomes a group of one, named if given
+    ./bench group add G ID             test run: a tab joins group G (its number in list, or an id prefix)
+    ./bench group out ID               test run: a tab leaves its group
+    ./bench group fold G on|off        test run: fold a group to its chip, or open it
+    ./bench group rename G NAME        test run: name a group (empty hands back its number)
+    ./bench group renameui [G]         test run: raise the chip's name field on G, or lower it
+    ./bench group colour G N           test run: a colour 0–7 — grey red orange yellow green blue purple magenta
+    ./bench group icon G SYM           test run: an SF Symbol from the group's list
+    ./bench group newtab G             test run: a fresh tab at the end of the group's run
+    ./bench group move G INDEX         test run: the whole run to INDEX among the row's other tabs
+    ./bench group ungroup G            test run: the group goes, its tabs stay
+    ./bench group close G              test run: close every member; "group reopen" brings it all back
+    ./bench group reopen               test run: reopen what last closed — a whole group comes back whole
+    ./bench group bookmark G [NAME]    test run: the group's tabs as a folder of bookmarks
+    ./bench group space G              test run: the group becomes a space of its own
+    ./bench group menu G [PATH]        test run: the menu a chip's right-click builds → its items,
+                                       and its hand-made views drawn to a PNG at PATH
+    ./bench hit X Y [double|middle|right]
+                                       what a press at X Y (points from the window's top left) lands on,
                                        and whether a drag from there would move the window;
-                                       double: test run, a double-click there (start the probe hidden)
+                                       double: test run, a double-click there (start the probe hidden);
+                                       right: test run, a right-click on a group's chip → the menu it builds
     ./bench place ID INDEX             put a tab at another place in the row
+    ./bench pin ID [on|off]            pin a tab to the head of the row, or take the pin off — --test runs only
     ./bench film peek|unpeek|fold PATH [N] [SECS]  the window drawn N times while it animates → PATH-00.png… — --test runs only
     ./bench ui KEY VALUE               settings/passwords/welcome/history/downloads/bookmarks/hidden on|off,
                                        look light|dark|system, sidebar on|off, spaces on|off, hides on|off,
@@ -188,13 +209,45 @@ def main(argv):
         elif args and args[0] == "release": request["action"] = "release"
         elif args and args[0] == "move" and len(args) == 2: request["action"], request["index"] = "move", int(args[1])
         elif args: sys.exit("usage: bench space [new NAME | go N | delete | swipe DX | hold DX | release | move N]")
+    elif verb == "group":
+        if not args or args[0] == "list": request["action"] = "list"
+        elif args[0] == "new" and len(args) >= 2:
+            request["action"], request["id"] = "new", args[1]
+            if len(args) > 2: request["name"] = " ".join(args[2:])
+        elif args[0] == "add" and len(args) == 3: request["action"], request["group"], request["id"] = "add", args[1], args[2]
+        elif args[0] == "out" and len(args) == 2: request["action"], request["id"] = "out", args[1]
+        elif args[0] == "fold" and len(args) == 3:
+            request["action"], request["group"], request["on"] = "fold", args[1], args[2] in ("on", "true", "1", "yes")
+        elif args[0] == "rename" and len(args) >= 2: request["action"], request["group"], request["name"] = "rename", args[1], " ".join(args[2:])
+        elif args[0] == "renameui":
+            request["action"] = "renameui"
+            if len(args) > 1: request["group"] = args[1]
+        elif args[0] == "colour" and len(args) == 3: request["action"], request["group"], request["colour"] = "colour", args[1], int(args[2])
+        elif args[0] == "icon" and len(args) == 3: request["action"], request["group"], request["icon"] = "icon", args[1], args[2]
+        elif args[0] == "newtab" and len(args) == 2: request["action"], request["group"] = "newtab", args[1]
+        elif args[0] == "move" and len(args) == 3: request["action"], request["group"], request["index"] = "move", args[1], int(args[2])
+        elif args[0] == "ungroup" and len(args) == 2: request["action"], request["group"] = "ungroup", args[1]
+        elif args[0] == "close" and len(args) == 2: request["action"], request["group"] = "close", args[1]
+        elif args[0] == "reopen" and len(args) == 1: request["action"] = "reopen"
+        elif args[0] == "bookmark" and len(args) >= 2:
+            request["action"], request["group"] = "bookmark", args[1]
+            if len(args) > 2: request["name"] = " ".join(args[2:])
+        elif args[0] == "space" and len(args) == 2: request["action"], request["group"] = "space", args[1]
+        elif args[0] == "menu" and len(args) in (2, 3):
+            request["action"], request["group"] = "menu", args[1]
+            if len(args) == 3: request["path"] = os.path.abspath(args[2])
+        else: sys.exit("usage: bench group [list | new ID [NAME] | add G ID | out ID | fold G on|off | rename G NAME | renameui [G] | colour G N | icon G SYM | newtab G | move G INDEX | ungroup G | close G | reopen | bookmark G [NAME] | space G | menu G [PATH]]")
     elif verb == "hit":
-        if len(args) not in (2, 3) or (len(args) == 3 and args[2] not in ("double", "middle")): sys.exit("usage: bench hit X Y [double|middle]")
+        if len(args) not in (2, 3) or (len(args) == 3 and args[2] not in ("double", "middle", "right")): sys.exit("usage: bench hit X Y [double|middle|right]")
         request["x"], request["y"] = float(args[0]), float(args[1])
         if len(args) == 3: request[args[2]] = True
     elif verb == "place":
         if len(args) != 2: sys.exit("usage: bench place ID INDEX")
         request["id"], request["to"] = args[0], int(args[1])
+    elif verb == "pin":
+        if not 1 <= len(args) <= 2: sys.exit("usage: bench pin ID [on|off]")
+        request["id"] = args[0]
+        request["on"] = (args[1] if len(args) > 1 else "on") in ("on", "true", "1", "yes")
     elif verb == "film":
         if len(args) not in (2, 3, 4) or args[0] not in ("peek", "unpeek", "fold", "none"):
             sys.exit("usage: bench film peek|unpeek|fold|none PATH [FRAMES] [EVERY]")
@@ -222,7 +275,8 @@ def main(argv):
         for tab in answer.get("tabs", []):
             mark = "⚗" if tab.get("bench") else ("●" if tab.get("active") else " ")
             state = " …" if tab.get("loading") else (" z" if tab.get("asleep") else "")
-            print(f"{mark} {tab['id']}  {tab.get('title') or '—'}  {tab.get('url')}{state}")
+            group = f" [{tab['group']}]" if tab.get("group") else ""
+            print(f"{mark} {tab['id']}  {tab.get('title') or '—'}  {tab.get('url')}{group}{state}")
     else:
         print(json.dumps(answer, ensure_ascii=False, indent=2))
     return 0

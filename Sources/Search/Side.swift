@@ -13,7 +13,9 @@ struct SideBar: View {
     @Namespace private var pill
 
     @State private var dragging: Tab.ID?
-    @State private var from = 0
+    /// The edge the picked-up row left — kept, not an index, so the hand
+    /// stays glued to it however the rows beneath change places.
+    @State private var anchor: CGFloat = 0
     @State private var travel: CGFloat = 0
     @State private var landing = false
     /// The width the column had when the edge was picked up.
@@ -31,10 +33,21 @@ struct SideBar: View {
     @State private var pinFrom = 0
     @State private var pinTravel: CGSize = .zero
 
+    /// A whole group carried by its header — the same drag as a row's,
+    /// landed with `moveGroup` so the members follow it.
+    @State private var groupDragging: TabGroup.ID?
+    @State private var groupAnchor: CGFloat = 0
+    @State private var groupTravel: CGFloat = 0
+    /// The header under the pointer — one for the column, as the edge's is.
+    @State private var overHead: TabGroup.ID?
+
     private static let row: CGFloat = 28
     private static let gap: CGFloat = 2
     private static let square: CGFloat = 34
     private static let pinGap: CGFloat = 4
+    /// The air a group block keeps around its rows, so two blocks never
+    /// touch and a block never sits flush against a plain row.
+    private static let blockPad: CGFloat = 4
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -194,12 +207,19 @@ struct SideBar: View {
                             ScrollView(.vertical) { rows }
                                 // The tab you go to is the tab you see — ⌘1–⌘9,
                                 // ⇧⌘], a link opening beside the one on screen.
+                                // Rows are named by their item, so a tab in a
+                                // folded group reveals the header standing for
+                                // it rather than a row it doesn't have.
                                 .onChange(of: browser.activeID) { _, id in
-                                    guard let id else { return }
-                                    withAnimation(Motion.glide) { proxy.scrollTo(id) }
+                                    guard let tab = browser.tabs.first(where: { $0.id == id }) else { return }
+                                    withAnimation(Motion.glide) {
+                                        proxy.scrollTo(browser.visibleID(for: tab))
+                                    }
                                 }
                                 .onAppear {
-                                    if let id = browser.activeID { proxy.scrollTo(id, anchor: .center) }
+                                    if let tab = browser.active {
+                                        proxy.scrollTo(browser.visibleID(for: tab), anchor: .center)
+                                    }
                                 }
                         }
                     }
@@ -214,10 +234,10 @@ struct SideBar: View {
 
     /// Another space's rows, drawn with the same pieces as this one's so the
     /// two read as one column while they pass — and nothing to press until
-    /// it is the one on screen.
+    /// it is the one on screen. Groups parked with it keep their blocks: a
+    /// folded run goes by as its header, an open one as the whole card.
     private func preview(_ row: Parked, pill: Namespace.ID) -> some View {
         let pins = row.tabs.filter { $0.pin != nil }
-        let rest = row.tabs.filter { $0.pin == nil }
         let cols = SideBar.pinColumns(pins.count)
         let width = pinWidth(for: pins.count)
         let height = min(SideBar.square, width)
@@ -226,16 +246,37 @@ struct SideBar: View {
                 VStack(spacing: 0) {
                     PinGrid(columns: cols, width: width, height: height, spacing: SideBar.pinGap) {
                         ForEach(pins) { tab in
-                            PinSquare(browser: browser, prefs: prefs, tab: tab, live: tab.id == row.active,
+                            PinSquare(browser: browser, tab: tab, live: tab.id == row.active,
                                       pill: pill, width: width, height: height)
                         }
                     }
                 }
+                // The same shared card the live column's pins sit on — a
+                // space going by keeps its pieces exactly as it left them.
+                .padding(SideBar.blockPad)
+                .background { pinCard }
+                .padding(.horizontal, -SideBar.blockPad)
                 .padding(.bottom, 10)
             }
             VStack(spacing: SideBar.gap) {
-                ForEach(rest) { tab in
-                    SideRow(browser: browser, prefs: prefs, tab: tab, live: tab.id == row.active, pill: pill, close: {})
+                ForEach(Self.pieces(from: Self.items(in: row))) { piece in
+                    switch piece {
+                    case .row(let tab):
+                        SideRow(browser: browser, prefs: prefs, tab: tab,
+                                live: tab.id == row.active, pill: pill, close: {})
+                    case .block(let group, let members):
+                        VStack(spacing: SideBar.gap) {
+                            head(group, title: Self.title(of: group, in: row),
+                                 count: row.tabs.reduce(0) { $0 + ($1.groupID == group.id ? 1 : 0) },
+                                 interactive: false)
+                            ForEach(members) { tab in
+                                SideRow(browser: browser, prefs: prefs, tab: tab,
+                                        live: tab.id == row.active, pill: pill, tint: group.tint, close: {})
+                            }
+                        }
+                        .background { card(group.tint) }
+                        .padding(.vertical, SideBar.blockPad)
+                    }
                 }
             }
             newTab
@@ -250,16 +291,34 @@ struct SideBar: View {
         let pins = browser.pinnedCount
         let cols = SideBar.pinColumns(pins)
         let pinRows = pins == 0 ? 0 : (pins + cols - 1) / cols
+        // The pin block is its rows of cells plus the air the shared card
+        // keeps above and below them, then the gap under the block itself.
         let pinBlock = pinRows == 0 ? 0
-            : CGFloat(pinRows) * pinHeight + CGFloat(pinRows - 1) * SideBar.pinGap + 10
-        let loose = CGFloat(browser.tabs.count - pins) * (SideBar.row + SideBar.gap)
-        return Metrics.strip + pinBlock + loose + SideBar.row + 8
+            : CGFloat(pinRows) * pinHeight + CGFloat(pinRows - 1) * SideBar.pinGap
+                + 2 * SideBar.blockPad + 10
+        // The loose column as it is actually drawn: a block is its rows plus
+        // the air it keeps around them, a tab on its own is a row — and a
+        // folded group's members draw nothing at all.
+        var loose: CGFloat = 0
+        var first = true
+        for piece in pieces {
+            if !first { loose += SideBar.gap }
+            first = false
+            switch piece {
+            case .row:
+                loose += SideBar.row
+            case .block(_, let members):
+                loose += CGFloat(members.count + 1) * SideBar.row
+                    + CGFloat(members.count) * SideBar.gap
+                    + 2 * SideBar.blockPad
+            }
+        }
+        return Metrics.strip + pinBlock + loose + SideBar.gap + SideBar.row + 8
     }
 
     // MARK: - the pinned squares
 
     private var pinnedTabs: [Tab] { browser.tabs.filter { $0.pin != nil } }
-    private var looseTabs: [Tab] { browser.tabs.filter { $0.pin == nil } }
 
     /// Three columns is the block's own shape — up to six pins, that's two
     /// full rows, and one or two is just those same three places with a
@@ -292,6 +351,15 @@ struct SideBar: View {
         min(SideBar.square, pinWidth)
     }
 
+    /// The card the whole pin block sits on. The squares used to draw this
+    /// same wash a faint apiece; worn once by the block it reads as one
+    /// piece rather than a row of tiles — and stays dimmer than the live
+    /// square's full wash, so the picked tab still stands out on it.
+    private var pinCard: some View {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(Palette.wash.opacity(0.55))
+    }
+
     /// The grid itself: fixed-size cells, left-aligned, so a half-empty last
     /// row holds its ground rather than stretching to fill it.
     private var pinned: some View {
@@ -308,7 +376,6 @@ struct SideBar: View {
                 let held = pinDragging == tab.id
                 PinSquare(
                     browser: browser,
-                    prefs: prefs,
                     tab: tab,
                     live: tab.id == browser.activeID,
                     pill: pill,
@@ -323,6 +390,15 @@ struct SideBar: View {
                 .gesture(pinReorder(tab: tab, index: index, columns: cols, width: width, height: height))
             }
         } }
+        // One shared card under the grid, its air kept as padding so every
+        // cell sits inside it — reaching a touch wider than the cells the
+        // way a group's card reaches past its rows, which leaves the cells
+        // their size and their pitch, and everything the reorder measures
+        // exactly where it was. The block just grows a sliver top and
+        // bottom, which `rowsEnd` counts.
+        .padding(SideBar.blockPad)
+        .background { pinCard }
+        .padding(.horizontal, -SideBar.blockPad)
         .coordinateSpace(name: "pins")
     }
 
@@ -387,54 +463,414 @@ struct SideBar: View {
 
     // MARK: - the rows
 
+    /// One thing the loose column draws: a tab standing alone, or a group —
+    /// its header and, while it is open, the members it wraps — as a block.
+    private enum Piece: Identifiable {
+        case row(Tab)
+        case block(TabGroup, [Tab])
+
+        var id: String {
+            switch self {
+            case .row(let tab): return TabItem.tab(tab).id
+            case .block(let group, _): return TabItem.group(group).id
+            }
+        }
+    }
+
+    /// `visibleItems` without the pins — they stand in the grid above, and a
+    /// pin is never in a group, so a `.group` item can only ever be loose.
+    private var looseItems: [TabItem] {
+        browser.visibleItems.filter { $0.tab?.pin == nil }
+    }
+
+    /// The items folded into draw order: a group's header gathers the
+    /// members that follow it into one block; a loose tab is a row alone.
+    private static func pieces(from items: [TabItem]) -> [Piece] {
+        var out: [Piece] = []
+        var at = 0
+        while at < items.count {
+            switch items[at] {
+            case .group(let group):
+                var members: [Tab] = []
+                var next = at + 1
+                while next < items.count,
+                      case .tab(let tab) = items[next],
+                      tab.groupID == group.id {
+                    members.append(tab)
+                    next += 1
+                }
+                out.append(.block(group, members))
+                at = next
+            case .tab(let tab):
+                out.append(.row(tab))
+                at += 1
+            }
+        }
+        return out
+    }
+
+    private var pieces: [Piece] { Self.pieces(from: looseItems) }
+
+    /// `visibleItems` for a parked row — it keeps its own groups for exactly
+    /// this, so a space passing by shows the blocks it left behind.
+    private static func items(in row: Parked) -> [TabItem] {
+        var out: [TabItem] = []
+        var headed: Set<UUID> = []
+        for tab in row.tabs where tab.pin == nil {
+            guard let id = tab.groupID,
+                  let group = row.groups.first(where: { $0.id == id })
+            else {
+                out.append(.tab(tab))
+                continue
+            }
+            if headed.insert(id).inserted { out.append(.group(group)) }
+            if group.expanded { out.append(.tab(tab)) }
+        }
+        return out
+    }
+
+    /// What a parked group is called — `groupTitle` numbers the unnamed by
+    /// the row on screen; a parked one is numbered among its own.
+    private static func title(of group: TabGroup, in row: Parked) -> String {
+        if let name = group.name, !name.isEmpty { return name }
+        var order: [UUID] = []
+        for tab in row.tabs {
+            guard let id = tab.groupID, !order.contains(id) else { continue }
+            order.append(id)
+        }
+        let unnamed = order.filter { id in
+            row.groups.first { $0.id == id }?.name?.isEmpty != false
+        }
+        guard let at = unnamed.firstIndex(of: group.id) else { return "Group" }
+        return "Group \(at + 1)"
+    }
+
     private var loose: some View {
-        VStack(spacing: SideBar.gap) {
+        let origins = drawnOrigins
+        return VStack(spacing: SideBar.gap) {
             // See the grid: the drag is measured in the column's space, not
             // the row's, so a row that has just moved keeps its bearings.
-            ForEach(Array(looseTabs.enumerated()), id: \.element.id) { index, tab in
-                let step = SideBar.row + SideBar.gap
-                let held = dragging == tab.id
-                SideRow(
-                    browser: browser,
-                    prefs: prefs,
-                    tab: tab,
-                    live: tab.id == browser.activeID,
-                    pill: pill,
-                    close: { browser.close(tab) }
-                )
-                .offset(y: held ? travel - CGFloat(index - from) * step : 0)
-                // Under the hand exactly. Its place in the row springs when it
-                // passes another tab, and the offset springs back the same way —
-                // until the next move of the hand cuts the offset's spring short
-                // and leaves the place's running: the tab jumped a whole slot and
-                // drifted back each time it passed one. Only the others glide.
-                .transaction { if held { $0.animation = nil } }
-                .zIndex(held ? 1 : 0)
-                .shadow(color: .black.opacity(held ? 0.14 : 0), radius: 12, y: 4)
-                .gesture(reorder(tab: tab, index: index, step: step))
+            ForEach(pieces) { piece in
+                switch piece {
+                case .row(let tab):
+                    row(tab, tint: nil, origins: origins)
+                case .block(let group, let members):
+                    block(group, members: members, origins: origins)
+                }
             }
         }
         .coordinateSpace(name: "rows")
+        .animation(Motion.settle, value: browser.groups)
+    }
+
+    /// The top edge of every drawn row, in the loose column's own space — a
+    /// folded run contributes just its header. Computed rather than measured,
+    /// the way `rowsEnd` is, so a drag can ask before layout answers; a
+    /// block's padding is why the edges aren't one even stride apart.
+    private var drawnOrigins: [CGFloat] {
+        var out: [CGFloat] = []
+        var y: CGFloat = 0
+        for piece in pieces {
+            switch piece {
+            case .row:
+                out.append(y)
+                y += SideBar.row + SideBar.gap
+            case .block(_, let members):
+                y += SideBar.blockPad
+                for _ in 0...members.count {
+                    out.append(y)
+                    y += SideBar.row + SideBar.gap
+                }
+                y += SideBar.blockPad
+            }
+        }
+        return out
+    }
+
+    /// One loose row — standing on the ground, or a member inside a group's
+    /// block where `tint` blends its washes into the card under it.
+    private func row(_ tab: Tab, tint: Color?, origins: [CGFloat]) -> some View {
+        // The drag's index is the row's place among the drawn items, not the
+        // tabs' — a folded group's members hold tabs but draw no rows.
+        let index = looseItems.firstIndex { $0.id == TabItem.tab(tab).id } ?? 0
+        let held = dragging == tab.id
+        return SideRow(
+            browser: browser,
+            prefs: prefs,
+            tab: tab,
+            live: tab.id == browser.activeID,
+            pill: pill,
+            tint: tint,
+            close: { browser.close(tab) }
+        )
+        .offset(y: held && origins.indices.contains(index)
+                ? anchor + travel - origins[index] : 0)
+        // Under the hand exactly. Its place in the column springs when it
+        // passes another row, and the offset springs back the same way —
+        // until the next move of the hand cuts the offset's spring short
+        // and leaves the place's running: the row jumped a whole slot and
+        // drifted back each time it passed one. Only the others glide.
+        .transaction { if held { $0.animation = nil } }
+        .zIndex(held ? 1 : 0)
+        .shadow(color: .black.opacity(held ? 0.14 : 0), radius: 12, y: 4)
+        .gesture(reorder(tab: tab, index: index, origins: origins))
+    }
+
+    /// A group's run: the header over its member rows, all of it on one
+    /// tinted card that reaches a little past them so the block reads as a
+    /// piece apart — and so the rows keep their own pitch and the drag math
+    /// never has to know a block is there.
+    private func block(_ group: TabGroup, members: [Tab], origins: [CGFloat]) -> some View {
+        let held = groupDragging == group.id
+        // The slot the block sits in: its header's place among the loose
+        // items, since everything drawn above a header belongs to others.
+        let now = looseItems.firstIndex { $0.id == TabItem.group(group).id } ?? 0
+        return VStack(spacing: SideBar.gap) {
+            head(group, title: browser.groupTitle(group),
+                 count: browser.groupCount(group), interactive: true,
+                 index: now, origins: origins)
+            ForEach(members) { tab in
+                row(tab, tint: group.tint, origins: origins)
+                    // Named the way the scroll reveal asks — ForEach's own
+                    // tag is the tab's UUID, but `visibleID` answers the
+                    // item's, and the two never matched.
+                    .id(TabItem.tab(tab).id)
+            }
+        }
+        .background { card(group.tint) }
+        .padding(.vertical, SideBar.blockPad)
+        .offset(y: held && origins.indices.contains(now)
+                ? groupAnchor + groupTravel - origins[now] : 0)
+        // Glued to the hand like a row: the block's place springs as it
+        // passes another, the offset under it does not — see the rows' own.
+        .transaction { if held { $0.animation = nil } }
+        // A member picked up inside the block lifts it whole — it will be
+        // leaving, and the rows it crosses are the card's own.
+        .zIndex(held || members.contains { $0.id == dragging } ? 1 : 0)
+        .shadow(color: .black.opacity(held ? 0.14 : 0), radius: 12, y: 4)
+    }
+
+    /// The card a group sits on: its colour as a wash over the column's
+    /// ground, rounded a little past the rows' own corners and reaching a
+    /// touch wider than them so the run reads as one piece.
+    private func card(_ tint: Color) -> some View {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(tint.opacity(0.12))
+            .padding(.horizontal, -4)
+            .padding(.vertical, -2)
+    }
+
+    /// The colour a group's name and symbol wear — the group's own pulled
+    /// toward the window's ink far enough to read over its wash: deepened on
+    /// a light window, lifted a little on a dark one.
+    private static func ink(_ tint: Color) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let dim = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            let base = NSColor(tint).usingColorSpace(.deviceRGB) ?? .gray
+            var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            base.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+            return NSColor(hue: h,
+                           saturation: min(1, s * 1.05),
+                           brightness: dim ? min(1, b * 1.12) : b * 0.72,
+                           alpha: 1)
+        })
+    }
+
+    /// A group's header: its symbol and name in the group's colour, a count
+    /// of what a folded run is keeping out of sight, the chevron at the far
+    /// end saying which way the fold sits. Parked rows draw it too, with
+    /// nothing answering — `interactive` is the difference, and the drag's
+    /// index and edges come with it.
+    private func head(_ group: TabGroup, title: String, count: Int, interactive: Bool,
+                      index: Int = 0, origins: [CGFloat] = []) -> some View {
+        let tint = group.tint
+        let renaming = interactive && browser.renamingGroup == group.id
+        let hovering = interactive && overHead == group.id
+        return HStack(spacing: 8) {
+            Image(systemName: group.symbol)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Self.ink(tint))
+                .frame(width: 15)
+            if renaming {
+                GroupNameField(browser: browser, group: group)
+                    .frame(height: 16)
+            } else {
+                Text(title)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .foregroundStyle(Self.ink(tint))
+            }
+            Spacer(minLength: 2)
+            if !group.expanded, count > 0 {
+                Text("\(count)")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Self.ink(tint).opacity(0.55))
+            }
+            Image(systemName: group.expanded ? "chevron.up" : "chevron.down")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(Self.ink(tint).opacity(0.55))
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, 7)
+        .frame(height: SideBar.row)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(tint.opacity(hovering ? 0.16 : 0))
+        }
+        .contentShape(Rectangle())
+        .onHover { over in
+            overHead = over ? group.id : (overHead == group.id ? nil : overHead)
+        }
+        .onTapGesture {
+            guard interactive, browser.renamingGroup != group.id else { return }
+            withAnimation(Motion.settle) { browser.toggleGroup(group.id) }
+        }
+        // High priority so the whole block lifts on a drag while a plain
+        // click still folds — the same pact the rows' own gestures keep.
+        .highPriorityGesture(groupMove(group, index: index, origins: origins),
+                             isEnabled: interactive)
+        .overlay { if interactive { GroupMenuCatch(browser: browser, group: group) } }
+        .animation(Motion.quick, value: hovering)
+    }
+
+    /// The boundary a point in the column is nearest, as a drawn-row index —
+    /// "before this one" — with one more answer, the count of them, for the
+    /// stretch past the last row that means "at the end". The edges are
+    /// measured one by one rather than divided out of a pitch, because a
+    /// block's padding bends the spacing.
+    private func edge(near y: CGFloat, in origins: [CGFloat]) -> Int {
+        var best = origins.count
+        var dist = CGFloat.greatestFiniteMagnitude
+        if let last = origins.last {
+            dist = abs(y - (last + SideBar.row))
+        }
+        for at in origins.indices {
+            let gap = abs(y - origins[at])
+            if gap < dist { (dist, best) = (gap, at) }
+        }
+        return best
+    }
+
+    /// The index into `tabs` a drop before drawn row `at` lands at — a plain
+    /// row's own place, a header's first member's (the header stands at the
+    /// run's head, so the drop is just before the run), the row's last place
+    /// past the end.
+    private func tabIndex(forItem at: Int) -> Int? {
+        guard at < looseItems.count else {
+            return browser.tabs.isEmpty ? nil : browser.tabs.count - 1
+        }
+        switch looseItems[at] {
+        case .tab(let tab): return browser.tabs.firstIndex { $0.id == tab.id }
+        case .group(let group): return browser.tabs.firstIndex { $0.groupID == group.id }
+        }
+    }
+
+    /// The index `moveGroup` wants for a block dropped before drawn row `at`:
+    /// the same place, but counted over the row with the group's own members
+    /// lifted out — a member standing before it leaves with it, and doesn't
+    /// count toward where it lands.
+    private func groupIndex(forItem at: Int, lifting group: TabGroup) -> Int {
+        let members = browser.tabs.reduce(0) { $0 + ($1.groupID == group.id ? 1 : 0) }
+        let rest = browser.tabs.count - members
+        guard at < looseItems.count else { return rest }
+        let pos = tabIndex(forItem: at) ?? browser.tabs.count
+        let lifted = browser.tabs[..<pos].reduce(0) { $0 + ($1.groupID == group.id ? 1 : 0) }
+        return min(pos - lifted, rest)
+    }
+
+    /// A header picked up carries its whole run: the same gesture as a row's,
+    /// landed with `moveGroup` rather than `move` so the members follow it
+    /// instead of being picked off one by one.
+    private func groupMove(_ group: TabGroup, index: Int, origins: [CGFloat]) -> some Gesture {
+        DragGesture(minimumDistance: 5, coordinateSpace: .named("rows"))
+            .onChanged { value in
+                guard origins.indices.contains(index) else { return }
+                if groupDragging != group.id {
+                    groupDragging = group.id
+                    groupAnchor = origins[index]
+                }
+                groupTravel = value.translation.height
+                let target = edge(near: groupAnchor + groupTravel, in: origins)
+                let to = groupIndex(forItem: target, lifting: group)
+                // Aimed at where it already stands — inside its own run
+                // included — nothing moves.
+                guard to != groupIndex(forItem: index, lifting: group) else { return }
+                withAnimation(Motion.settle) {
+                    browser.moveGroup(group.id, toTabIndex: to)
+                }
+            }
+            .onEnded { _ in
+                withAnimation(Motion.settle) {
+                    groupDragging = nil
+                    groupTravel = 0
+                }
+            }
+    }
+
+    /// A tab dropped on a group's header joins the run, at its end — the one
+    /// place it can land without the run breaking. `add` opens a folded run
+    /// to show where the tab went; a drop asks the opposite, so the fold the
+    /// header was holding is handed back to it — aiming at a shut group is
+    /// how you file a tab away.
+    private func join(_ tab: Tab, _ group: TabGroup) {
+        let folded = !group.expanded
+        withAnimation(Motion.settle) { browser.add(tab, to: group.id) }
+        if folded, tab.groupID == group.id,
+           browser.groups.first(where: { $0.id == group.id })?.expanded == true {
+            browser.toggleGroup(group.id)
+        }
     }
 
     /// Pick a row up and the others make way as it passes them.
-    private func reorder(tab: Tab, index: Int, step: CGFloat) -> some Gesture {
+    private func reorder(tab: Tab, index: Int, origins: [CGFloat]) -> some Gesture {
         DragGesture(minimumDistance: 5, coordinateSpace: .named("rows"))
             .onChanged { value in
+                guard origins.indices.contains(index) else { return }
                 if dragging != tab.id {
                     dragging = tab.id
-                    from = index
+                    anchor = origins[index]
                 }
                 travel = value.translation.height
-                let moved = Int((travel / step).rounded())
-                let target = min(max(0, from + moved), looseTabs.count - 1)
-                if target != index {
-                    // Positions here are among the loose rows; the pinned
-                    // block sits in front of them in the real list.
-                    withAnimation(Motion.settle) {
-                        browser.move(tab, to: target + browser.pinnedCount)
-                    }
+                let y = anchor + travel
+                // On a header row — anywhere in the stretch of column it is
+                // drawn over, not just past its top edge — the drop joins the
+                // run instead of standing ahead of it: `add` lands the tab at
+                // the run's end, and a block holding its run folded keeps it
+                // folded. The span runs to the next row's top, so the air
+                // between header and first member — inside the run's card —
+                // joins as well; the air *above* a header stays outside it.
+                // The header's own drag is `groupMove`; this only ever fires
+                // for a row's.
+                for at in origins.indices {
+                    guard at < looseItems.count,
+                          case .group(let group) = looseItems[at],
+                          y >= origins[at],
+                          y < origins[at] + SideBar.row + SideBar.gap
+                    else { continue }
+                    join(tab, group)
+                    return
                 }
+                // The edge the row's top is nearest. An even row pitch used
+                // to divide the travel; folded runs and block padding broke
+                // that — a chip is one drawn row but a whole run of tabs —
+                // so the drawn edges are measured, then mapped: before a
+                // header is before the run, past one is past it, and only a
+                // member's own row is inside.
+                let target = edge(near: y, in: origins)
+                guard target != index, var to = tabIndex(forItem: target) else { return }
+                // A header stands at its run's head, so a drop short of it
+                // lands before the run — which, coming down, is one place
+                // lower: the dragged row lifting out shifts the run a place
+                // left, and asking for its old head index puts the drop
+                // inside it.
+                if target < looseItems.count, case .group = looseItems[target],
+                   let here = browser.tabs.firstIndex(where: { $0.id == tab.id }),
+                   here < to {
+                    to -= 1
+                }
+                withAnimation(Motion.settle) { browser.move(tab, to: to) }
             }
             .onEnded { _ in
                 withAnimation(Motion.settle) {
@@ -514,7 +950,6 @@ private struct PinGrid: Layout {
 /// room to spare turns into a wide, short button rather than a bigger icon.
 private struct PinSquare: View {
     @ObservedObject var browser: Browser
-    @ObservedObject var prefs: Preferences
     @ObservedObject var tab: Tab
     let live: Bool
     let pill: Namespace.ID
@@ -532,7 +967,17 @@ private struct PinSquare: View {
         Group {
             if browser.editingPin == tab.id {
                 PinField(browser: browser, tab: tab)
-            } else if prefs.glyph == .icons, let icon = tab.icon {
+            } else if tab.loading {
+                // The ring spins in the glyph's slot while the page is
+                // coming — Chrome's way over a pinned tab's icon —
+                // whichever glyph the square would otherwise wear.
+                Ring(size: scale * 11 / 34)
+                    .transition(.opacity)
+            } else if let icon = tab.icon {
+                // A pin has no title to speak for it, so the site's mark
+                // stands for it whenever there is one — the letters/icons
+                // choice is for the rows, where a title does the naming.
+                // A site that never gave an icon keeps the letter.
                 Mark(icon: icon, letter: tab.pin ?? "", size: scale * 16 / 34, dim: tab.asleep)
             } else {
                 Text(tab.pin ?? "")
@@ -547,9 +992,12 @@ private struct PinSquare: View {
                 RoundedRectangle(cornerRadius: scale * 9 / 34, style: .continuous)
                     .fill(Palette.wash)
                     .matchedGeometryEffect(id: "live", in: pill)
-            } else {
+            } else if hovering {
+                // Nothing at rest — the card under the block is the fill a
+                // square used to draw for itself; only the pointer still
+                // lights one.
                 RoundedRectangle(cornerRadius: scale * 9 / 34, style: .continuous)
-                    .fill(hovering ? Palette.hover : Palette.wash.opacity(0.55))
+                    .fill(Palette.hover)
             }
         }
         .contentShape(RoundedRectangle(cornerRadius: scale * 9 / 34, style: .continuous))
@@ -562,6 +1010,7 @@ private struct PinSquare: View {
         .contextMenu { TabMenu(browser: browser, tab: tab, close: { browser.close(tab) }) }
         .help(tab.label)
         .animation(Motion.quick, value: hovering)
+        .animation(Motion.quick, value: tab.loading)
         .transition(.scale(scale: 0.8).combined(with: .opacity))
     }
 }
@@ -573,6 +1022,10 @@ private struct SideRow: View {
     @ObservedObject var tab: Tab
     let live: Bool
     let pill: Namespace.ID
+    /// The group's colour while the row sits inside a block — the wash the
+    /// live row wears and the ground the hover draws over are the card's
+    /// own, so a live member reads as picked rather than as grey on colour.
+    var tint: Color? = nil
     let close: () -> Void
 
     @State private var hovering = false
@@ -587,7 +1040,18 @@ private struct SideRow: View {
                     .frame(height: 16)
             } else {
                 if prefs.glyph == .icons, !tab.isBlank {
-                    Mark(icon: tab.icon, letter: tab.monogram, size: 15)
+                    // The ring takes the mark's slot while the page is
+                    // coming — Chrome's spinner where the site icon sits —
+                    // leaving the button at the far end to the cross.
+                    ZStack {
+                        if tab.loading {
+                            Ring().transition(.opacity)
+                        } else {
+                            Mark(icon: tab.icon, letter: tab.monogram, size: 15)
+                        }
+                    }
+                    .frame(width: 15, height: 15)
+                    .animation(Motion.quick, value: tab.loading)
                 }
                 if tab.bench {
                     // A script's tab, not yours.
@@ -617,7 +1081,9 @@ private struct SideRow: View {
                         .frame(width: 15, height: 15)
                         .background(Palette.ink.opacity(0.07), in: Circle())
                         .transition(.opacity)
-                } else if tab.loading {
+                } else if tab.loading, prefs.glyph == .letters {
+                    // With letters there is no mark's slot to lend the
+                    // ring, so the button's does as it always has.
                     Ring().transition(.opacity)
                 } else if tab.noisy {
                     Image(systemName: "speaker.wave.2.fill")
@@ -667,7 +1133,7 @@ private struct SideRow: View {
     private var ground: some View {
         if live {
             ZStack(alignment: .leading) {
-                Rectangle().fill(Palette.wash)
+                Rectangle().fill(tint.map { $0.opacity(0.30) } ?? Palette.wash)
                 GeometryReader { geo in
                     Rectangle()
                         .fill(Palette.ink.opacity(0.055))
@@ -679,7 +1145,7 @@ private struct SideRow: View {
             .matchedGeometryEffect(id: "live", in: pill)
         } else if hovering {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(Palette.hover)
+                .fill(tint.map { $0.opacity(0.16) } ?? Palette.hover)
         }
     }
 

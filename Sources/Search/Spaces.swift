@@ -145,6 +145,8 @@ enum Spaces {
 struct Parked {
     var tabs: [Tab]
     var active: Tab.ID?
+    /// The row's groups — they are the row's, so they park with it.
+    var groups: [TabGroup] = []
 }
 
 extension Browser {
@@ -176,13 +178,16 @@ extension Browser {
         // The row on screen is parked as it is. Its sound stops: a space
         // you left is not one you are listening to.
         for tab in tabs where tab.built != nil { tab.web.pauseAllMediaPlayback() }
-        parked[spaceID] = Parked(tabs: tabs, active: activeID)
+        parked[spaceID] = Parked(
+            tabs: tabs, active: activeID,
+            groups: groups.filter { group in tabs.contains { $0.groupID == group.id } }
+        )
 
         spaceID = id
         Spaces.current = id
         Store.settings.set(id.uuidString, forKey: "space.current")
         if let back = parked.removeValue(forKey: id), !back.tabs.isEmpty {
-            showRow(back.tabs, active: back.active)
+            showRow(back.tabs, active: back.active, groups: back.groups)
             if let active, !active.wake() { active.revive() }
         } else {
             showRow([], active: nil)

@@ -20,6 +20,7 @@ It was built by a design studio that spends its whole day in a browser and was t
 
 - **One field.** Type an address and you go there; type words and you search. It finishes addresses from your own history and never sends what you type anywhere until you press Return.
 - **Tabs that stay out of the way.** Pin the pages you keep open all day and they shrink to a letter or their icon. Tabs from your last session come back instantly and cost nothing until you click them. `⌘K` lists your open tabs by name.
+- **Tab groups.** Right-click a tab, New Tab Group, and the run it starts wears a colour, a name and an icon — a chip in the row that folds its tabs away on a click, a tinted block in the sidebar. Drag tabs in and out; drag the chip to move them all. The chip's own right-click renames it, moves it to a space of its own, or closes it whole — `⇧⌘T` brings it back whole.
 - **Reading mode.** `⇧⌘R` strips a page down to the article.
 - **Hide anything, for good.** `⇧⌘H`, then click a cookie banner, a newsletter overlay, a rail of "related" nonsense — it goes, and it is still gone on that site next time, before the page has drawn a single frame.
 - **An ad blocker that runs before the page.** Third-party trackers and ad networks are stopped at the network level, so there is nothing to render and nothing to slow down. On by default, off per site if something breaks.

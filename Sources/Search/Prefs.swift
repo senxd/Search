@@ -8,8 +8,9 @@ import SwiftUI
 // redraw when one changes. Defaults are chosen so that a browser nobody has
 // configured behaves the way it always did.
 
-/// What a tab wears beside its title, and what a pinned one is reduced to: a
-/// letter, or the site's own icon.
+/// What a loose tab wears beside its title: a letter, or the site's own
+/// icon — a spinner stands in for the mark while the page loads. A pinned
+/// one always wears the icon; the letter is for when the site has none.
 enum Glyph: String, CaseIterable, Identifiable {
     case letters, icons
 
