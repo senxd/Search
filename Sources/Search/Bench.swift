@@ -145,6 +145,9 @@ final class Bench {
         accepting = source
         listener = fd
         running = true
+        // The agent sessions live behind the same switch: "Let a script drive
+        // Search" is what opens either socket to the world outside the app.
+        AgentSocket.shared.start(for: browser)
     }
 
     func stop() {
@@ -157,6 +160,7 @@ final class Bench {
         clients.values.forEach { $0.drop() }
         clients = [:]
         running = false
+        AgentSocket.shared.stop()
         // The tabs a script left open go with it.
         if let browser {
             for tab in browser.tabs where tab.bench { browser.close(tab) }
@@ -234,6 +238,10 @@ final class Bench {
         private func say(_ answer: [String: Any]) {
             guard !answered else { return }
             answered = true
+            // Same crash vector as agent.sock's say(): a page value carrying
+            // a non-finite number raises an uncatchable NSInvalidArgument-
+            // Exception in JSONSerialization — check rather than catch.
+            let answer = Drive.jsonSafe(answer) ? answer : ["error": "the answer wasn't JSON-safe"]
             var out = (try? JSONSerialization.data(withJSONObject: answer)) ?? Data("{\"error\":\"unwritable answer\"}".utf8)
             out.append(0x0A)
             out.withUnsafeBytes { raw in
@@ -316,7 +324,7 @@ final class Bench {
         case "wait":
             guard let tab = find(request, in: browser) else { answer(missing(request)); return }
             let limit = Date().addingTimeInterval(request["seconds"] as? Double ?? 20)
-            wait(for: tab, until: limit, answer)
+            wait(for: tab, in: browser, until: limit, answer)
 
         case "sleep":
             // Now rather than after half an hour, but past every other check
@@ -432,70 +440,7 @@ final class Bench {
             shoot(tab, to: URL(fileURLWithPath: path), width: width, answer)
 
         case "probe":
-            // The state of the window itself, for the bug that is not in a
-            // page: which panels are up, whether something modal has the
-            // app, and every window the app owns.
-            var out: [String: Any] = [
-                "settings": browser.tuning,
-                "welcome": browser.welcoming,
-                "passwords": browser.managing,
-                "history": browser.recalling,
-                "downloads": browser.hoarding,
-                "bookmarks": browser.bookmarking,
-                "field": browser.editing,
-                "suggesting": browser.suggesting != nil,
-                "offering": browser.offering != nil,
-                "modal": NSApp.modalWindow.map { "\(type(of: $0)) “\($0.title)”" } ?? "",
-                "look": browser.prefs.look.rawValue,
-                "appearance": NSApp.appearance?.name.rawValue ?? "system",
-                "key": NSApp.keyWindow.map { "\(type(of: $0)) “\($0.title)”" } ?? "",
-            ]
-            out["windows"] = NSApp.windows.map { window -> [String: Any] in
-                [
-                    "kind": "\(type(of: window))",
-                    "title": window.title,
-                    "visible": window.isVisible,
-                    "level": window.level.rawValue,
-                    "frame": [Int(window.frame.minX), Int(window.frame.minY), Int(window.frame.width), Int(window.frame.height)],
-                    "number": window.windowNumber,
-                ]
-            }
-            if let window = Links.window { out["lights"] = Bench.lights(of: window) }
-            out["keysQuieted"] = PageView.quieted
-            // Settings › General › Web Inspector, as each page's WebKit has it.
-            let asked = NSSelectorFromString("_developerExtrasEnabled")
-            out["inspector"] = browser.tabs.compactMap { tab -> Bool? in
-                guard let preferences = tab.built?.configuration.preferences, preferences.responds(to: asked) else { return nil }
-                return preferences.value(forKey: "developerExtrasEnabled") as? Bool
-            }
-            // Settings › General › Pages at 120 Hz, as each page's WebKit has
-            // it: true is held near 60, WebKit's own default.
-            out["prefersNear60FPS"] = browser.tabs.compactMap { tab -> Bool? in
-                guard let preferences = tab.built?.configuration.preferences else { return nil }
-                return FrameRate.prefersNear60(preferences)
-            }
-            // The column folded away, out for a look, and the lights with it (see Fold.swift).
-            out["peek"] = browser.peekTab?.address?.absoluteString ?? ""
-            // Where the peek's page sits in the window, from its top-left corner, in points.
-            if let web = browser.peekTab?.built, let window = web.window {
-                let r = web.convert(web.bounds, to: nil)
-                out["peekFrame"] = [Int(r.minX), Int(window.frame.height - r.maxY), Int(r.width), Int(r.height)]
-            }
-            out["folded"] = browser.folded
-            out["peeking"] = browser.peeking
-            out["sideHides"] = browser.prefs.sideHides
-            out["lightsHidden"] = Fold.titlebar?.isHidden ?? false
-            out["siteCard"] = SiteCardPanel.isShown
-            // Whether this Mac lets the browser use its passkeys at all — the
-            // one-time permission macOS asks a browser other than Safari for.
-            switch ASAuthorizationWebBrowserPublicKeyCredentialManager().authorizationStateForPlatformCredentials {
-            case .authorized: out["passkeyAccess"] = "authorized"
-            case .denied: out["passkeyAccess"] = "denied"
-            default: out["passkeyAccess"] = "notDetermined"
-            }
-            out["passkeyAsks"] = Passkeys.asked
-            out["passkeyLast"] = Passkeys.last
-            answer(out)
+            answer(probeReport(browser))
 
         case "press":
             // A key pressed on the app as a whole, through its event queue —
@@ -630,6 +575,28 @@ final class Bench {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                     answer(["tabsBefore": before, "tabsAfter": browser.tabs.count])
                 }
+                return
+            }
+            if request["right"] as? Bool == true {
+                // A right press on a group's chip, handed straight to the
+                // view that catches the right button over it (GroupMenuCatch
+                // in GroupMenu.swift) — a probe's window is in the back, and
+                // the menu it raises is built but never popped, so the
+                // answer is what the menu would have said.
+                guard Store.testing else { answer(["error": "hit … right only works on a --test run"]); return }
+                func catcher(in view: NSView) -> NSView? {
+                    for sub in view.subviews.reversed() { if let found = catcher(in: sub) { return found } }
+                    guard String(reflecting: type(of: view)).contains("GroupMenuCatch") else { return nil }
+                    return view.convert(view.bounds, to: nil).contains(point) ? view : nil
+                }
+                guard let target = catcher(in: frame) else { answer(["error": "no group's chip there"]); return }
+                guard let down = NSEvent.mouseEvent(
+                    with: .rightMouseDown, location: point, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1
+                ) else { answer(["error": "no event"]); return }
+                target.rightMouseDown(with: down)
+                answer(["menu": GroupMenu.shown.map(describeMenu) ?? []])
                 return
             }
             if request["double"] as? Bool == true {
@@ -1016,6 +983,22 @@ final class Bench {
                 }
             }
 
+        case "pin":
+            // Pinning carries the tab into the pinned block at the head of
+            // the row, which the bench never does to someone using it: only
+            // on a SEARCH_PROBE run.
+            guard Store.testing else {
+                answer(["error": "pin only works on a --test run — it would rearrange your row"])
+                return
+            }
+            guard let tab = find(request, in: browser) else { answer(missing(request)); return }
+            if request["on"] as? Bool ?? true { browser.pin(tab) } else { browser.unpin(tab) }
+            var out = describe(tab)
+            out["pinned"] = tab.pin != nil
+            out["pin"] = tab.pin ?? ""
+            out["at"] = browser.tabs.firstIndex { $0.id == tab.id } ?? -1
+            answer(out)
+
         case "film":
             // The whole window, title bar and lights included, drawn every few
             // hundredths of a second while something animates — what a person
@@ -1199,6 +1182,29 @@ final class Bench {
                 window.contentView = nil
             }
 
+        case "winshot":
+            // The whole window — chrome, lights, tabs and the page on stage —
+            // drawn into one PNG, the same offscreen bitmap the strip and
+            // column shots are made with. For an auditor who wants what a
+            // person would see, not another slice of it.
+            guard let window = Links.window,
+                  let frame = window.contentView?.superview,
+                  let path = request["path"] as? String, !path.isEmpty
+            else { answer(["error": "winshot needs a path"]); return }
+            // The pages take a third of a second each to draw into a picture,
+            // so give the whole thing a beat rather than racing the paint.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                guard let picture = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) else {
+                    answer(["error": "nothing drawn"])
+                    return
+                }
+                frame.cacheDisplay(in: frame.bounds, to: picture)
+                do {
+                    try picture.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+                    answer(["saved": path, "width": picture.pixelsWide, "height": picture.pixelsHigh])
+                } catch { answer(["error": error.localizedDescription]) }
+            }
+
         case "space":
             // The spaces, and switching between them, for a test of what a
             // space keeps apart. Test runs only: it moves your tabs about.
@@ -1262,6 +1268,134 @@ final class Bench {
                 }
             }
 
+        case "group":
+            // The tab groups, from the shell: made, named, filled, folded,
+            // bookmarked, closed, sent to a space. Test runs only — it
+            // rearranges your row.
+            guard Store.testing else {
+                answer(["error": "group only works on a --test run — it would rearrange your row"])
+                return
+            }
+            let noGroup = ["error": "no such group — see group list"]
+            switch request["action"] as? String ?? "list" {
+            case "list":
+                answer([
+                    "groups": groupList(browser, members: true),
+                    // The flattened row the bars draw — a folded group is
+                    // its chip alone, an open one chip then members.
+                    "items": browser.visibleItems.map(\.id),
+                ])
+            case "new":
+                guard let tab = find(request, in: browser) else { answer(missing(request)); return }
+                guard let group = browser.createGroup(from: tab) else {
+                    answer(["error": "not groupable — pinned or already in a group"])
+                    return
+                }
+                if let name = request["name"] as? String, !name.isEmpty {
+                    browser.renameGroup(group.id, to: name)
+                }
+                answer(["groups": groupList(browser)])
+            case "add":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                guard let tab = find(request, in: browser) else { answer(missing(request)); return }
+                browser.add(tab, to: group.id)
+                answer(["groups": groupList(browser)])
+            case "out":
+                guard let tab = find(request, in: browser) else { answer(missing(request)); return }
+                browser.removeFromGroup(tab)
+                answer(["groups": groupList(browser)])
+            case "fold":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                // on folds it to its chip; off opens it again. No `on` at
+                // all just turns it over.
+                if let on = request["on"] as? Bool {
+                    if browser.groups.first(where: { $0.id == group.id })?.expanded == on {
+                        browser.toggleGroup(group.id)
+                    }
+                } else {
+                    browser.toggleGroup(group.id)
+                }
+                answer(["groups": groupList(browser)])
+            case "rename":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.renameGroup(group.id, to: request["name"] as? String ?? "")
+                answer(["groups": groupList(browser)])
+            case "renameui":
+                // The chip's name field, up (`renameui G`) or down (`renameui`).
+                if let ref = request["group"], !(ref as? String ?? "").isEmpty {
+                    guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                    browser.beginGroupRename(group.id)
+                } else {
+                    browser.endGroupRename()
+                }
+                answer([
+                    "groups": groupList(browser),
+                    "renaming": browser.renamingGroup?.uuidString.lowercased() ?? "",
+                ])
+            case "colour":
+                guard let group = findGroup(request, in: browser), let colour = request["colour"] as? Int
+                else { answer(["error": "colour needs a group and a number"]); return }
+                browser.colourGroup(group.id, with: colour)
+                answer(["groups": groupList(browser)])
+            case "icon":
+                guard let group = findGroup(request, in: browser), let icon = request["icon"] as? String
+                else { answer(["error": "icon needs a group and a symbol name"]); return }
+                browser.iconGroup(group.id, to: icon)
+                answer(["groups": groupList(browser)])
+            case "newtab":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.newTabInGroup(group.id)
+                answer(["groups": groupList(browser), "tab": browser.active.map { Bench.short($0) } ?? ""])
+            case "move":
+                guard let group = findGroup(request, in: browser), let index = request["index"] as? Int
+                else { answer(["error": "move needs a group and an index"]); return }
+                browser.moveGroup(group.id, toTabIndex: index)
+                answer(["groups": groupList(browser), "items": browser.visibleItems.map(\.id)])
+            case "ungroup":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.ungroup(group.id)
+                answer(["groups": groupList(browser)])
+            case "close":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.closeGroup(group.id)
+                answer(["groups": groupList(browser), "tabs": browser.tabs.count])
+            case "reopen":
+                browser.reopen()
+                answer(["groups": groupList(browser), "tabs": browser.tabs.count])
+            case "bookmark":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.bookmarkGroup(group.id, named: request["name"] as? String ?? "")
+                answer(["groups": groupList(browser), "bookmarks": browser.bookmarks.count])
+            case "space":
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                browser.moveGroupToNewSpace(group.id)
+                answer([
+                    "groups": groupList(browser),
+                    "spaces": browser.spaces.map(\.name),
+                    "current": browser.space.name,
+                    "tabs": browser.tabs.count,
+                ])
+            case "menu":
+                // The menu a chip's right-click builds, described — and its
+                // hand-made views drawn to a picture, since a menu itself
+                // can't be drawn off screen but its views can.
+                guard let group = findGroup(request, in: browser) else { answer(noGroup); return }
+                let menu = GroupMenu.make(for: browser, group: group)
+                var out: [String: Any] = ["items": describeMenu(menu)]
+                if let path = request["path"] as? String, !path.isEmpty {
+                    guard let data = menuPicture(menu)?.representation(using: .png, properties: [:]) else {
+                        answer(["error": "nothing drawn"]); return
+                    }
+                    do {
+                        try data.write(to: URL(fileURLWithPath: path))
+                        out["saved"] = path
+                    } catch { out["error"] = error.localizedDescription }
+                }
+                answer(out)
+            default:
+                answer(["error": "unknown group action — list, new, add, out, fold, rename, renameui, colour, icon, newtab, move, ungroup, close, reopen, bookmark, space, menu"])
+            }
+
         case "ui":
             // Open or close the app's own panels, to reproduce what a person
             // did without a person.
@@ -1302,7 +1436,7 @@ final class Bench {
 
         default:
             answer(["error": "unknown command “\(verb)”", "commands": [
-                "tabs", "open", "go", "close", "wait", "sleep", "select", "text", "eval", "click", "type", "submit", "shot", "probe", "key", "resize", "hit", "film", "window", "pages", "picture", "place", "field", "bookmark", "menu", "keyeq", "pull", "space", "strip", "column", "fold", "consent", "site", "little", "ui",
+                "tabs", "open", "go", "close", "wait", "sleep", "select", "text", "eval", "click", "type", "submit", "shot", "probe", "key", "resize", "hit", "film", "window", "pages", "picture", "place", "pin", "field", "bookmark", "menu", "keyeq", "pull", "space", "group", "strip", "column", "winshot", "fold", "consent", "site", "little", "ui",
             ]])
         }
     }
@@ -1412,6 +1546,82 @@ final class Bench {
         }
     }
 
+    /// The state of the window itself, for the bug that is not in a page:
+    /// which panels are up, whether something modal has the app, and every
+    /// window the app owns. Internal so Drive's `agent.probe` answers the
+    /// same report rather than a copy of it.
+    func probeReport(_ browser: Browser) -> [String: Any] {
+        var out: [String: Any] = [
+            "settings": browser.tuning,
+            "welcome": browser.welcoming,
+            "passwords": browser.managing,
+            "history": browser.recalling,
+            "downloads": browser.hoarding,
+            "bookmarks": browser.bookmarking,
+            "field": browser.editing,
+            "suggesting": browser.suggesting != nil,
+            "offering": browser.offering != nil,
+            "modal": NSApp.modalWindow.map { "\(type(of: $0)) “\($0.title)”" } ?? "",
+            "look": browser.prefs.look.rawValue,
+            "appearance": NSApp.appearance?.name.rawValue ?? "system",
+            "key": NSApp.keyWindow.map { "\(type(of: $0)) “\($0.title)”" } ?? "",
+        ]
+        out["windows"] = NSApp.windows.map { window -> [String: Any] in
+            [
+                "kind": "\(type(of: window))",
+                "title": window.title,
+                "visible": window.isVisible,
+                "level": window.level.rawValue,
+                "frame": [Int(window.frame.minX), Int(window.frame.minY), Int(window.frame.width), Int(window.frame.height)],
+                "number": window.windowNumber,
+            ]
+        }
+        if let window = Links.window { out["lights"] = Bench.lights(of: window) }
+        out["keysQuieted"] = PageView.quieted
+        // Settings › General › Web Inspector, as each page's WebKit has it.
+        let asked = NSSelectorFromString("_developerExtrasEnabled")
+        out["inspector"] = browser.tabs.compactMap { tab -> Bool? in
+            guard let preferences = tab.built?.configuration.preferences, preferences.responds(to: asked) else { return nil }
+            return preferences.value(forKey: "developerExtrasEnabled") as? Bool
+        }
+        // Settings › General › Pages at 120 Hz, as each page's WebKit has
+        // it: true is held near 60, WebKit's own default.
+        out["prefersNear60FPS"] = browser.tabs.compactMap { tab -> Bool? in
+            guard let preferences = tab.built?.configuration.preferences else { return nil }
+            return FrameRate.prefersNear60(preferences)
+        }
+        // The column folded away, out for a look, and the lights with it (see Fold.swift).
+        out["peek"] = browser.peekTab?.address?.absoluteString ?? ""
+        // Where the peek's page sits in the window, from its top-left corner, in points.
+        if let web = browser.peekTab?.built, let window = web.window {
+            let r = web.convert(web.bounds, to: nil)
+            out["peekFrame"] = [Int(r.minX), Int(window.frame.height - r.maxY), Int(r.width), Int(r.height)]
+        }
+        out["folded"] = browser.folded
+        out["peeking"] = browser.peeking
+        out["sideHides"] = browser.prefs.sideHides
+        out["lightsHidden"] = Fold.titlebar?.isHidden ?? false
+        out["siteCard"] = SiteCardPanel.isShown
+        // Whether this Mac lets the browser use its passkeys at all — the
+        // one-time permission macOS asks a browser other than Safari for.
+        switch ASAuthorizationWebBrowserPublicKeyCredentialManager().authorizationStateForPlatformCredentials {
+        case .authorized: out["passkeyAccess"] = "authorized"
+        case .denied: out["passkeyAccess"] = "denied"
+        default: out["passkeyAccess"] = "notDetermined"
+        }
+        out["passkeyAsks"] = Passkeys.asked
+        out["passkeyLast"] = Passkeys.last
+        out["groups"] = groupList(browser)
+        // The spaces live in memory, so the report is free to carry them:
+        // whether the rows are on, which one is current, what they're called.
+        out["spacesOn"] = browser.prefs.usesSpaces
+        out["space"] = browser.space.name
+        out["spaces"] = browser.spaces.map(\.name)
+        // Which tab is on the stage, the way the ops layer names tabs.
+        out["active"] = browser.active.map { Bench.short($0) } ?? ""
+        return out
+    }
+
     /// The tab a request names, among the ones the bench opened itself. The
     /// bench is how this browser is driven while somebody is using it, and
     /// reading, clicking or sleeping in one of their tabs is not part of
@@ -1424,16 +1634,30 @@ final class Bench {
         return browser.tabs.first { (Store.testing || $0.bench) && $0.id.uuidString.lowercased().hasPrefix(ref) }
     }
 
+    /// The first characters of a tab's id, the way `./bench tabs` prints them.
+    /// Any tab answers — the agent drives the window it is in, popups and all.
+    func find(_ ref: String, in browser: Browser) -> Tab? {
+        browser.tabs.first { $0.id.uuidString.lowercased().hasPrefix(ref) }
+    }
+
     private func missing(_ request: [String: Any]) -> [String: Any] {
         ["error": "no tab “\(request["id"] as? String ?? "")” — see tabs"]
     }
 
-    private func describe(_ tab: Tab) -> [String: Any] {
+    private func describe(_ tab: Tab) -> [String: Any] { describe(tab, in: browser) }
+
+    /// A tab as one line of JSON-able fact, for `tabs` and the agent's
+    /// `tabs.list` alike. The browser is a parameter so the ops layer can
+    /// describe tabs even when the bench itself isn't running.
+    func describe(_ tab: Tab, in browser: Browser?) -> [String: Any] {
         [
             "id": Bench.short(tab),
             "url": tab.address?.absoluteString ?? "",
             "title": tab.title,
             "name": tab.name ?? "",
+            "group": tab.groupID
+                .flatMap { id in browser?.groups.first { $0.id == id } }
+                .map { browser?.groupTitle($0) ?? "" } ?? "",
             "loading": tab.loading,
             "hollow": tab.hollow,
             "view": tab.built?.url?.absoluteString ?? "",
@@ -1445,6 +1669,97 @@ final class Bench {
             "muted": tab.muted,
             "extensions": { if #available(macOS 15.4, *) { return tab.carriesExtensions } else { return false } }(),
         ]
+    }
+
+    /// The groups as `probe` and every `group` answer report them; `list`
+    /// adds each one's member tabs.
+    private func groupList(_ browser: Browser, members: Bool = false) -> [[String: Any]] {
+        browser.orderedGroups.map { group in
+            var out: [String: Any] = [
+                "id": group.id.uuidString.lowercased(),
+                "title": browser.groupTitle(group),
+                "colour": group.colour,
+                "icon": group.icon,
+                "expanded": group.expanded,
+                "count": browser.groupCount(group),
+            ]
+            if members {
+                out["tabs"] = browser.tabs.filter { $0.groupID == group.id }.map(Bench.short)
+            }
+            return out
+        }
+    }
+
+    /// A menu's items as plain data — its titles, which are views or hold a
+    /// submenu — so the bench can say what a right-click would have shown
+    /// without a menu ever going up on anyone's screen.
+    private func describeMenu(_ menu: NSMenu) -> [[String: Any]] {
+        menu.items.map { item in
+            var out: [String: Any] = ["title": item.title, "enabled": item.isEnabled]
+            if item.isSeparatorItem { out["title"] = "—" }
+            if let view = item.view { out["view"] = String(reflecting: type(of: view)) }
+            if let submenu = item.submenu { out["submenu"] = describeMenu(submenu) }
+            return out
+        }
+    }
+
+    /// The picture box is flipped so a stack laid out from the top lands
+    /// that way in the bitmap too — cacheDisplay draws an unflipped view
+    /// bottom-first, which is how the hosting views' pictures elsewhere in
+    /// this file already come out the right way up. Its ground is drawn,
+    /// not a layer's: a cgColor resolves once against whatever appearance
+    /// happens to be ambient, while drawing resolves with the window's.
+    private final class Flipped: NSView {
+        override var isFlipped: Bool { true }
+        override func draw(_: NSRect) { NSColor.controlBackgroundColor.setFill(); bounds.fill() }
+    }
+
+    /// A menu's custom views stacked into one picture, for `group menu` —
+    /// the closest thing to drawing the menu itself, which can't be done
+    /// off screen. The views leave the menu for the drawing; it's a probe's
+    /// menu, never shown.
+    private func menuPicture(_ menu: NSMenu) -> NSBitmapImageRep? {
+        var views: [NSView] = []
+        for item in menu.items + (menu.items.compactMap(\.submenu).flatMap(\.items)) {
+            guard let view = item.view else { continue }
+            // Take the view away from its item before moving it: an item
+            // watches its view's frame and puts it back — a frame set while
+            // the item still owns it doesn't stick.
+            item.view = nil
+            views.append(view)
+        }
+        guard !views.isEmpty else { return nil }
+        let width: CGFloat = 240
+        let height = views.reduce(CGFloat(10)) { $0 + $1.frame.height + 10 }
+        let box = Flipped(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        var y: CGFloat = 10
+        for view in views {
+            // Reparent first, then place — and put autoresizing back on the
+            // frame: a menu lays its item views out with constraints, so a
+            // frame set while the view is still the menu's doesn't stick.
+            box.addSubview(view)
+            view.translatesAutoresizingMaskIntoConstraints = true
+            view.frame = NSRect(x: 0, y: y, width: width, height: view.frame.height)
+            y += view.frame.height + 10
+        }
+        let window = NSWindow(contentRect: box.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.appearance = NSApp.effectiveAppearance
+        window.contentView = box
+        box.layoutSubtreeIfNeeded()
+        guard let picture = box.bitmapImageRepForCachingDisplay(in: box.bounds) else { return nil }
+        box.cacheDisplay(in: box.bounds, to: picture)
+        return picture
+    }
+
+    /// A `group` argument: a 1-based number in `group list` order, or the
+    /// first characters of a group's id, as `id` is for tabs.
+    private func findGroup(_ request: [String: Any], in browser: Browser) -> TabGroup? {
+        let ref = ((request["group"] as? String) ?? (request["group"] as? Int).map(String.init))?.lowercased() ?? ""
+        guard !ref.isEmpty else { return nil }
+        if let n = Int(ref), browser.orderedGroups.indices.contains(n - 1) {
+            return browser.orderedGroups[n - 1]
+        }
+        return browser.groups.first { $0.id.uuidString.lowercased().hasPrefix(ref) }
     }
 
     static func short(_ tab: Tab) -> String {
@@ -1471,26 +1786,28 @@ final class Bench {
         CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
     }
 
-    /// Once the page has stopped loading, or the time is up.
-    private func wait(for tab: Tab, until limit: Date, _ answer: @escaping ([String: Any]) -> Void) {
-        if !tab.loading, tab.address != nil, tab.failure == nil || true {
+    /// Once the page has stopped loading, or the time is up. The browser is
+    /// passed in so Drive's `page.wait` — which may run with the bench itself
+    /// off — still describes the tab it waited on correctly.
+    func wait(for tab: Tab, in browser: Browser, until limit: Date, _ answer: @escaping ([String: Any]) -> Void) {
+        if !tab.loading, tab.address != nil || tab.failure != nil {
             // A beat for the document's own scripts to settle.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 guard let self else { return }
-                var out = describe(tab)
+                var out = describe(tab, in: browser)
                 if let failure = tab.failure { out["failure"] = failure }
                 answer(out)
             }
             return
         }
         guard Date() < limit else {
-            var out = describe(tab)
+            var out = describe(tab, in: browser)
             out["timeout"] = true
             answer(out)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.wait(for: tab, until: limit, answer)
+            self?.wait(for: tab, in: browser, until: limit, answer)
         }
     }
 
@@ -1500,9 +1817,12 @@ final class Bench {
 
     /// A page nobody is looking at has to be somewhere to be laid out at all.
     /// The stage takes it back the moment you pick its tab, and it comes
-    /// here again when the bench next needs it.
-    private func house(_ tab: Tab) {
-        guard tab.bench, tab.web.window == nil else { return }
+    /// here again when the bench next needs it. Not bench-only any more: the
+    /// agent's attached tabs need a window to paint in exactly the same way.
+    /// The `built` check keeps the question from being the reason a view
+    /// exists — a sleeping tab stays asleep.
+    func house(_ tab: Tab) {
+        guard tab.built != nil, tab.web.window == nil else { return }
         let window = room ?? makeRoom()
         tab.web.frame = window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
         tab.web.autoresizingMask = [.width, .height]
@@ -1528,11 +1848,11 @@ final class Bench {
         return window
     }
 
-    private func shoot(_ tab: Tab, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {
+    func shoot(_ tab: Tab, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {
         shoot(tab.web, to: file, width: width, answer)
     }
 
-    private func shoot(_ web: WKWebView, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {
+    func shoot(_ web: WKWebView, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {
         let shot = WKSnapshotConfiguration()
         shot.afterScreenUpdates = true
         if let width { shot.snapshotWidth = NSNumber(value: width) }
@@ -1558,7 +1878,7 @@ final class Bench {
     // MARK: - page-side helpers
 
     /// A JavaScript value the way JSON can carry it.
-    private static func plain(_ value: Any?) -> Any {
+    static func plain(_ value: Any?) -> Any {
         guard let value else { return NSNull() }
         if JSONSerialization.isValidJSONObject(["v": value]) { return value }
         return String(describing: value)
@@ -1567,7 +1887,7 @@ final class Bench {
     /// Where an element's middle is, in the page's own points, scrolled
     /// into view first. A selector, or `text=…` for a button or link by its
     /// words.
-    private static func locate(_ selector: String) -> String {
+    static func locate(_ selector: String) -> String {
         let sel = (try? JSONSerialization.data(withJSONObject: [selector])).flatMap { String(data: $0, encoding: .utf8) }.map { String($0.dropFirst().dropLast()) } ?? "\"\""
         return """
         (function () {
@@ -1591,7 +1911,7 @@ final class Bench {
     /// Click, type into, or submit the element a selector names. Typing goes
     /// through the field's own setter and fires the events a keystroke
     /// would, the same as the password filler, so frameworks notice.
-    private static func act(_ verb: String, selector: String, text: String) -> String {
+    static func act(_ verb: String, selector: String, text: String) -> String {
         let sel = (try? JSONSerialization.data(withJSONObject: [selector])).flatMap { String(data: $0, encoding: .utf8) }.map { String($0.dropFirst().dropLast()) } ?? "\"\""
         let txt = (try? JSONSerialization.data(withJSONObject: [text])).flatMap { String(data: $0, encoding: .utf8) }.map { String($0.dropFirst().dropLast()) } ?? "\"\""
         return """

@@ -1,0 +1,11 @@
+{
+  "name": "form-fill",
+  "tags": ["form", "smoke"],
+  "prompt": "Fill in the form on the page I have open: name Ada Lovelace, email ada@x.com, country France, tick the agree box, and submit it.",
+  "setup": {"tabs": [
+    {"url": "fixture:form", "as": "f", "via": "bench"}
+  ]},
+  "verify": {"kind": "js", "tab": "f",
+    "js": "!!document.getElementById('result') && /CONF-741/.test(document.getElementById('result').textContent) && /Ada/.test(document.getElementById('result').textContent)"},
+  "timeout": 90
+}

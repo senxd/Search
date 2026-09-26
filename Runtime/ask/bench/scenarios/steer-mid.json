@@ -1,0 +1,11 @@
+{
+  "name": "steer-mid",
+  "tags": ["steer"],
+  "prompt": "Count from 1 to 1000 for me, one number per line, and keep going until you reach 1000.",
+  "drive": [
+    {"sleep": 6},
+    {"steer": "Stop counting — just reply with the single word DONE."}
+  ],
+  "verify": {"kind": "chat", "expect": "\\bDONE\\b"},
+  "timeout": 120
+}

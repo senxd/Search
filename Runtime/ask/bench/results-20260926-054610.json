@@ -1,0 +1,70 @@
+{
+  "meta": {
+    "world": "bncheck",
+    "suite": "com.officecommun.search.test.bncheck",
+    "started": "20260926-054610",
+    "model_requested": "openai/gpt-6-luna",
+    "model_effective": "openrouter/openai/gpt-6-luna",
+    "provider": "openrouter",
+    "images": true,
+    "isolation": "chat",
+    "offline": false,
+    "app": "/Users/winter/Documents/GitHub/Search/.build/debug/Search",
+    "webkit_store": "Search",
+    "mode_forced": "full",
+    "port": 8877,
+    "filter": [
+      "consent-pin",
+      "iframe-count",
+      "sleeper"
+    ],
+    "reuse": false,
+    "fallback_relaunch": false,
+    "preflight_chats": [
+      "71D6272D-29E7-464A-B2BA-BE1B1D0AFB3C"
+    ],
+    "finished": "2026-09-26T05:47:30",
+    "passed": 0,
+    "failed": 3,
+    "skipped": 0,
+    "total": 3
+  },
+  "rows": [
+    {
+      "name": "consent-pin",
+      "ok": false,
+      "seconds": 25.211616039276123,
+      "toolCalls": {},
+      "chat": "649782FC-4A28-417D-9FD8-A1F169B5B443",
+      "detail": "FAIL(no agent message); ok(1/1 tabs url~*about.html bench=*)",
+      "shot": "/Users/winter/Documents/GitHub/Search/Runtime/ask/bench/shots/consent-pin.png",
+      "model_effective": "openrouter/openai/gpt-6-luna",
+      "rateLimited": true,
+      "reason": "verify"
+    },
+    {
+      "name": "iframe-count",
+      "ok": false,
+      "seconds": 25.613232851028442,
+      "toolCalls": {},
+      "chat": "1F881D6F-DC4A-4DFD-B666-ECB0BA6031D4",
+      "detail": "FAIL(no agent message); FAIL(eval on fc8ec4df: false)",
+      "shot": "/Users/winter/Documents/GitHub/Search/Runtime/ask/bench/shots/iframe-count.png",
+      "model_effective": "openrouter/openai/gpt-6-luna",
+      "rateLimited": true,
+      "reason": "verify"
+    },
+    {
+      "name": "sleeper",
+      "ok": false,
+      "seconds": 25.95235514640808,
+      "toolCalls": {},
+      "chat": "87F7A907-0296-43B0-BB75-4EA3C0A62D3F",
+      "detail": "FAIL(no agent message)",
+      "shot": "/Users/winter/Documents/GitHub/Search/Runtime/ask/bench/shots/sleeper.png",
+      "model_effective": "openrouter/openai/gpt-6-luna",
+      "rateLimited": true,
+      "reason": "verify"
+    }
+  ]
+}

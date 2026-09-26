@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Ask the Search you already have open to do something — the agent
+socket's shell driver, one session per command.
+
+    ./ask tabs                       every tab, yours and the agent's
+    ./ask agent-tabs                 only the ⚗ tabs
+    ./ask open URL [--foreground]    an agent tab at URL → its id
+    ./ask attach ID                  take read+drive rights on a tab (one of
+                                     yours must first be chipped in the app's
+                                     Ask panel — the wire can't grant)
+    ./ask detach ID                  give it back
+    ./ask close ID                   close an agent tab (the agent's own only)
+    ./ask select ID                  bring a tab to the front
+    ./ask go ID URL                  send a tab somewhere else
+    ./ask back|forward|reload ID     history buttons; reload wakes a sleeper
+    ./ask wait ID [SECONDS]          until the page has loaded
+    ./ask snap ID [--full] [--boxes] [--max-chars N]
+                                     the semantic tree (refs for click/fill/…)
+    ./ask text ID                    the page's text
+    ./ask shot ID [PATH] [--marks] [--width N]
+                                     a PNG of the page → its path
+    ./ask eval ID JS                 run JavaScript, print what it returns
+    ./ask code ID JS                 JS with the page driver in scope → {value, consoleLines}
+    ./ask console ID                 the console lines the driver heard
+    ./ask frames ID                  the page's frames
+    ./ask click ID REF|css:SEL|text:STR [--tier auto|js|event] [--double] [--button B]
+                                     [--modifiers M,…] [--with-snapshot]
+    ./ask fill ID REF|…|text:STR STR set a field atomically
+    ./ask type ID REF|…|text:STR STR [--delay MS]
+                                     real per-character keys
+    ./ask press ID KEY [REF] [MOD…]  Enter, Tab, Escape, a… — focus REF first,
+                                     then cmd shift ctrl opt (or --modifiers M,…)
+    ./ask hover ID REF               move-only
+    ./ask scroll ID [REF|page] [DY] [--dx N] [--to-text STR]
+                                     the page by default, an element by ref
+    ./ask choose ID REF VALUE…       options of a <select>
+    ./ask check ID REF [on|off]      a checkbox
+    ./ask submit ID [REF]            the form
+    ./ask clickat ID X Y             a click at page coordinates
+    ./ask lease ID on|off            hold/release the tab — your touch ends it
+    ./ask probe                      the window's own state: panels, groups, active
+    ./ask groups                     the tab groups (from probe)
+    ./ask spaces                     the spaces, when the build reports them
+    ./ask panel on|off               the Ask panel
+    ./ask events                     subscribed events as they happen, until Ctrl-C
+    ./ask ping                       is anyone home
+
+Needs Settings › General › "Let a script drive Search" switched on in the
+running app — same switch as bench, different door: this one keeps a
+session open on agent.sock where bench.sock takes one request per
+connection. IDs are the first characters of a tab's id, as `tabs` prints
+them; REFs are the `e3`-style handles `snap` prints (css:SEL and text:STR
+work anywhere a REF does). With --test, talks to a SEARCH_PROBE run
+instead of the real one; with --world NAME, to the world "Search (NAME)".
+Global flags go before the command — after the verb, "--…" words are the
+command's own (so `type ID e3 --yes` types "--yes").
+"""
+
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "sdk"))
+from search_agent import Agent, AgentError, SocketGone  # noqa: E402
+
+
+def out(answer):
+    print(json.dumps(answer, ensure_ascii=False, indent=2))
+
+
+def locator(word):
+    """REF, css:SEL, text:STR, loc:… — passed to the SDK as one target."""
+    return word
+
+
+# Modifier names — bench's spelling ("cmd shift ctrl opt") plus the aliases
+# drive.js knows — used by press to tell a MOD from a target ref.
+MODS = frozenset(("cmd", "meta", "shift", "ctrl", "control", "opt", "alt"))
+
+
+def parse(args, valued=()):
+    """A verb's own args → (positionals, {flag: True|value}).  ``--flag``,
+    ``--flag=V``, and — for the names in ``valued`` — ``--flag V`` too.
+    Anything without a ``--`` is positional, verbatim."""
+    pos, flags = [], {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--"):
+            name, eq, v = a[2:].partition("=")
+            if eq:
+                flags[name] = v
+            elif name in valued and i + 1 < len(args):
+                flags[name] = args[i + 1]
+                i += 1
+            else:
+                flags[name] = True
+        else:
+            pos.append(a)
+        i += 1
+    return pos, flags
+
+
+def num(word, what):
+    """A flag/positional that's supposed to be a number, or a clean exit."""
+    if word is True or word is None:
+        sys.exit(f"{what} needs a value")
+    try:
+        return float(word)
+    except (TypeError, ValueError):
+        sys.exit(f"{what} needs a number, got “{word}”")
+
+
+def main(argv):
+    argv = list(argv)
+    world = None
+    # Flags lead the command; past the verb a "--…" word is the verb's own
+    # — `type T e3 "--yes"` types "--yes".  (So --test/--world come before
+    # the verb; each verb's own flags come after it.)
+    while argv and argv[0].startswith("--"):
+        flag = argv.pop(0)
+        if flag == "--test":
+            world = "test"
+        elif flag == "--world":
+            if not argv:
+                sys.exit("usage: ask --world NAME COMMAND …")
+            world = argv.pop(0)
+        elif flag.startswith("--world="):
+            world = flag.split("=", 1)[1]
+        elif flag == "--yes":
+            pass  # kept for old invocations — a flag was never a grant
+        elif flag == "--help":
+            print(__doc__.strip())
+            return 0
+        else:
+            sys.exit(f"unknown flag “{flag}” — see ask help")
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    verb, args = argv[0], argv[1:]
+
+    try:
+        with Agent(world) as a:
+            if verb == "tabs":
+                if args:
+                    sys.exit("usage: ask tabs")
+                out({"tabs": a.tabs()})
+            elif verb == "agent-tabs":
+                if args:
+                    sys.exit("usage: ask agent-tabs")
+                out({"tabs": a.agent_tabs()})
+            elif verb == "open":
+                pos, flags = parse(args)
+                if len(pos) != 1 or set(flags) - {"foreground"}:
+                    sys.exit("usage: ask open URL [--foreground]")
+                print(a.open(pos[0], foreground=True if "foreground" in flags else None))
+            elif verb == "attach":
+                pos, flags = parse(args)
+                # --yes is still swallowed for old scripts, but it buys
+                # nothing: consent was never the wire's to give — a user
+                # tab's only grant is its chip in the app's Ask panel, and
+                # no retry or prompt can stand in for it.
+                if len(pos) != 1 or set(flags) - {"yes"}:
+                    sys.exit("usage: ask attach ID")
+                try:
+                    out(a.attach(pos[0]))
+                except AgentError as e:
+                    if "needs its chip" not in str(e):
+                        raise
+                    sys.exit(
+                        f"error: {e}\nthis tab needs its chip added in Ask "
+                        "first — attach it from the panel, then rerun"
+                    )
+            elif verb == "detach":
+                if len(args) != 1:
+                    sys.exit("usage: ask detach ID")
+                out(a.detach(args[0]))
+            elif verb == "close":
+                if len(args) != 1:
+                    sys.exit("usage: ask close ID")
+                out(a.close(args[0]))
+            elif verb == "select":
+                if len(args) != 1:
+                    sys.exit("usage: ask select ID")
+                out(a.select(args[0]))
+            elif verb == "go":
+                if len(args) != 2:
+                    sys.exit("usage: ask go ID URL")
+                out(a.go(args[0], args[1]))
+            elif verb in ("back", "forward", "reload"):
+                if len(args) != 1:
+                    sys.exit(f"usage: ask {verb} ID")
+                out(getattr(a, verb)(args[0]))
+            elif verb == "wait":
+                if not 1 <= len(args) <= 2:
+                    sys.exit("usage: ask wait ID [SECONDS]")
+                out(a.wait(args[0], num(args[1], "SECONDS") if len(args) > 1 else None))
+            elif verb == "snap":
+                pos, flags = parse(args, valued=("max-chars",))
+                if len(pos) != 1 or set(flags) - {"full", "boxes", "max-chars"}:
+                    sys.exit("usage: ask snap ID [--full] [--boxes] [--max-chars N]")
+                result = a.snapshot(
+                    pos[0],
+                    scope="full" if "full" in flags else "viewport",
+                    boxes="boxes" in flags,
+                    max_chars=(
+                        int(num(flags["max-chars"], "--max-chars"))
+                        if "max-chars" in flags else None
+                    ),
+                )
+                print(result["snapshot"])
+                if result.get("truncated"):
+                    print("\n[… truncated]", file=sys.stderr)
+            elif verb == "text":
+                if len(args) != 1:
+                    sys.exit("usage: ask text ID")
+                result = a.text(args[0])
+                print(result["text"])
+                if result.get("truncated"):
+                    print("\n[… truncated]", file=sys.stderr)
+            elif verb == "shot":
+                pos, flags = parse(args, valued=("width",))
+                if not 1 <= len(pos) <= 2 or set(flags) - {"marks", "width"}:
+                    sys.exit("usage: ask shot ID [PATH] [--marks] [--width N]")
+                result = a.screenshot(
+                    pos[0],
+                    path=pos[1] if len(pos) > 1 else None,
+                    marks="marks" in flags,
+                    width=num(flags["width"], "--width") if "width" in flags else None,
+                )
+                print(result["path"])
+            elif verb == "eval":
+                if len(args) != 2:
+                    sys.exit("usage: ask eval ID JS")
+                value = a.eval(args[0], args[1])
+                print(
+                    value
+                    if isinstance(value, str)
+                    else json.dumps(value, ensure_ascii=False, indent=2)
+                )
+            elif verb == "code":
+                if len(args) != 2:
+                    sys.exit("usage: ask code ID JS")
+                result = a.code(args[0], args[1])
+                value = result.get("value")
+                print(
+                    value
+                    if isinstance(value, str)
+                    else json.dumps(value, ensure_ascii=False, indent=2)
+                )
+                if result.get("consoleLines"):
+                    print(f"[+{result['consoleLines']} console line(s)]", file=sys.stderr)
+            elif verb == "console":
+                if len(args) != 1:
+                    sys.exit("usage: ask console ID")
+                out({"messages": a.console(args[0])})
+            elif verb == "frames":
+                if len(args) != 1:
+                    sys.exit("usage: ask frames ID")
+                out({"frames": a.frames(args[0])})
+            elif verb == "click":
+                pos, flags = parse(args, valued=("tier", "button", "modifiers"))
+                if len(pos) != 2 or set(flags) - {
+                    "tier", "button", "double", "with-snapshot", "modifiers"
+                }:
+                    sys.exit(
+                        "usage: ask click ID REF|css:SEL|text:STR "
+                        "[--tier auto|js|event] [--double] [--button left|middle|right] "
+                        "[--modifiers M,…] [--with-snapshot]"
+                    )
+                kw = {}
+                if "tier" in flags:
+                    if flags["tier"] not in ("auto", "js", "event"):
+                        sys.exit("--tier is auto, js or event")
+                    kw["tier"] = flags["tier"]
+                if "button" in flags:
+                    if flags["button"] not in ("left", "middle", "right"):
+                        sys.exit("--button is left, middle or right")
+                    kw["button"] = flags["button"]
+                if "double" in flags:
+                    kw["double"] = True
+                if "with-snapshot" in flags:
+                    kw["withSnapshot"] = True
+                if "modifiers" in flags:
+                    if flags["modifiers"] is True:
+                        sys.exit("--modifiers needs a value — --modifiers cmd,shift")
+                    kw["modifiers"] = [
+                        m for m in str(flags["modifiers"]).replace(" ", ",").split(",")
+                        if m
+                    ]
+                out(a.click(pos[0], locator(pos[1]), **kw))
+            elif verb == "fill":
+                if len(args) != 3:
+                    sys.exit("usage: ask fill ID REF|css:SEL|text:STR TEXT")
+                out(a.fill(args[0], locator(args[1]), args[2]))
+            elif verb == "type":
+                # TEXT is verbatim — flags are only read after it, so a
+                # literal "--delay" (or "--yes") still types as written.
+                if len(args) < 3:
+                    sys.exit("usage: ask type ID REF|css:SEL|text:STR TEXT [--delay MS]")
+                tail, flags = parse(args[3:], valued=("delay",))
+                if tail or set(flags) - {"delay"}:
+                    sys.exit("usage: ask type ID REF|css:SEL|text:STR TEXT [--delay MS]")
+                out(a.type(
+                    args[0], locator(args[1]), args[2],
+                    delay=num(flags["delay"], "--delay") if "delay" in flags else None,
+                ))
+            elif verb == "press":
+                pos, flags = parse(args, valued=("modifiers",))
+                if len(pos) < 2 or set(flags) - {"modifiers"}:
+                    sys.exit(
+                        "usage: ask press ID KEY [REF] [MOD…] [--modifiers M,…]"
+                    )
+                mods, target = [], None
+                # After KEY: a known modifier word is a mod, anything else
+                # is the ref to focus first — `press T Enter e3 shift`.
+                for w in pos[2:]:
+                    if w.lower() in MODS:
+                        mods.append(w)
+                    elif target is None:
+                        target = w
+                    else:
+                        sys.exit(
+                            "usage: ask press ID KEY [REF] [MOD…] [--modifiers M,…]"
+                        )
+                if "modifiers" in flags:
+                    if flags["modifiers"] is True:
+                        sys.exit("--modifiers needs a value — --modifiers cmd,shift")
+                    mods.extend(
+                        m for m in str(flags["modifiers"]).replace(" ", ",").split(",")
+                        if m
+                    )
+                out(a.press(pos[0], pos[1], target=target, modifiers=mods or None))
+            elif verb == "hover":
+                if len(args) != 2:
+                    sys.exit("usage: ask hover ID REF")
+                out(a.hover(args[0], locator(args[1])))
+            elif verb == "scroll":
+                pos, flags = parse(args, valued=("dx", "dy", "to-text"))
+                if not 1 <= len(pos) <= 3 or set(flags) - {"dx", "dy", "to-text"}:
+                    sys.exit(
+                        "usage: ask scroll ID [REF|page] [DY] "
+                        "[--dx N] [--dy N] [--to-text STR]"
+                    )
+                out(a.scroll(
+                    pos[0],
+                    locator(pos[1]) if len(pos) > 1 else "page",
+                    dx=num(flags["dx"], "--dx") if "dx" in flags else None,
+                    dy=(num(flags["dy"], "--dy") if "dy" in flags
+                        else (num(pos[2], "DY") if len(pos) > 2 else 600)),
+                    to_text=flags.get("to-text"),
+                ))
+            elif verb == "choose":
+                if len(args) < 3:
+                    sys.exit("usage: ask choose ID REF VALUE…")
+                out(a.select_option(args[0], locator(args[1]), args[2:]))
+            elif verb == "check":
+                if not 2 <= len(args) <= 3:
+                    sys.exit("usage: ask check ID REF [on|off]")
+                on = args[2] if len(args) > 2 else "on"
+                if on not in ("on", "off"):
+                    sys.exit("usage: ask check ID REF [on|off]")
+                out(a.check(args[0], locator(args[1]), on=on == "on"))
+            elif verb == "submit":
+                if not 1 <= len(args) <= 2:
+                    sys.exit("usage: ask submit ID [REF]")
+                out(a.submit(args[0], locator(args[1]) if len(args) > 1 else None))
+            elif verb == "clickat":
+                if len(args) != 3:
+                    sys.exit("usage: ask clickat ID X Y")
+                out(a.click_at(args[0], num(args[1], "X"), num(args[2], "Y")))
+            elif verb == "lease":
+                if len(args) != 2 or args[1] not in ("on", "off"):
+                    sys.exit("usage: ask lease ID on|off")
+                out(a.lease(args[0], on=args[1] == "on"))
+            elif verb == "probe":
+                if args:
+                    sys.exit("usage: ask probe")
+                out(a.probe())
+            elif verb == "groups":
+                if args:
+                    sys.exit("usage: ask groups")
+                out({"groups": a.groups()})
+            elif verb == "spaces":
+                if args:
+                    sys.exit("usage: ask spaces")
+                out({"spaces": a.spaces()})
+            elif verb == "panel":
+                if len(args) != 1 or args[0] not in ("on", "off"):
+                    sys.exit("usage: ask panel on|off")
+                out(a.ask_open(args[0] == "on"))
+            elif verb == "events":
+                if args:
+                    sys.exit("usage: ask events")
+                a.subscribe(["*"])
+                try:
+                    for ev in a.events():
+                        print(json.dumps(ev, ensure_ascii=False), flush=True)
+                except KeyboardInterrupt:
+                    pass
+            elif verb == "ping":
+                if args:
+                    sys.exit("usage: ask ping")
+                out(a.ping())
+            else:
+                sys.exit(f"unknown command “{verb}” — see ask help")
+    except SocketGone as e:
+        sys.exit(f"error: {e}")
+    except AgentError as e:
+        sys.exit(f"error: {e}")
+    except TimeoutError as e:
+        sys.exit(f"error: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

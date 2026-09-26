@@ -5,17 +5,22 @@ import Foundation
 // page or in the history file next door.
 
 enum Session {
-    struct Entry: Codable {
+    struct Entry: Codable, Equatable {
         var url: String
         var title: String
         var pin: String?
         /// The name you gave the tab, when you gave it one.
         var name: String?
+        /// The group it sat in, when it sat in one.
+        var groupID: UUID?
     }
 
     struct Shape: Codable {
         var tabs: [Entry]
         var active: Int
+        /// The groups the tabs were in. Nil in files from before groups —
+        /// which is what makes those files still read.
+        var groups: [TabGroup]?
     }
 
     /// The first space's is the session there always was; each other space

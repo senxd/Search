@@ -1,0 +1,65 @@
+{
+  "meta": {
+    "world": "wbfix",
+    "suite": "com.officecommun.search.test.wbfix",
+    "started": "20260926-051841",
+    "model_requested": "echo",
+    "model_effective": "echo/echo",
+    "provider": "echo",
+    "images": false,
+    "isolation": "chat",
+    "offline": false,
+    "app": "/Users/winter/Documents/GitHub/Search/.build/debug/Search",
+    "webkit_store": "Search",
+    "mode_forced": "full",
+    "port": 8877,
+    "filter": [
+      "smoke"
+    ],
+    "reuse": false,
+    "fallback_relaunch": false,
+    "preflight_chats": [
+      "4813D931-1EFD-4388-A127-C88471D1B581"
+    ],
+    "finished": "2026-09-26T05:18:56",
+    "passed": 0,
+    "failed": 3,
+    "skipped": 0,
+    "total": 3
+  },
+  "rows": [
+    {
+      "name": "form-fill",
+      "ok": false,
+      "seconds": 3.213589906692505,
+      "toolCalls": {},
+      "chat": "9C6DA1CB-2DB0-4B51-B70D-60F89BA0718B",
+      "detail": "eval on fb3e137c: false",
+      "shot": "/Users/winter/Documents/GitHub/Search/Runtime/ask/bench/shots/form-fill.png",
+      "model_effective": "echo/echo",
+      "reason": "verify"
+    },
+    {
+      "name": "nav-title",
+      "ok": false,
+      "seconds": 2.785733222961426,
+      "toolCalls": {},
+      "chat": "392A21C9-2F05-4032-A422-AE901F90803E",
+      "detail": "FAIL(last agent text ~ /Example Domain/); FAIL(0/1 tool cards tab_open failed=*)",
+      "shot": "/Users/winter/Documents/GitHub/Search/Runtime/ask/bench/shots/nav-title.png",
+      "model_effective": "echo/echo",
+      "reason": "verify"
+    },
+    {
+      "name": "stop-mid",
+      "ok": false,
+      "seconds": 6.083087205886841,
+      "toolCalls": {},
+      "chat": "9DE55ECD-2123-4D0A-8E7B-11561F446CB5",
+      "detail": "turn already over at stop (role 'agent', no writes after it) — the quiet is vacuous",
+      "shot": "/Users/winter/Documents/GitHub/Search/Runtime/ask/bench/shots/stop-mid.png",
+      "model_effective": "echo/echo",
+      "reason": "verify"
+    }
+  ]
+}

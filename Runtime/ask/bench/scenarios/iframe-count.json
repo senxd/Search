@@ -1,0 +1,14 @@
+{
+  "name": "iframe-count",
+  "tags": ["frames"],
+  "prompt": "There's a counter inside the frame on this page — click its button once and tell me the count it shows.",
+  "setup": {"tabs": [
+    {"url": "fixture:frames", "as": "fr", "via": "bench"}
+  ]},
+  "verify": {"kind": "all", "checks": [
+    {"kind": "chat", "expect": "\\b1\\b"},
+    {"kind": "js", "tab": "fr",
+      "js": "!!document.querySelector('iframe') && document.querySelector('iframe').contentDocument.getElementById('count').textContent.trim() === '1'"}
+  ]},
+  "timeout": 90
+}

@@ -1,0 +1,11 @@
+{
+  "name": "snap-buttons",
+  "tags": ["snapshot"],
+  "prompt": "The Mission Control page I have open — what buttons does it have? List them all.",
+  "setup": {"tabs": [
+    {"url": "fixture:dashboard", "as": "d", "via": "bench"}
+  ]},
+  "verify": {"kind": "chat", "i": true,
+    "expect": "(?=[\\s\\S]*Deploy)(?=[\\s\\S]*Abort)(?=[\\s\\S]*Ping)|(?=[\\s\\S]*Deploy)(?=[\\s\\S]*Abort)(?=[\\s\\S]*Reset)|(?=[\\s\\S]*Deploy)(?=[\\s\\S]*Ping)(?=[\\s\\S]*Reset)|(?=[\\s\\S]*Abort)(?=[\\s\\S]*Ping)(?=[\\s\\S]*Reset)"},
+  "timeout": 90
+}

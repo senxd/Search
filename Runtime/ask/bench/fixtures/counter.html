@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Counter</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 2rem; }
+  #count { font-size: 2rem; font-weight: 700; }
+  button { font-size: 1.1rem; padding: .5rem 1.4rem; }
+</style>
+<h1>Counter</h1>
+<p id="count">0</p>
+<button id="bump" type="button">Bump</button>
+<script>
+  var count = 0;
+  document.getElementById('bump').addEventListener('click', function () {
+    count += 1;
+    document.getElementById('count').textContent = String(count);
+  });
+</script>

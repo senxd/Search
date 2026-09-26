@@ -1,0 +1,10 @@
+{
+  "name": "snap-text",
+  "tags": ["snapshot"],
+  "prompt": "What's the label on the first row of the page I have open?",
+  "setup": {"tabs": [
+    {"url": "fixture:longscroll", "as": "s", "via": "bench"}
+  ]},
+  "verify": {"kind": "chat", "expect": "\\brow 1\\b", "i": true},
+  "timeout": 90
+}

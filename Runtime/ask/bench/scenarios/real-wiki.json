@@ -1,0 +1,11 @@
+{
+  "name": "real-wiki",
+  "tags": ["real"],
+  "skipIf": "offline",
+  "prompt": "Open en.wikipedia.org, search for Bicycle, and read me the first sentence of the article.",
+  "verify": {"kind": "all", "checks": [
+    {"kind": "chat", "expect": "bicycle", "i": true},
+    {"kind": "tool", "minCalls": 2}
+  ]},
+  "timeout": 120
+}

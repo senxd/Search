@@ -1,0 +1,11 @@
+{
+  "name": "stale-retry",
+  "tags": ["click"],
+  "prompt": "Click the Sync button on this page — it can fail the first time, so if it does, take another look and try again.",
+  "setup": {"tabs": [
+    {"url": "fixture:stale", "as": "s", "via": "bench"}
+  ]},
+  "verify": {"kind": "js", "tab": "s",
+    "js": "!!document.getElementById('synced') && document.getElementById('synced').textContent.indexOf('SYNCED') >= 0"},
+  "timeout": 90
+}

@@ -50,6 +50,11 @@ enum FluidTone {
     static let muted = dynamic(NSColor(white: 0.269, alpha: 1), NSColor(white: 0.97, alpha: 1))
     /// --border: neutral-200 / white 10%.
     static let border = dynamic(NSColor(white: 1, alpha: 0.10), NSColor(white: 0.922, alpha: 1))
+    /// The stronger border unchecked boxes show on hover: neutral-400 / -500.
+    static let borderStrong = dynamic(
+        NSColor(srgbRed: 0x73/255, green: 0x73/255, blue: 0x73/255, alpha: 1),
+        NSColor(srgbRed: 0xA3/255, green: 0xA3/255, blue: 0xA3/255, alpha: 1)
+    )
     /// --focus-ring: #6B97FF in both schemes.
     static let focusRing = Color(red: 0x6B/255, green: 0x97/255, blue: 1)
     /// The switch's on fill: #6B97FF resting, #5C89F2 hovered.
@@ -258,6 +263,10 @@ final class FluidHover {
 
 extension EnvironmentValues {
     @Entry var fluidHover: FluidHover? = nil
+    /// The ambient shape context — React's ShapeProvider. Popups ignore
+    /// it (always rounded); triggers/inputs follow it.
+    @Entry var fluidShape: FluidShape = .rounded
+    @Entry var fluidSize: FluidSize = .default
 }
 
 // MARK: - Modifiers

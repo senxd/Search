@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Buggy Boot</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 2rem; }
+</style>
+<h1>It looks fine</h1>
+<p>The page renders — the trouble only shows on the console.</p>
+<script>
+  console.log('boot: starting');
+  console.error('boot failed: config module threw "ENOENT settings.json"');
+  console.warn('boot: continuing with defaults');
+</script>

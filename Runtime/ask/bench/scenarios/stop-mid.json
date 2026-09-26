@@ -1,0 +1,12 @@
+{
+  "name": "stop-mid",
+  "tags": ["stop", "smoke"],
+  "prompt": "Count from 1 to 1000 slowly, one number per line — take your time, don't rush.",
+  "drive": [
+    {"sleep": 5},
+    {"stop": true}
+  ],
+  "until": "quiet",
+  "verify": {"kind": "stopped", "within": 15},
+  "timeout": 60
+}

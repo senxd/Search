@@ -8,8 +8,9 @@ import SwiftUI
 // redraw when one changes. Defaults are chosen so that a browser nobody has
 // configured behaves the way it always did.
 
-/// What a tab wears beside its title, and what a pinned one is reduced to: a
-/// letter, or the site's own icon.
+/// What a loose tab wears beside its title: a letter, or the site's own
+/// icon — a spinner stands in for the mark while the page loads. A pinned
+/// one always wears the icon; the letter is for when the site has none.
 enum Glyph: String, CaseIterable, Identifiable {
     case letters, icons
 
@@ -208,6 +209,13 @@ final class Preferences: ObservableObject {
         didSet { store.set(usesSpaces, forKey: "spaces") }
     }
 
+    /// Ask, the assistant beside the page: whether its button sits in the
+    /// tab bar. On unless turned off — whether the panel itself is open is
+    /// Mind's "ask.open", not this.
+    @Published var ask: Bool {
+        didSet { store.set(ask, forKey: "ask") }
+    }
+
     init() {
         // Carried over from when there were four ways of holding the browser
         // and this was one of them.
@@ -287,6 +295,7 @@ final class Preferences: ObservableObject {
         let fast = store.bool(forKey: "pages.120")
         fastPages = fast
         FrameRate.fast = fast
+        ask = store.object(forKey: "ask") as? Bool ?? true
         // Left behind by the Web Inspector's switch, from before it was
         // always there.
         store.removeObject(forKey: "inspector")

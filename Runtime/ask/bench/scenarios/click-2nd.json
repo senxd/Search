@@ -1,0 +1,11 @@
+{
+  "name": "click-2nd",
+  "tags": ["click"],
+  "prompt": "Click the second link in the list on this page.",
+  "setup": {"tabs": [
+    {"url": "fixture:links", "as": "l", "via": "bench"}
+  ]},
+  "verify": {"kind": "js", "tab": "l",
+    "js": "location.pathname.endsWith('/link-1.html')"},
+  "timeout": 90
+}

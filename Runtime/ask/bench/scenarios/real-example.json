@@ -1,0 +1,8 @@
+{
+  "name": "real-example",
+  "tags": ["real"],
+  "skipIf": "offline",
+  "prompt": "Open example.com — what is this domain actually for?",
+  "verify": {"kind": "chat", "expect": "illustrative|examples", "i": true},
+  "timeout": 90
+}

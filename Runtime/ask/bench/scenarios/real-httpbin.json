@@ -1,0 +1,8 @@
+{
+  "name": "real-httpbin",
+  "tags": ["real", "form"],
+  "skipIf": "offline",
+  "prompt": "Go to https://httpbin.org/forms/post, fill the custname field with Test Person, submit the form, and tell me what name the response shows.",
+  "verify": {"kind": "chat", "expect": "Test Person"},
+  "timeout": 120
+}

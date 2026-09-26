@@ -1,0 +1,13 @@
+{
+  "name": "read-console",
+  "tags": ["console"],
+  "prompt": "Is the page I have open logging any errors?",
+  "setup": {"tabs": [
+    {"url": "fixture:buggy", "as": "b", "via": "bench"}
+  ]},
+  "verify": {"kind": "all", "checks": [
+    {"kind": "chat", "expect": "error", "i": true},
+    {"kind": "tool", "name": "console", "minCalls": 1}
+  ]},
+  "timeout": 90
+}

@@ -1,0 +1,10 @@
+{
+  "name": "extract-links",
+  "tags": ["snapshot"],
+  "prompt": "Give me the hrefs of the first three links on this page, in order.",
+  "setup": {"tabs": [
+    {"url": "fixture:links", "as": "l", "via": "bench"}
+  ]},
+  "verify": {"kind": "chat", "expect": "link-0.*link-1.*link-2"},
+  "timeout": 90
+}

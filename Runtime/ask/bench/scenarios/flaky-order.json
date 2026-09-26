@@ -1,0 +1,11 @@
+{
+  "name": "flaky-order",
+  "tags": ["click"],
+  "prompt": "Place the order on the checkout page I have open.",
+  "setup": {"tabs": [
+    {"url": "fixture:flaky", "as": "fl", "via": "bench"}
+  ]},
+  "verify": {"kind": "js", "tab": "fl",
+    "js": "location.pathname.endsWith('/ordered.html')"},
+  "timeout": 90
+}

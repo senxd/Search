@@ -1,0 +1,11 @@
+{
+  "name": "click-covered",
+  "tags": ["click"],
+  "prompt": "Click the Buy button on the page I have open.",
+  "setup": {"tabs": [
+    {"url": "fixture:covered", "as": "c", "via": "bench"}
+  ]},
+  "verify": {"kind": "js", "tab": "c",
+    "js": "!!document.getElementById('bought') && getComputedStyle(document.getElementById('bought')).display !== 'none'"},
+  "timeout": 90
+}

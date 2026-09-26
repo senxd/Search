@@ -271,6 +271,8 @@ private final class CursorGroundView: NSView {
 struct ContentView: View {
     @ObservedObject var browser: Browser
     @Environment(\.openWindow) private var openWindow
+    /// Ask's rail on the right edge — whether it is out is the panel's state.
+    @ObservedObject private var mind = Mind.shared
 
     @State private var keys: Any?
     @State private var window: NSWindow?
@@ -311,8 +313,22 @@ struct ContentView: View {
                     .transition(.move(edge: .leading))
             }
 
+            // Ask, beside the page the way the column is beside it on
+            // the other edge — the page gives ground rather than being
+            // covered. Off in settings means off, even mid-open.
+            if rail {
+                AskPanel(browser: browser)
+                    .frame(width: 380)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+
             if !browser.prefs.sidebar, !browser.folded, browser.active?.immersed != true {
                 TabBar(browser: browser)
+                    // The rail owns the window's whole right column — the
+                    // strip ends at its edge rather than spanning above it,
+                    // and its doors (Ask included) ride the same spring left.
+                    .padding(.trailing, rail ? 380 : 0)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
 
@@ -326,6 +342,7 @@ struct ContentView: View {
         }
         .ignoresSafeArea()
         .animation(Motion.glide, value: browser.prefs.sidebar)
+        .animation(Motion.glide, value: rail)
         .animation(.easeOut(duration: 0.12), value: browser.active?.immersed)
         .onAppear { if room == nil { room = chrome } }
         .onChange(of: chrome) { old, new in make(room: new, after: old) }
@@ -428,6 +445,7 @@ struct ContentView: View {
                 // is not what the field is standing over, and dimming it along
                 // with the page says otherwise.
                 .padding(.leading, sidebar ? browser.prefs.sideWidth : 0)
+                .padding(.trailing, rail ? 380 : 0)
                 .transition(.scale(scale: 0.97).combined(with: .opacity))
         }
     }
@@ -688,6 +706,12 @@ struct ContentView: View {
     /// True while the tabs are down the left, and not folded away (see Fold.swift).
     private var sidebar: Bool {
         browser.prefs.sidebar && !browser.folded && browser.active?.immersed != true
+    }
+
+    /// True while Ask's card is out on the right — off in Settings means off
+    /// even mid-open, the way the column's own switch is live.
+    private var rail: Bool {
+        mind.open && browser.prefs.ask
     }
 
     /// The column has its own corner for the lights, so the page beside it
