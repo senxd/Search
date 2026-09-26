@@ -9,6 +9,8 @@ struct SearchApp: App {
     @StateObject private var browser = Browser()
     /// Links from other apps, and the Dock icon.
     @NSApplicationDelegateAdaptor(Links.self) private var links
+    /// Opens the Fluid Functionalism gallery (View › Fluid Gallery).
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         Window("Search", id: "browser") {
@@ -100,6 +102,8 @@ struct SearchApp: App {
                     .keyboardShortcut("j", modifiers: [.command, .option])
                 Button("Inspect Element") { browser.inspectElement() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
+                Divider()
+                Button("Fluid Gallery") { openWindow(id: "fluid") }
             }
             CommandMenu("Tabs") {
                 Button("Back") { browser.back() }
@@ -195,6 +199,13 @@ struct SearchApp: App {
                 Button("Send Feedback…") { Links.writeFeedback() }
             }
         }
+
+        // The Fluid Functionalism component port, live inside the app —
+        // View › Fluid Gallery opens it.
+        Window("Fluid Gallery", id: "fluid") {
+            FluidGallery()
+        }
+        .defaultSize(width: 1120, height: 600)
     }
 }
 
@@ -259,6 +270,7 @@ private final class CursorGroundView: NSView {
 
 struct ContentView: View {
     @ObservedObject var browser: Browser
+    @Environment(\.openWindow) private var openWindow
 
     @State private var keys: Any?
     @State private var window: NSWindow?
@@ -524,6 +536,11 @@ struct ContentView: View {
             // Addresses from other apps have somewhere to go from here on.
             Links.hand(to: browser)
             BookmarkMenu.shared.start(for: browser)
+            // FLUID_GALLERY=1 opens the component gallery straight into a
+            // window — how the port is verified headlessly.
+            if ProcessInfo.processInfo.environment["FLUID_GALLERY"] == "1" {
+                openWindow(id: "fluid")
+            }
         }
     }
 
