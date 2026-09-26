@@ -65,6 +65,7 @@
     ./bench place ID INDEX             put a tab at another place in the row
     ./bench pin ID [on|off]            pin a tab to the head of the row, or take the pin off — --test runs only
     ./bench film peek|unpeek|fold PATH [N] [SECS]  the window drawn N times while it animates → PATH-00.png… — --test runs only
+    ./bench winshot PATH               the whole window — chrome, lights, tabs and page — drawn to a PNG
     ./bench ui KEY VALUE               settings/passwords/welcome/history/downloads/bookmarks/hidden on|off,
                                        look light|dark|system, sidebar on|off, spaces on|off, hides on|off,
                                        folded on|off, peek on|off
@@ -254,6 +255,9 @@ def main(argv):
         request["action"], request["path"] = args[0], os.path.abspath(args[1])
         if len(args) > 2: request["frames"] = int(args[2])
         if len(args) > 3: request["every"] = float(args[3])
+    elif verb == "winshot":
+        if len(args) != 1: sys.exit("usage: bench winshot PATH")
+        request["path"] = os.path.abspath(args[0])
     elif verb not in ("tabs", "probe", "extensions"):
         sys.exit(f"unknown command “{verb}” — see bench help")
 

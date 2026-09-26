@@ -84,7 +84,7 @@ final class Float {
         // WebKit puts its own pinch recogniser on a web view, and a gesture
         // recogniser is consulted before the responder chain is. With it left
         // on, every pinch aimed at this window went into zooming the page
-        // inside it instead of sizing the window. It comes back on landing.
+        // inside it instead of sizing the window.
         (page as? WKWebView)?.allowsMagnification = false
 
         page.removeFromSuperview()
@@ -137,7 +137,7 @@ final class Float {
         guard let panel else { return }
         ticker?.invalidate()
         ticker = nil
-        (page as? WKWebView)?.allowsMagnification = true
+        (page as? WKWebView)?.allowsMagnification = false
         page?.removeFromSuperview()
         page = nil
         controls = nil

@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Canvas Box</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 2rem; }
+  canvas { display: block; }
+</style>
+<h1>A drawing, not words</h1>
+<p>There is a blue box below with a word painted inside it.</p>
+<canvas id="c" width="360" height="160"></canvas>
+<script>
+  // The word exists only as pixels — no DOM text, no aria label, no alt.
+  var ctx = document.getElementById('c').getContext('2d');
+  ctx.fillStyle = '#e8e8ec';
+  ctx.fillRect(0, 0, 360, 160);
+  ctx.fillStyle = '#1a4fc4';
+  ctx.fillRect(30, 30, 300, 100);
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 44px -apple-system, Helvetica, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('TEMPO', 180, 82);
+</script>

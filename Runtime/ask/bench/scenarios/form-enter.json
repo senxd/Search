@@ -1,0 +1,11 @@
+{
+  "name": "form-enter",
+  "tags": ["form"],
+  "prompt": "Focus the field on this page, type \"hello world\", then press Enter.",
+  "setup": {"tabs": [
+    {"url": "fixture:keys", "as": "k", "via": "bench"}
+  ]},
+  "verify": {"kind": "js", "tab": "k",
+    "js": "document.querySelectorAll('#log li').length === 1"},
+  "timeout": 90
+}

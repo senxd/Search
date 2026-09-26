@@ -1,0 +1,11 @@
+{
+  "name": "multi-compare",
+  "tags": ["compare"],
+  "prompt": "I've got two tabs open with the same desk lamp from two different shops — which listing costs more, and what does it cost?",
+  "setup": {"tabs": [
+    {"url": "fixture:compare-a", "as": "a", "via": "bench"},
+    {"url": "fixture:compare-b", "as": "b", "via": "bench"}
+  ]},
+  "verify": {"kind": "chat", "expect": "43|compare-b", "i": true},
+  "timeout": 90
+}

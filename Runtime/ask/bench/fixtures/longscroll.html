@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Long Scroll</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 2rem; }
+  .row { padding: .55rem .4rem; border-bottom: 1px solid #ddd; }
+  .row b { display: inline-block; width: 5rem; }
+  #the-end { margin: 2rem 0; padding: 1rem; text-align: center;
+             font-weight: 700; letter-spacing: .2em; color: #6a1b9a; }
+</style>
+<h1>Two hundred rows</h1>
+<div id="rows"></div>
+<div id="tail"></div>
+<script>
+  // Two hundred labelled rows. The last line is not in the markup at all —
+  // it is inserted only when the bottom comes close to the viewport, so a
+  // page read top-down never sees it until the scroll gets there.
+  var rows = document.getElementById('rows');
+  for (var i = 1; i <= 200; i++) {
+    var d = document.createElement('div');
+    d.className = 'row';
+    d.innerHTML = '<b>Row ' + i + '</b> inventory line ' + i + ' — counted and filed.';
+    rows.appendChild(d);
+  }
+  var marker = document.createElement('div');
+  marker.id = 'near-end';
+  document.getElementById('tail').appendChild(marker);
+  var done = false;
+  function reveal() {
+    if (done) return;
+    done = true;
+    var end = document.createElement('div');
+    end.id = 'the-end';
+    end.textContent = 'THE END';
+    document.getElementById('tail').appendChild(end);
+  }
+  if ('IntersectionObserver' in window) {
+    new IntersectionObserver(function (entries) {
+      if (entries.some(function (e) { return e.isIntersecting; })) reveal();
+    }, { rootMargin: '300px' }).observe(marker);
+  }
+  // Fallback for a reader that checks by hand.
+  window.addEventListener('scroll', function () {
+    if (window.innerHeight + window.scrollY > document.body.scrollHeight - 400) reveal();
+  });
+</script>

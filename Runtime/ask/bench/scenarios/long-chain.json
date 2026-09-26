@@ -1,0 +1,13 @@
+{
+  "name": "long-chain",
+  "tags": ["form", "nav"],
+  "prompt": "Two things: fill in this form for Grace Hopper — email grace@example.com, country France, agree ticked — and submit it; then open http://127.0.0.1:{port}/links.html in a new tab and click the first link.",
+  "setup": {"tabs": [
+    {"url": "fixture:form", "as": "f", "via": "bench"}
+  ]},
+  "verify": {"kind": "all", "checks": [
+    {"kind": "js", "tab": "last", "js": "location.pathname.endsWith('/link-0.html')"},
+    {"kind": "chat", "expect": "CONF-741|link-0|Link 0", "i": true}
+  ]},
+  "timeout": 150
+}

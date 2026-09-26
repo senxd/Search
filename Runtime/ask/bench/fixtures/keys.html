@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Key Log</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 2rem; }
+  input { width: 20rem; padding: .4rem; }
+</style>
+<h1>Key log</h1>
+<p>Type into the field and press Enter — each entry is logged.</p>
+<input id="field" type="text" autocomplete="off" placeholder="type here, then Enter">
+<ul id="log"></ul>
+<script>
+  document.getElementById('field').addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter') return;
+    var li = document.createElement('li');
+    li.textContent = this.value;
+    document.getElementById('log').appendChild(li);
+    this.value = '';
+  });
+</script>

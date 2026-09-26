@@ -1,0 +1,67 @@
+{
+  "meta": {
+    "world": "bncheck2",
+    "suite": "com.officecommun.search.test.bncheck2",
+    "started": "20260926-054736",
+    "model_requested": "codex/gpt-6-luna",
+    "model_effective": "codex/gpt-6-luna",
+    "provider": "codex",
+    "images": true,
+    "isolation": "chat",
+    "offline": false,
+    "app": "/Users/winter/Documents/GitHub/Search/.build/debug/Search",
+    "webkit_store": "Search",
+    "mode_forced": "full",
+    "port": 8877,
+    "filter": [
+      "consent-pin",
+      "iframe-count",
+      "sleeper"
+    ],
+    "reuse": false,
+    "fallback_relaunch": false,
+    "preflight_chats": [
+      "B6E748B8-2D7B-46C9-A746-8E4E7D1F7D0B"
+    ],
+    "finished": "2026-09-26T05:47:49",
+    "passed": 0,
+    "failed": 3,
+    "skipped": 0,
+    "total": 3
+  },
+  "rows": [
+    {
+      "name": "consent-pin",
+      "ok": false,
+      "seconds": 3.2318899631500244,
+      "toolCalls": {},
+      "chat": "71F3B304-C979-4E56-AE54-7F6EEF422096",
+      "detail": "FAIL(no agent message); ok(1/1 tabs url~*about.html bench=*)",
+      "shot": "/Users/winter/Documents/GitHub/Search/Runtime/ask/bench/shots/consent-pin.png",
+      "model_effective": "codex/gpt-6-luna",
+      "reason": "verify"
+    },
+    {
+      "name": "iframe-count",
+      "ok": false,
+      "seconds": 3.381887912750244,
+      "toolCalls": {},
+      "chat": "77C14A51-6205-4E73-800D-B83D4A284ED6",
+      "detail": "FAIL(no agent message); FAIL(eval on 860c4718: false)",
+      "shot": "/Users/winter/Documents/GitHub/Search/Runtime/ask/bench/shots/iframe-count.png",
+      "model_effective": "codex/gpt-6-luna",
+      "reason": "verify"
+    },
+    {
+      "name": "sleeper",
+      "ok": false,
+      "seconds": 3.2204558849334717,
+      "toolCalls": {},
+      "chat": "0FF6BEE4-B27B-4433-9093-961FCD5A00B7",
+      "detail": "FAIL(no agent message)",
+      "shot": "/Users/winter/Documents/GitHub/Search/Runtime/ask/bench/shots/sleeper.png",
+      "model_effective": "codex/gpt-6-luna",
+      "reason": "verify"
+    }
+  ]
+}

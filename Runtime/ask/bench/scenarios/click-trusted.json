@@ -1,0 +1,11 @@
+{
+  "name": "click-trusted",
+  "tags": ["click"],
+  "prompt": "Click the Vote button on the page I have open.",
+  "setup": {"tabs": [
+    {"url": "fixture:trusted", "as": "t", "via": "bench"}
+  ]},
+  "verify": {"kind": "js", "tab": "t",
+    "js": "document.getElementById('count').textContent.trim() === '1'"},
+  "timeout": 90
+}

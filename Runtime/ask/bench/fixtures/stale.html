@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Stale Sync</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 2rem; }
+  #synced { margin-top: 1rem; color: #1b5e20; font-weight: 600; }
+</style>
+<h1>Sync panel</h1>
+<p>The panel rebuilds itself every two seconds — anything you were holding goes stale.</p>
+<div id="box"></div>
+<div id="synced"></div>
+<script>
+  // Everything inside #box is thrown away and rebuilt every 2 s, so an
+  // element handle taken from one snapshot is a dead node by the next.
+  // The result lives outside the box and survives the rebuilds.
+  function build() {
+    var box = document.getElementById('box');
+    box.innerHTML = '<button id="sync" type="button">Sync</button>' +
+      ' <span class="stamp">rebuilt ' + new Date().toLocaleTimeString() + '</span>';
+    document.getElementById('sync').addEventListener('click', function () {
+      document.getElementById('synced').textContent = 'SYNCED';
+    });
+  }
+  build();
+  setInterval(build, 2000);
+</script>

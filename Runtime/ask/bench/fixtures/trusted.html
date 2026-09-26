@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Trusted Vote</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 2rem; }
+  button { font-size: 1.1rem; padding: .5rem 1.2rem; }
+</style>
+<h1>Vote</h1>
+<p>Only a real click counts — synthetic events are silently ignored.</p>
+<button id="vote" type="button">Vote</button>
+<p>Votes: <b id="count">0</b></p>
+<script>
+  // Deliberately no feedback for untrusted clicks: any DOM twitch would
+  // tell the driver's auto tier the click landed, and it would never
+  // escalate to a real event. Silence is what the escalation needs.
+  var count = 0;
+  document.getElementById('vote').addEventListener('click', function (e) {
+    if (!e.isTrusted) return;
+    count += 1;
+    document.getElementById('count').textContent = String(count);
+  });
+</script>

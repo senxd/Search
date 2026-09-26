@@ -11,11 +11,15 @@ struct SettingsPanel: View {
 
     @ObservedObject private var updater = Updater.shared
     @ObservedObject private var shield = Shield.shared
+    @ObservedObject private var mind = Mind.shared
     @State private var isDefault = Links.isDefault
     @State private var page: Page = Page(rawValue: Store.settings.string(forKey: "settings.page") ?? "") ?? .general
+    /// Bumped when a Codex import lands, so its key line re-reads Keys and
+    /// shows Set rather than an empty field.
+    @State private var codexStamp = 0
 
     enum Page: String, CaseIterable, Identifiable {
-        case general, tabs, extensions, passwords, downloads, privacy, about
+        case general, tabs, extensions, passwords, downloads, privacy, ask, about
         var id: String { rawValue }
         var title: String {
             switch self {
@@ -25,6 +29,7 @@ struct SettingsPanel: View {
             case .passwords: return "Passwords"
             case .downloads: return "Downloads"
             case .privacy: return "Privacy"
+            case .ask: return "Ask"
             case .about: return "About"
             }
         }
@@ -36,6 +41,7 @@ struct SettingsPanel: View {
             case .passwords: return "key"
             case .downloads: return "arrow.down.circle"
             case .privacy: return "hand.raised"
+            case .ask: return "sparkles"
             case .about: return "info.circle"
             }
         }
@@ -137,6 +143,7 @@ struct SettingsPanel: View {
                     case .passwords: passwords
                     case .downloads: downloads
                     case .privacy: privacy
+                    case .ask: ask
                     case .about: about
                     }
                 }
@@ -369,6 +376,175 @@ struct SettingsPanel: View {
                 }
             }
         }
+    }
+
+    // MARK: - ask
+
+    /// What each provider wakes with — mirrored from PROVIDERS'
+    /// defaultModel in Runtime/ask/harness.js, so a provider switch never
+    /// leaves the last provider's model name on the wrong wire.
+    private static let askDefaults: [String: String] = [
+        "openrouter": "z-ai/glm-5.3-flash",
+        "codex": "gpt-6-luna",
+        "devin": "devin",
+    ]
+
+    private static func askDefault(_ provider: String) -> String {
+        askDefaults[provider] ?? "z-ai/glm-5.3-flash"
+    }
+
+    private var ask: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Card {
+                Line("Show Ask Search in the tab bar", "The assistant beside the page — it reads and drives only the tabs you hand it") {
+                    Switch(on: $prefs.ask)
+                }
+                Rule()
+                Line("Ask with", "Which brain answers — the default is openrouter z-ai/glm-5.3-flash") {
+                    Segmented(
+                        options: [("openrouter", "OpenRouter"), ("codex", "Codex"), ("devin", "Devin")],
+                        selection: Binding(
+                            get: { mind.model.provider },
+                            set: { mind.model = AskModel(provider: $0, model: Self.askDefault($0)) }
+                        )
+                    )
+                }
+                ZStack(alignment: .leading) {
+                    if mind.model.model.isEmpty {
+                        Text(Self.askDefault(mind.model.provider))
+                            .foregroundStyle(Palette.muted.opacity(0.8))
+                    }
+                    TextField("", text: Binding(
+                        get: { mind.model.model },
+                        set: { mind.model = AskModel(provider: mind.model.provider, model: $0) }
+                    ))
+                    .textFieldStyle(.plain)
+                    .foregroundStyle(Palette.ink)
+                }
+                .font(.system(size: 12.5))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Palette.wash, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .padding(.horizontal, 14)
+                .padding(.bottom, 11)
+                Rule()
+                Line("Default mode", "The leash a new chat starts on — Read is eyes only, Guard asks before the heavy things, Full asks nothing") {
+                    Segmented(
+                        options: [(AskMode.read, "Read"), (.guard, "Guard"), (.full, "Full")],
+                        selection: Binding(
+                            get: { AskMode(rawValue: Store.settings.string(forKey: "ask.mode") ?? "") ?? .guard },
+                            set: { Store.settings.set($0.rawValue, forKey: "ask.mode") }
+                        )
+                    )
+                }
+            }
+            Card {
+                Line("OpenRouter", "One key for every model it carries — sk-or-v1-…, from openrouter.ai/keys") {
+                    KeyLine(name: "openrouter", placeholder: "sk-or-v1-…")
+                }
+                Rule()
+                Line("Codex", "Needs a JSON blob — {\"access_token\":…,\"account_id\":…}. Paste it, or leave ~/.codex/auth.json to be read") {
+                    VStack(alignment: .trailing, spacing: 6) {
+                        KeyLine(name: "codex", placeholder: "{\"access_token\":…}")
+                            .id(codexStamp)
+                        Quick("Import ~/.codex/auth.json") { importCodex() }
+                    }
+                }
+                Rule()
+                Line("Devin", "API key — cog_…") {
+                    KeyLine(name: "devin", placeholder: "cog_…")
+                }
+            }
+            Caption("Keys live in Search's own folder (ask.keys.json), readable only by you.")
+        }
+    }
+
+    /// One provider's API key: a hidden field until one is kept, then the
+    /// dots and a way to take it back. What was written is never shown again.
+    private struct KeyLine: View {
+        let name: String
+        let placeholder: String
+
+        @State private var draft = ""
+        @State private var kept: Bool
+
+        init(name: String, placeholder: String) {
+            self.name = name
+            self.placeholder = placeholder
+            _kept = State(initialValue: Keys.get(name) != nil)
+        }
+
+        var body: some View {
+            if kept {
+                HStack(spacing: 8) {
+                    Text("•••")
+                        .font(.system(size: 12.5, design: .monospaced))
+                        .foregroundStyle(Palette.ink)
+                    Text("Set")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Palette.muted)
+                    Quick("Remove") {
+                        Keys.set(name, nil)
+                        kept = false
+                    }
+                }
+            } else {
+                HStack(spacing: 6) {
+                    ZStack(alignment: .leading) {
+                        if draft.isEmpty {
+                            Text(placeholder)
+                                .foregroundStyle(Palette.ink.opacity(0.3))
+                                .padding(.leading, 10)
+                        }
+                        SecureField("", text: $draft)
+                            .textFieldStyle(.plain)
+                            .foregroundStyle(Palette.ink)
+                            .onSubmit(commit)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                    }
+                    .font(.system(size: 12.5, design: .monospaced))
+                    .frame(width: 168)
+                    .background(Palette.wash, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    Pill("Save", filled: true, action: commit)
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+
+        /// Written on return or Save, and the field emptied behind it — the
+        /// dots are all the panel ever shows of a kept key.
+        private func commit() {
+            let key = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { return }
+            Keys.set(name, key)
+            draft = ""
+            kept = true
+        }
+    }
+
+    /// Codex keeps its sign-in at ~/.codex/auth.json; the wire wants the
+    /// tokens out of it as one JSON blob under "codex".
+    private func importCodex() {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/auth.json")
+        guard let data = try? Data(contentsOf: url),
+              let auth = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = auth["tokens"] as? [String: Any],
+              let access = tokens["access_token"] as? String, !access.isEmpty
+        else {
+            browser.announce("Nothing to import — ~/.codex/auth.json has no tokens")
+            return
+        }
+        var blob: [String: Any] = ["access_token": access]
+        for key in ["account_id", "refresh_token"] {
+            if let value = tokens[key] as? String { blob[key] = value }
+        }
+        guard let out = try? JSONSerialization.data(withJSONObject: blob, options: [.sortedKeys]),
+              let json = String(data: out, encoding: .utf8) else { return }
+        Keys.set("codex", json)
+        codexStamp += 1
+        browser.announce("Codex key imported")
     }
 
     // MARK: - about

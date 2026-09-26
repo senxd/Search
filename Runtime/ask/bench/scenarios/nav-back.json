@@ -1,0 +1,13 @@
+{
+  "name": "nav-back",
+  "tags": ["nav"],
+  "prompt": "On the page I have open, follow the \"Link three\" link, then go back — what's the title you end up on?",
+  "setup": {"tabs": [
+    {"url": "fixture:links", "as": "l", "via": "bench"}
+  ]},
+  "verify": {"kind": "all", "checks": [
+    {"kind": "chat", "expect": "eight links", "i": true},
+    {"kind": "tool", "name": "back", "minCalls": 1}
+  ]},
+  "timeout": 90
+}

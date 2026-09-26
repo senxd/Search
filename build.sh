@@ -73,6 +73,13 @@ swift Icon/icon.swift "$ICONSET" > /dev/null
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 rm -rf "$ICONSET"
 
+# The JavaScript AskJS.load() reads at runtime — Bundle.main looks in
+# Contents/Resources/ask first, and the repo fallback only works out of
+# .build. Just the two files the app loads ship: the test file, the docs
+# and the test/ folder stay in the repo.
+mkdir -p "$APP/Contents/Resources/ask"
+cp Runtime/ask/drive.js Runtime/ask/harness.js "$APP/Contents/Resources/ask/"
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

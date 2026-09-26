@@ -125,6 +125,13 @@ final class Preferences: ObservableObject {
         didSet { store.set(usesSpaces, forKey: "spaces") }
     }
 
+    /// Ask, the assistant beside the page: whether its button sits in the
+    /// tab bar. On unless turned off — whether the panel itself is open is
+    /// Mind's "ask.open", not this.
+    @Published var ask: Bool {
+        didSet { store.set(ask, forKey: "ask") }
+    }
+
     init() {
         // Carried over from when there were four ways of holding the browser
         // and this was one of them.
@@ -178,6 +185,7 @@ final class Preferences: ObservableObject {
         // existed; they are not asked to sit through it.
         welcomed = store.bool(forKey: "welcomed") || store.object(forKey: "glyph") != nil
         usesSpaces = store.bool(forKey: "spaces")
+        ask = store.object(forKey: "ask") as? Bool ?? true
         // Left behind by the Web Inspector's switch, from before it was
         // always there.
         store.removeObject(forKey: "inspector")

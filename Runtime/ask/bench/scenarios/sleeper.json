@@ -1,0 +1,13 @@
+{
+  "name": "sleeper",
+  "tags": ["tabs", "no-real-sleep-path"],
+  "note": "Was a sleep-then-reload scenario; that half is unreachable today — Sleep.swift refuses tab.bench (\"a bench tab\") and the world's only non-bench tab is the active on-screen one, so setup \"sleep\": true can never take and the reload requirement could never pass. What remains is the real half: find a named background fixture tab and read its h1. Restore sleep:true plus the reload check when a product path exists that can actually put a tab to sleep.",
+  "prompt": "One of my open tabs is called The Sleeping Nook — read that background tab and tell me its first heading.",
+  "setup": {"tabs": [
+    {"url": "fixture:sleeper", "as": "sl", "via": "bench"}
+  ]},
+  "verify": {"kind": "all", "checks": [
+    {"kind": "chat", "expect": "rise and shine", "i": true}
+  ]},
+  "timeout": 90
+}

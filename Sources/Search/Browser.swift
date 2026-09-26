@@ -723,6 +723,10 @@ final class Browser: NSObject, ObservableObject {
         Shield.shared.enabled = prefs.shielded
         Shield.shared.compile()
         if #available(macOS 15.4, *) { Extensions.shared.start(for: self) }
+        // The ops layer exists whether or not the sockets do — the in-app Ask
+        // panel drives through it in-process. The sockets it also serves are
+        // Bench.start's business, and stay behind "Let a script drive Search".
+        AskRuntime.drive = Drive(browser: self)
         if prefs.bench { Bench.shared.start(for: self) }
         welcoming = !prefs.welcomed
         // Asked to stay out of the way: it starts that way (see Fold.swift).
@@ -1345,11 +1349,14 @@ final class Browser: NSObject, ObservableObject {
     }
 
     /// A page for the bench: at the end of the row, behind whatever you are
-    /// looking at, and marked as not yours.
+    /// looking at, and marked as not yours. `shy` opens it signed in as
+    /// nobody — a fresh bench tab keeps nothing and sees no sign-ins, the
+    /// sandboxing Ask's read mode wants (design/permissions.md §4).
     @discardableResult
-    func benchOpen(_ url: URL) -> Tab {
+    func benchOpen(_ url: URL, shy: Bool = false) -> Tab {
         let url = Browser.page(url)
-        let tab = Tab(bench: true, configuration: Browser.extensionConfiguration(for: url))
+        let tab = Tab(shy: shy, bench: true,
+                      configuration: shy ? nil : Browser.extensionConfiguration(for: url))
         prepare(tab)
         tabs.append(tab)
         tab.go(to: url)
@@ -1584,10 +1591,8 @@ final class Browser: NSObject, ObservableObject {
         // rewritten while you pinch and fades a moment after you stop.
         tab.onZoom = { [weak self] _, value in
             guard let self else { return }
-            let percent = Int((value * 100).rounded())
-            guard percent != zoomShown else { return }
-            zoomShown = percent
-            announce("\(percent)%")
+            zoomShown = Int((value * 100).rounded())
+            announce("\(zoomShown)%")
         }
 
         // A page's title lands a beat after the page itself, and a history
@@ -2278,7 +2283,7 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         navigationAction: WKNavigationAction,
         didBecome download: WKDownload
     ) {
-        keep(download)
+        keep(download, from: webView)
     }
 
     func webView(
@@ -2286,6 +2291,27 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         navigationResponse: WKNavigationResponse,
         didBecome download: WKDownload
     ) {
+        keep(download, from: webView)
+    }
+
+    /// The Ask gate's reach into downloads (design/permissions.md §2, §4):
+    /// a file on its way to disk off a bench tab is a destructive-class act
+    /// by the session holding it. A read-mode holder loses it outright;
+    /// guard would ask — but the download is already moving by the time it
+    /// lands here and there's no parked `finish` for a card to settle, so
+    /// it refuses too, with a note. (If asking ever earns its keep, the
+    /// park point is `decideDestinationUsing`'s completion handler.)
+    /// A `full` holder and a loose bench tab — bench.sock's own, nobody's
+    /// session — keep working as they always have.
+    private func keep(_ download: WKDownload, from webView: WKWebView) {
+        if let tab = tab(for: webView), tab.bench,
+           let drive = AskRuntime.drive as? Drive,
+           let holder = drive.holder(of: tab),
+           drive.mode(for: holder) != .full {
+            download.cancel(nil)
+            announce("Ask's \(drive.mode(for: holder).label.lowercased()) mode kept a download off disk")
+            return
+        }
         keep(download)
     }
 
@@ -2364,6 +2390,10 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        // The context page-side ops were talking to is going away — let the
+        // drive settle what it had in flight before it counts as missing.
+        Drive.noteCommit(webView: webView)
+        (webView as? PageView)?.endPinch()
         guard let tab = tab(for: webView) else { return }
         tab.failure = nil
         tab.typing = false

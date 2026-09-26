@@ -1,0 +1,7 @@
+{
+  "name": "tab-trio",
+  "tags": ["tabs"],
+  "prompt": "Open three tabs for me: http://127.0.0.1:{port}/links.html, http://127.0.0.1:{port}/counter.html and http://127.0.0.1:{port}/dashboard.html",
+  "verify": {"kind": "tabs", "url": "*127.0.0.1*", "bench": true, "min": 3},
+  "timeout": 90
+}

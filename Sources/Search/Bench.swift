@@ -100,6 +100,9 @@ final class Bench {
         accepting = source
         listener = fd
         running = true
+        // The agent sessions live behind the same switch: "Let a script drive
+        // Search" is what opens either socket to the world outside the app.
+        AgentSocket.shared.start(for: browser)
     }
 
     func stop() {
@@ -112,6 +115,7 @@ final class Bench {
         clients.values.forEach { $0.drop() }
         clients = [:]
         running = false
+        AgentSocket.shared.stop()
         // The tabs a script left open go with it.
         if let browser {
             for tab in browser.tabs where tab.bench { browser.close(tab) }
@@ -189,6 +193,10 @@ final class Bench {
         private func say(_ answer: [String: Any]) {
             guard !answered else { return }
             answered = true
+            // Same crash vector as agent.sock's say(): a page value carrying
+            // a non-finite number raises an uncatchable NSInvalidArgument-
+            // Exception in JSONSerialization — check rather than catch.
+            let answer = Drive.jsonSafe(answer) ? answer : ["error": "the answer wasn't JSON-safe"]
             var out = (try? JSONSerialization.data(withJSONObject: answer)) ?? Data("{\"error\":\"unwritable answer\"}".utf8)
             out.append(0x0A)
             out.withUnsafeBytes { raw in
@@ -271,7 +279,7 @@ final class Bench {
         case "wait":
             guard let tab = find(request, in: browser) else { answer(missing(request)); return }
             let limit = Date().addingTimeInterval(request["seconds"] as? Double ?? 20)
-            wait(for: tab, until: limit, answer)
+            wait(for: tab, in: browser, until: limit, answer)
 
         case "sleep":
             // Now rather than after half an hour, but past every other check
@@ -370,49 +378,7 @@ final class Bench {
             shoot(tab, to: URL(fileURLWithPath: path), width: width, answer)
 
         case "probe":
-            // The state of the window itself, for the bug that is not in a
-            // page: which panels are up, whether something modal has the
-            // app, and every window the app owns.
-            var out: [String: Any] = [
-                "settings": browser.tuning,
-                "welcome": browser.welcoming,
-                "passwords": browser.managing,
-                "history": browser.recalling,
-                "downloads": browser.hoarding,
-                "bookmarks": browser.bookmarking,
-                "field": browser.editing,
-                "suggesting": browser.suggesting != nil,
-                "offering": browser.offering != nil,
-                "modal": NSApp.modalWindow.map { "\(type(of: $0)) “\($0.title)”" } ?? "",
-                "look": browser.prefs.look.rawValue,
-                "appearance": NSApp.appearance?.name.rawValue ?? "system",
-                "key": NSApp.keyWindow.map { "\(type(of: $0)) “\($0.title)”" } ?? "",
-            ]
-            out["windows"] = NSApp.windows.map { window -> [String: Any] in
-                [
-                    "kind": "\(type(of: window))",
-                    "title": window.title,
-                    "visible": window.isVisible,
-                    "level": window.level.rawValue,
-                    "frame": [Int(window.frame.minX), Int(window.frame.minY), Int(window.frame.width), Int(window.frame.height)],
-                    "number": window.windowNumber,
-                ]
-            }
-            if let window = Links.window { out["lights"] = Bench.lights(of: window) }
-            out["keysQuieted"] = PageView.quieted
-            // Settings › General › Web Inspector, as each page's WebKit has it.
-            let asked = NSSelectorFromString("_developerExtrasEnabled")
-            out["inspector"] = browser.tabs.compactMap { tab -> Bool? in
-                guard let preferences = tab.built?.configuration.preferences, preferences.responds(to: asked) else { return nil }
-                return preferences.value(forKey: "developerExtrasEnabled") as? Bool
-            }
-            // The column folded away, out for a look, and the lights with it (see Fold.swift).
-            out["folded"] = browser.folded
-            out["peeking"] = browser.peeking
-            out["sideHides"] = browser.prefs.sideHides
-            out["lightsHidden"] = Fold.titlebar?.isHidden ?? false
-            out["groups"] = groupList(browser)
-            answer(out)
+            answer(probeReport(browser))
 
         case "press":
             // A key pressed on the app as a whole, through its event queue —
@@ -726,6 +692,29 @@ final class Bench {
                 window.contentView = nil
             }
 
+        case "winshot":
+            // The whole window — chrome, lights, tabs and the page on stage —
+            // drawn into one PNG, the same offscreen bitmap the strip and
+            // column shots are made with. For an auditor who wants what a
+            // person would see, not another slice of it.
+            guard let window = Links.window,
+                  let frame = window.contentView?.superview,
+                  let path = request["path"] as? String, !path.isEmpty
+            else { answer(["error": "winshot needs a path"]); return }
+            // The pages take a third of a second each to draw into a picture,
+            // so give the whole thing a beat rather than racing the paint.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                guard let picture = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) else {
+                    answer(["error": "nothing drawn"])
+                    return
+                }
+                frame.cacheDisplay(in: frame.bounds, to: picture)
+                do {
+                    try picture.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+                    answer(["saved": path, "width": picture.pixelsWide, "height": picture.pixelsHigh])
+                } catch { answer(["error": error.localizedDescription]) }
+            }
+
         case "space":
             // The spaces, and switching between them, for a test of what a
             // space keeps apart. Test runs only: it moves your tabs about.
@@ -952,7 +941,7 @@ final class Bench {
 
         default:
             answer(["error": "unknown command “\(verb)”", "commands": [
-                "tabs", "open", "go", "close", "wait", "sleep", "select", "text", "eval", "click", "type", "submit", "shot", "probe", "key", "resize", "hit", "film", "place", "pin", "space", "group", "strip", "column", "ui",
+                "tabs", "open", "go", "close", "wait", "sleep", "select", "text", "eval", "click", "type", "submit", "shot", "probe", "key", "resize", "hit", "film", "place", "pin", "space", "group", "strip", "column", "winshot", "ui",
             ]])
         }
     }
@@ -1062,16 +1051,80 @@ final class Bench {
         }
     }
 
+    /// The state of the window itself, for the bug that is not in a page:
+    /// which panels are up, whether something modal has the app, and every
+    /// window the app owns. Internal so Drive's `agent.probe` answers the
+    /// same report rather than a copy of it.
+    func probeReport(_ browser: Browser) -> [String: Any] {
+        var out: [String: Any] = [
+            "settings": browser.tuning,
+            "welcome": browser.welcoming,
+            "passwords": browser.managing,
+            "history": browser.recalling,
+            "downloads": browser.hoarding,
+            "bookmarks": browser.bookmarking,
+            "field": browser.editing,
+            "suggesting": browser.suggesting != nil,
+            "offering": browser.offering != nil,
+            "modal": NSApp.modalWindow.map { "\(type(of: $0)) “\($0.title)”" } ?? "",
+            "look": browser.prefs.look.rawValue,
+            "appearance": NSApp.appearance?.name.rawValue ?? "system",
+            "key": NSApp.keyWindow.map { "\(type(of: $0)) “\($0.title)”" } ?? "",
+        ]
+        out["windows"] = NSApp.windows.map { window -> [String: Any] in
+            [
+                "kind": "\(type(of: window))",
+                "title": window.title,
+                "visible": window.isVisible,
+                "level": window.level.rawValue,
+                "frame": [Int(window.frame.minX), Int(window.frame.minY), Int(window.frame.width), Int(window.frame.height)],
+                "number": window.windowNumber,
+            ]
+        }
+        if let window = Links.window { out["lights"] = Bench.lights(of: window) }
+        out["keysQuieted"] = PageView.quieted
+        // Settings › General › Web Inspector, as each page's WebKit has it.
+        let asked = NSSelectorFromString("_developerExtrasEnabled")
+        out["inspector"] = browser.tabs.compactMap { tab -> Bool? in
+            guard let preferences = tab.built?.configuration.preferences, preferences.responds(to: asked) else { return nil }
+            return preferences.value(forKey: "developerExtrasEnabled") as? Bool
+        }
+        // The column folded away, out for a look, and the lights with it (see Fold.swift).
+        out["folded"] = browser.folded
+        out["peeking"] = browser.peeking
+        out["sideHides"] = browser.prefs.sideHides
+        out["lightsHidden"] = Fold.titlebar?.isHidden ?? false
+        out["groups"] = groupList(browser)
+        // The spaces live in memory, so the report is free to carry them:
+        // whether the rows are on, which one is current, what they're called.
+        out["spacesOn"] = browser.prefs.usesSpaces
+        out["space"] = browser.space.name
+        out["spaces"] = browser.spaces.map(\.name)
+        // Which tab is on the stage, the way the ops layer names tabs.
+        out["active"] = browser.active.map { Bench.short($0) } ?? ""
+        return out
+    }
+
     private func find(_ request: [String: Any], in browser: Browser) -> Tab? {
         guard let ref = (request["id"] as? String)?.lowercased(), !ref.isEmpty else { return nil }
-        return browser.tabs.first { $0.id.uuidString.lowercased().hasPrefix(ref) }
+        return find(ref, in: browser)
+    }
+
+    /// The first characters of a tab's id, the way `./bench tabs` prints them.
+    func find(_ ref: String, in browser: Browser) -> Tab? {
+        browser.tabs.first { $0.id.uuidString.lowercased().hasPrefix(ref) }
     }
 
     private func missing(_ request: [String: Any]) -> [String: Any] {
         ["error": "no tab “\(request["id"] as? String ?? "")” — see tabs"]
     }
 
-    private func describe(_ tab: Tab) -> [String: Any] {
+    private func describe(_ tab: Tab) -> [String: Any] { describe(tab, in: browser) }
+
+    /// A tab as one line of JSON-able fact, for `tabs` and the agent's
+    /// `tabs.list` alike. The browser is a parameter so the ops layer can
+    /// describe tabs even when the bench itself isn't running.
+    func describe(_ tab: Tab, in browser: Browser?) -> [String: Any] {
         [
             "id": Bench.short(tab),
             "url": tab.address?.absoluteString ?? "",
@@ -1184,26 +1237,28 @@ final class Bench {
         String(tab.id.uuidString.prefix(8)).lowercased()
     }
 
-    /// Once the page has stopped loading, or the time is up.
-    private func wait(for tab: Tab, until limit: Date, _ answer: @escaping ([String: Any]) -> Void) {
-        if !tab.loading, tab.address != nil, tab.failure == nil || true {
+    /// Once the page has stopped loading, or the time is up. The browser is
+    /// passed in so Drive's `page.wait` — which may run with the bench itself
+    /// off — still describes the tab it waited on correctly.
+    func wait(for tab: Tab, in browser: Browser, until limit: Date, _ answer: @escaping ([String: Any]) -> Void) {
+        if !tab.loading, tab.address != nil || tab.failure != nil {
             // A beat for the document's own scripts to settle.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 guard let self else { return }
-                var out = describe(tab)
+                var out = describe(tab, in: browser)
                 if let failure = tab.failure { out["failure"] = failure }
                 answer(out)
             }
             return
         }
         guard Date() < limit else {
-            var out = describe(tab)
+            var out = describe(tab, in: browser)
             out["timeout"] = true
             answer(out)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.wait(for: tab, until: limit, answer)
+            self?.wait(for: tab, in: browser, until: limit, answer)
         }
     }
 
@@ -1213,9 +1268,12 @@ final class Bench {
 
     /// A page nobody is looking at has to be somewhere to be laid out at all.
     /// The stage takes it back the moment you pick its tab, and it comes
-    /// here again when the bench next needs it.
-    private func house(_ tab: Tab) {
-        guard tab.bench, tab.web.window == nil else { return }
+    /// here again when the bench next needs it. Not bench-only any more: the
+    /// agent's attached tabs need a window to paint in exactly the same way.
+    /// The `built` check keeps the question from being the reason a view
+    /// exists — a sleeping tab stays asleep.
+    func house(_ tab: Tab) {
+        guard tab.built != nil, tab.web.window == nil else { return }
         let window = room ?? makeRoom()
         tab.web.frame = window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
         tab.web.autoresizingMask = [.width, .height]
@@ -1241,11 +1299,11 @@ final class Bench {
         return window
     }
 
-    private func shoot(_ tab: Tab, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {
+    func shoot(_ tab: Tab, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {
         shoot(tab.web, to: file, width: width, answer)
     }
 
-    private func shoot(_ web: WKWebView, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {
+    func shoot(_ web: WKWebView, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {
         let shot = WKSnapshotConfiguration()
         shot.afterScreenUpdates = true
         if let width { shot.snapshotWidth = NSNumber(value: width) }
@@ -1271,7 +1329,7 @@ final class Bench {
     // MARK: - page-side helpers
 
     /// A JavaScript value the way JSON can carry it.
-    private static func plain(_ value: Any?) -> Any {
+    static func plain(_ value: Any?) -> Any {
         guard let value else { return NSNull() }
         if JSONSerialization.isValidJSONObject(["v": value]) { return value }
         return String(describing: value)
@@ -1280,7 +1338,7 @@ final class Bench {
     /// Where an element's middle is, in the page's own points, scrolled
     /// into view first. A selector, or `text=…` for a button or link by its
     /// words.
-    private static func locate(_ selector: String) -> String {
+    static func locate(_ selector: String) -> String {
         let sel = (try? JSONSerialization.data(withJSONObject: [selector])).flatMap { String(data: $0, encoding: .utf8) }.map { String($0.dropFirst().dropLast()) } ?? "\"\""
         return """
         (function () {
@@ -1304,7 +1362,7 @@ final class Bench {
     /// Click, type into, or submit the element a selector names. Typing goes
     /// through the field's own setter and fires the events a keystroke
     /// would, the same as the password filler, so frameworks notice.
-    private static func act(_ verb: String, selector: String, text: String) -> String {
+    static func act(_ verb: String, selector: String, text: String) -> String {
         let sel = (try? JSONSerialization.data(withJSONObject: [selector])).flatMap { String(data: $0, encoding: .utf8) }.map { String($0.dropFirst().dropLast()) } ?? "\"\""
         let txt = (try? JSONSerialization.data(withJSONObject: [text])).flatMap { String(data: $0, encoding: .utf8) }.map { String($0.dropFirst().dropLast()) } ?? "\"\""
         return """

@@ -1,4 +1,5 @@
 import ImageIO
+import ObjectiveC
 import SwiftUI
 import WebKit
 
@@ -290,11 +291,12 @@ final class Tab: ObservableObject, Identifiable {
 
     private func build() -> PageView {
         let web = PageView(frame: .zero, configuration: configuration)
-        // The trackpad pinch is WebKit's own: it magnifies what is on screen
-        // and lets you move around inside it, the way pinching does everywhere
-        // else on a Mac. ⌘+ and ⌘- are the other thing — they lay the page out
-        // again at a bigger size — and both are worth having.
-        web.allowsMagnification = true
+        web.allowsMagnification = false
+        PageView.hookPinch()
+        web.onPinch = { [weak self] scale in
+            guard let self else { return }
+            self.onZoom?(self, self.web.pageZoom * scale)
+        }
         // WebKit's own two-finger swipe stays off. It drags the page across
         // the window with a picture of the last one behind it; ours is in
         // PageView, and it moves nothing but a disc.
@@ -388,9 +390,7 @@ final class Tab: ObservableObject, Identifiable {
     /// ⌘0 undoes both kinds of zoom at once — whichever one you reached for.
     func resetZoom() {
         magnify(to: 1)
-        guard web.magnification != 1 else { return }
-        web.magnification = 1
-        onZoom?(self, 1)
+        web.clearPinch()
     }
 
     // MARK: - taking things off the page
@@ -958,6 +958,9 @@ final class PageView: WKWebView {
 
     override func mouseDown(with event: NSEvent) {
         onTouch?()
+        // A hand on the page is also the answer to an agent's foreground
+        // lease on the tab — the driver's own clicks are filtered inside.
+        Drive.noteTouch(webView: self)
         super.mouseDown(with: event)
     }
 
@@ -976,6 +979,7 @@ final class PageView: WKWebView {
     static var quieted = 0
 
     override func keyDown(with event: NSEvent) {
+        Drive.noteTouch(webView: self)
         if let handed, PageView.same(handed, event) {
             self.handed = nil
             PageView.quieted += 1
@@ -1054,32 +1058,159 @@ final class PageView: WKWebView {
 
     // MARK: - two fingers together
 
-    // The pinch itself is WebKit's own: during the gesture it scales the
-    // rendered layers on the GPU around the fingers and only lays the page
-    // out again once they lift. Doing the same from here — a real change of
-    // scale on every event — was measured at a few frames a second, and the
-    // public `setMagnification(_:centeredAt:)` ignores its point and resets
-    // the scroll besides, so the pinch stays with WebKit. What is handled
-    // here is the one-shot gesture WebKit does not do well on its own.
+    var onPinch: ((CGFloat) -> Void)?
+
+    private static let pinchMax: CGFloat = 3
+    private static var pinchHooked = false
+    private static var forwardGesture: ((AnyObject, Selector, NSEvent) -> Void)?
+    private static let gestureSelector = NSSelectorFromString("_gestureEventWasNotHandledByWebCore:")
+
+    private struct PinchEvent {
+        var phase: NSEvent.Phase
+        var delta: CGFloat
+        var point: CGPoint
+        var used = false
+    }
+
+    private final class PinchClock: NSObject {
+        weak var view: PageView?
+        @objc func fire(_ link: CADisplayLink) { view?.pinchFrame() }
+    }
+
+    private var pinchEvents: [PinchEvent] = []
+    private var pinchOurs = false
+    private var pinchScale: CGFloat = 1
+    private var pinchScroll = CGPoint.zero
+    private var pinchStartScale: CGFloat = 1
+    private var pinchStartScroll = CGPoint.zero
+    private var pinchScrollKnown = false
+    private var pinchEpoch = 0
+    private var pinchDirty = false
+    private var pinchLink: CADisplayLink?
+    private var pinchClock: PinchClock?
+    private var pinchDrop: DispatchWorkItem?
+
+    deinit { pinchLink?.invalidate() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { stopPinchLink() }
+    }
+
+    static func hookPinch() {
+        if pinchHooked { return }
+        guard let method = class_getInstanceMethod(WKWebView.self, gestureSelector),
+              let encoding = method_getTypeEncoding(method)
+        else { return }
+        let imp = method_getImplementation(method)
+        forwardGesture = { obj, sel, event in
+            unsafeBitCast(imp, to: (@convention(c) (AnyObject, Selector, NSEvent) -> Void).self)(obj, sel, event)
+        }
+        let block: @convention(block) (AnyObject, NSEvent) -> Void = { obj, event in
+            (obj as? PageView)?.unhandledGesture(event)
+        }
+        guard class_addMethod(PageView.self, gestureSelector, imp_implementationWithBlock(block), encoding) else { return }
+        pinchHooked = true
+    }
+
+    override func magnify(with event: NSEvent) {
+        onTouch?()
+        let item = PinchEvent(
+            phase: event.phase,
+            delta: event.magnification,
+            point: convert(event.locationInWindow, from: nil)
+        )
+        if item.phase.contains(.began) || pinchEvents.isEmpty {
+            pinchEvents = []
+            pinchOurs = !Self.pinchHooked
+            pinchDrop?.cancel()
+            startReadingScroll()
+        }
+        pinchEvents.append(item)
+        if pinchOurs {
+            drivePinch()
+            return
+        }
+        super.magnify(with: event)
+        guard item.phase.contains(.ended) || item.phase.contains(.cancelled) else { return }
+        let epoch = pinchEpoch
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, epoch == self.pinchEpoch, !self.pinchOurs else { return }
+            self.pinchEvents = []
+        }
+        pinchDrop = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    fileprivate func unhandledGesture(_ event: NSEvent) {
+        guard event.type == .magnify else {
+            Self.forwardGesture?(self, Self.gestureSelector, event)
+            return
+        }
+        guard !pinchEvents.isEmpty else { return }
+        pinchDrop?.cancel()
+        pinchOurs = true
+        drivePinch()
+    }
+
+    func endPinch() {
+        pinchEpoch += 1
+        pinchOurs = false
+        pinchEvents = []
+        pinchScrollKnown = false
+        pinchDrop?.cancel()
+        stopPinchLink()
+        let raw = liveScale
+        guard raw > 1.01 else { return }
+        pinchScale = 1
+        pinchScroll = .zero
+        applyScale(1, origin: .zero)
+    }
+
+    func clearPinch() {
+        pinchOurs = false
+        pinchEvents = []
+        pinchDrop?.cancel()
+        stopPinchLink()
+        pinchEpoch += 1
+        let epoch = pinchEpoch
+        let scale = liveScale
+        guard scale > 1.01 else { return }
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        evaluateJavaScript("window.scrollX+','+window.scrollY") { [weak self] value, _ in
+            MainActor.assumeIsolated {
+                guard let self, epoch == self.pinchEpoch else { return }
+                let scroll = PageView.point(from: value)
+                let doc = self.documentPoint(scroll: scroll, scale: scale, at: center)
+                let origin = self.scrollOrigin(doc, scale: 1, at: center)
+                self.pinchScale = 1
+                self.pinchScroll = origin
+                self.applyScale(1, origin: origin)
+                self.onPinch?(1)
+            }
+        }
+    }
 
     /// Two fingers, tapped twice: the block under them fills the width, the
     /// way Safari's smart zoom does; tapped again, the page is back at its
     /// own size with the same spot still under the fingers. The page picks
     /// the block — it is the only one that knows where a column ends.
     override func smartMagnify(with event: NSEvent) {
-        guard allowsMagnification else {
-            super.smartMagnify(with: event)
-            return
-        }
         let point = convert(event.locationInWindow, from: nil)
-        let js = PageView.smart(x: point.x, y: point.y, scale: magnification, width: bounds.width)
+        pinchEpoch += 1
+        let epoch = pinchEpoch
+        let js = PageView.smart(x: point.x, y: point.y, scale: liveScale, width: bounds.width)
         evaluateJavaScript(js) { [weak self] value, _ in
             MainActor.assumeIsolated {
-                guard let self, let text = value as? String, let data = text.data(using: .utf8),
+                guard let self, epoch == self.pinchEpoch, let text = value as? String,
+                      let data = text.data(using: .utf8),
                       let zoom = try? JSONDecoder().decode(SmartZoom.self, from: data)
                 else { return }
-                self.setMagnification(zoom.scale, centeredAt: point)
-                self.evaluateJavaScript("window.scrollTo(\(zoom.x), \(zoom.y))")
+                let scale = min(Self.pinchMax, max(1, zoom.scale))
+                self.pinchScale = scale
+                self.pinchScroll = CGPoint(x: max(0, zoom.x), y: max(0, zoom.y))
+                self.applyScale(scale, origin: self.pinchScroll)
+                self.onPinch?(scale)
             }
         }
     }
@@ -1130,6 +1261,135 @@ final class PageView: WKWebView {
           });
         })(\(x), \(y), \(scale), \(width))
         """
+    }
+
+    private func startReadingScroll() {
+        pinchEpoch += 1
+        let epoch = pinchEpoch
+        pinchScrollKnown = false
+        let raw = liveScale
+        pinchScale = raw > 0.05 ? raw : 1
+        evaluateJavaScript("window.scrollX+','+window.scrollY") { [weak self] value, _ in
+            MainActor.assumeIsolated {
+                guard let self, epoch == self.pinchEpoch else { return }
+                self.pinchScroll = PageView.point(from: value)
+                self.pinchStartScale = self.pinchScale
+                self.pinchStartScroll = self.pinchScroll
+                self.pinchScrollKnown = true
+                self.drivePinch()
+            }
+        }
+    }
+
+    private func drivePinch() {
+        guard pinchOurs, pinchScrollKnown else { return }
+        var ended = false
+        var cancelled = false
+        for index in pinchEvents.indices {
+            guard !pinchEvents[index].used else { continue }
+            let item = pinchEvents[index]
+            pinchEvents[index].used = true
+            if item.phase.contains(.cancelled) {
+                cancelled = true
+                ended = true
+                continue
+            }
+            if item.phase.contains(.ended) {
+                stepPinch(item.delta, at: item.point)
+                ended = true
+                continue
+            }
+            stepPinch(item.delta, at: item.point)
+        }
+        guard ended else { return }
+        if cancelled {
+            pinchScale = pinchStartScale
+            pinchScroll = pinchStartScroll
+        }
+        commitPinch()
+        onPinch?(pinchScale)
+        pinchOurs = false
+        pinchEvents = []
+        pinchScrollKnown = false
+        stopPinchLink()
+    }
+
+    private func stepPinch(_ delta: CGFloat, at point: CGPoint) {
+        let factor = max(1 + delta, 1 / 512)
+        let next = min(Self.pinchMax, max(1, pinchScale * factor))
+        guard abs(next - pinchScale) > 0.0001 else {
+            onPinch?(pinchScale)
+            return
+        }
+        let doc = documentPoint(scroll: pinchScroll, scale: pinchScale, at: point)
+        pinchScale = next
+        pinchScroll = scrollOrigin(doc, scale: next, at: point)
+        scheduleCommit()
+    }
+
+    private func scheduleCommit() {
+        pinchDirty = true
+        guard pinchLink == nil else { return }
+        let clock = PinchClock()
+        clock.view = self
+        pinchClock = clock
+        let link = displayLink(target: clock, selector: #selector(PinchClock.fire(_:)))
+        link.add(to: .main, forMode: .common)
+        pinchLink = link
+    }
+
+    fileprivate func pinchFrame() {
+        guard pinchDirty else { return }
+        pinchDirty = false
+        commitPinch()
+        onPinch?(pinchScale)
+    }
+
+    private func commitPinch() {
+        applyScale(pinchScale, origin: pinchScroll)
+    }
+
+    private func stopPinchLink() {
+        pinchLink?.invalidate()
+        pinchLink = nil
+        pinchClock = nil
+        pinchDirty = false
+    }
+
+    private var liveScale: CGFloat {
+        let sel = NSSelectorFromString("_pageScale")
+        guard responds(to: sel) else { return magnification }
+        typealias Imp = @convention(c) (AnyObject, Selector) -> CGFloat
+        let scale = unsafeBitCast(method(for: sel), to: Imp.self)(self, sel)
+        return scale > 0.05 ? scale : 1
+    }
+
+    private func applyScale(_ scale: CGFloat, origin: CGPoint) {
+        let sel = NSSelectorFromString("_setPageScale:withOrigin:")
+        guard responds(to: sel) else {
+            magnification = scale
+            return
+        }
+        typealias Imp = @convention(c) (AnyObject, Selector, CGFloat, CGPoint) -> Void
+        unsafeBitCast(method(for: sel), to: Imp.self)(self, sel, scale, origin)
+    }
+
+    private func documentPoint(scroll: CGPoint, scale: CGFloat, at point: CGPoint) -> CGPoint {
+        let unit = max(0.01, scale) * max(0.01, pageZoom)
+        return CGPoint(x: scroll.x + point.x / unit, y: scroll.y + point.y / unit)
+    }
+
+    private func scrollOrigin(_ doc: CGPoint, scale: CGFloat, at point: CGPoint) -> CGPoint {
+        let unit = max(0.01, scale) * max(0.01, pageZoom)
+        return CGPoint(x: max(0, doc.x - point.x / unit), y: max(0, doc.y - point.y / unit))
+    }
+
+    private static func point(from value: Any?) -> CGPoint {
+        let text = value as? String ?? "0,0"
+        let bits = text.split(separator: ",")
+        let x = bits.first.flatMap { Double($0) } ?? 0
+        let y = bits.count > 1 ? (Double(bits[1]) ?? 0) : 0
+        return CGPoint(x: x, y: y)
     }
 
     override func scrollWheel(with event: NSEvent) {

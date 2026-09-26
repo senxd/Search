@@ -1,0 +1,11 @@
+{
+  "name": "vision-canvas",
+  "tags": ["vision"],
+  "skipIf": "noImages",
+  "prompt": "What word is written inside the blue box on the page I have open?",
+  "setup": {"tabs": [
+    {"url": "fixture:canvas", "as": "cv", "via": "bench"}
+  ]},
+  "verify": {"kind": "chat", "expect": "TEMPO", "i": true},
+  "timeout": 90
+}

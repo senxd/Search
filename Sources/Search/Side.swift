@@ -896,7 +896,8 @@ struct SideBar: View {
             .padding(.top, SideBar.gap)
     }
 
-    /// One small door at the bottom: the settings.
+    /// The column's own row of controls at the bottom: spaces, extensions,
+    /// the bookmarks — and Ask, when it is shown at all.
     private var foot: some View {
         HStack(spacing: 2) {
             if browser.prefs.usesSpaces { SpaceDot(browser: browser) }
@@ -905,6 +906,9 @@ struct SideBar: View {
                 .popover(isPresented: $browser.bookmarksOpen, arrowEdge: .trailing) {
                     BookmarksDropdown(browser: browser, bookmarks: browser.bookmarks)
                 }
+            if prefs.ask {
+                AskButton(browser: browser)
+            }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)

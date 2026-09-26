@@ -46,7 +46,7 @@ struct TabBar: View {
             ZStack(alignment: .leading) {
                 // The empty half of the strip is what you grab to move the
                 // window; the tabs keep the run they sit on.
-                DragStrip(reserved: Metrics.lights + dot + run(in: geo.size.width) + Metrics.tabGap + Metrics.plusWidth, trailing: Metrics.helm + 26 + 24)
+                DragStrip(reserved: Metrics.lights + dot + run(in: geo.size.width) + Metrics.tabGap + Metrics.plusWidth, trailing: Metrics.helm + 26 + 24 + (browser.prefs.ask ? AskButton.width : 0))
                 // And the corner the lights sit in, which is title bar too —
                 // the one stretch left to take hold of when tabs fill the row.
                 DragStrip()
@@ -198,6 +198,11 @@ struct TabBar: View {
                             .popover(isPresented: $browser.bookmarksOpen, arrowEdge: .bottom) {
                                 BookmarksDropdown(browser: browser, bookmarks: browser.bookmarks)
                             }
+                        // Ask gets a word where the doors wear symbols: it is
+                        // a feature arriving, not another tool.
+                        if browser.prefs.ask {
+                            AskButton(browser: browser)
+                        }
                     }
                     .background {
                         GeometryReader { box in

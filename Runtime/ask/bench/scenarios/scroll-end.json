@@ -1,0 +1,13 @@
+{
+  "name": "scroll-end",
+  "tags": ["scroll"],
+  "prompt": "Scroll all the way to the bottom of the page I have open and tell me what the last line says.",
+  "setup": {"tabs": [
+    {"url": "fixture:longscroll", "as": "s", "via": "bench"}
+  ]},
+  "verify": {"kind": "all", "checks": [
+    {"kind": "chat", "expect": "the end", "i": true},
+    {"kind": "js", "tab": "s", "js": "!!document.getElementById('the-end')"}
+  ]},
+  "timeout": 120
+}

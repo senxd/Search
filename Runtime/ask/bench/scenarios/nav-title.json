@@ -1,0 +1,10 @@
+{
+  "name": "nav-title",
+  "tags": ["nav", "smoke"],
+  "prompt": "Open example.com in a tab and tell me what its title is.",
+  "verify": {"kind": "all", "checks": [
+    {"kind": "chat", "expect": "Example Domain", "i": true},
+    {"kind": "tool", "name": "tab_open", "minCalls": 1}
+  ]},
+  "timeout": 90
+}
