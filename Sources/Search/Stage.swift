@@ -21,7 +21,10 @@ struct Page: View {
             // before and after the float changes nothing SwiftUI can see, so
             // the stage was never told to take it back when it landed, and
             // the tab stayed empty. Nothing, then the page, is a change.
-            WebStage(page: tab.isBlank || tab.asleep || tab.floating ? nil : tab.web)
+            // Nor one of ours: `Page` may still be mounted for the beat the
+            // stage takes to swap in NativePageView, and asking here is what
+            // would rebuild the view go() just tore down.
+            WebStage(page: tab.isBlank || tab.asleep || tab.floating || tab.native != nil ? nil : tab.web)
 
             if let cover = tab.cover {
                 // The page as it was left, while it is rebuilt underneath —

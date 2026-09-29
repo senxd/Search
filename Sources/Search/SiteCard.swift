@@ -41,8 +41,11 @@ enum SiteCardPanel {
             .sink { [weak browser] editing, draft in
                 MainActor.assumeIsolated {
                     guard let browser else { return }
+                    // One of ours has no site for the card to be about —
+                    // the field over it is just an address being typed.
                     guard let id = editing, !browser.renamingTab,
-                          let tab = browser.tabs.first(where: { $0.id == id }), !tab.isBlank
+                          let tab = browser.tabs.first(where: { $0.id == id }),
+                          !tab.isBlank, tab.native == nil
                     else { original = nil; hide(); return }
                     if original == nil {
                         // The edit began: the card comes up under the field once it

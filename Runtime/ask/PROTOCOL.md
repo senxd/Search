@@ -1,5 +1,8 @@
 # Ask / Drive protocol
 
+For engine inspection, native dialogs/uploads, tab handoff, and request receipts,
+see [Browser automation and inspection](INSPECTION.md).
+
 The ops layer `Drive` (Sources/Search/Drive.swift) speaks one op set over two
 doors: the in-app harness's `webkit.messageHandlers.searchHarness` bridge, and
 persistent JSON-lines sessions on `~/Library/Application Support/Search[ (world)]/agent.sock`.
@@ -29,28 +32,31 @@ write < destructive < privileged`:
 
 - `read` allows `meta`/`read` ops only — anything heavier is refused with
   `{error: "<op> is above read mode", code: "MODE"}`.
-- `guard` allows up to `write`; `destructive`/`privileged` ops park and
-  raise an approval card (an `AskApproval`: summary, the model's `why`,
-  a tab screenshot). An `always` verdict remembers `(op, host)` for the
-  session, dying with it the way grants do.
-- `full` allows everything the door does — door-bound ops still refuse by
-  origin.
+- `guard` resolves the action target and applies the category switches in
+  Settings > Ask > Action confirmations. Signing in defaults off; destructive
+  actions, messages, sharing, payments, account changes and unverified actions
+  default on. Any enabled matching category requests approval.
+- `full` allows everything the door permits. Origin restrictions still apply.
 
-Socket sessions default to `full` and never see a card — the wire owns no
-UI and answers on a 30 s patience timer, so an ask verdict resolves
-immediately as `{error: "…needs approval — the wire can't be shown a
-card", code: "NEEDS_UI"}`. A user denying a card answers
-`{error: "denied by user — …", code: "DENIED"}`. `.app`'s mode is the
-current chat's, pushed by Mind; the `agent.mode` op and `mode` on
-`subscribe` set a socket session's own leash only.
+Socket sessions default to `full`. A socket action needing approval returns
+`NEEDS_UI`, because socket sessions have no approval UI. The in-app mode belongs
+to the running chat; the model cannot change it with `agent.mode`.
 
-In `guard` mode a write-class `act.*` also escalates to `destructive` when
-the target's own words say spend/send/end (`buy|pay|order|purchase|
-subscribe|send|post|delete|transfer|confirm` — read off the `text`/`loc`/
-`css` args, except where `text` is the payload: fill, type, press,
-clickAt). A `ref`/`loc`/`css` locator carries no words, so the gate pays
-one read-only `resolve` for the element's {role,name} before dispatch —
-the priced version of the same check.
+An approval parks the tool and the agent loop. The card shows the action,
+site, category, prepared details and a screenshot. Credential pages omit the
+screenshot. Allow executes once; Cancel returns `GUARD_CANCELLED` and stops the
+remaining tool batch. Legacy `always` verdicts also allow once.
+
+Approval binds to the resolved node, document, action arguments, form values and
+surrounding page context. Changed evidence requires fresh approval. Inspection
+errors block execution. Classification uses DOM heuristics; unknown actions
+fall into Unverified actions. Disabling a category removes that category's
+confirmation requirement.
+
+The browser driver runs in an isolated WebKit content world. Page scripts cannot
+replace it. `page.code` intentionally runs in the page world; its driver refs
+have a `code-` prefix. Refs are local to their world: use CSS/locators across
+worlds, or obtain refs inside the same `page.code` call that uses them.
 
 Downloads from tabs a session holds are gated by the holder's mode but
 never asked: anything but `full` is cancelled outright — the file is
@@ -130,8 +136,9 @@ Mutating actions return `{ok:true, version, navChanged}` and accept
 
 Trusted tier ("event") = real `NSEvent`s delivered to the view in the
 offscreen room window (Bench `tap`/`key` machinery) — isTrusted, no focus
-theft. "auto" = JS first, escalate to event when the page ignored it (still
-not `.isConnected`, handler nopped) or the caller asked.
+theft. "auto" uses one native event after actionability checks. Covered elements
+are refused. `tier:"js"` explicitly selects synthetic input; a dispatched click
+is never retried based on missing DOM changes.
 
 ### window / meta
 

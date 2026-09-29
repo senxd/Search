@@ -423,7 +423,10 @@ struct BookmarksDropdown: View {
             Divider().overlay(Palette.hairline)
             VStack(spacing: 1) {
                 Foot("bookmark", "Add This Page") { browser.bookmarkCurrent() }
-                Foot(nil, "Manage Bookmarks…") { browser.bookmarking = true }
+                Foot(nil, "Manage Bookmarks…") {
+                    browser.bookmarksOpen = false
+                    browser.openInternal(.bookmarks)
+                }
             }
             .padding(6)
         }
@@ -466,12 +469,12 @@ struct BookmarksDropdown: View {
 }
 
 /// The full list, for taking things out of it or bringing more in.
-struct BookmarksPanel: View {
+struct BookmarksPage: View {
     @ObservedObject var browser: Browser
     @ObservedObject var bookmarks: Bookmarks
 
     var body: some View {
-        Plate("Bookmarks", width: 600, close: { browser.bookmarking = false }) {
+        PageSheet("Bookmarks") {
             if bookmarks.isEmpty {
                 Card { Nothing("Nothing kept yet. Add this page with ⇧⌘B, or bring yours in below.") }
             } else {
@@ -485,7 +488,7 @@ struct BookmarksPanel: View {
                     }
                     .padding(.bottom, 2)
                 }
-                .frame(maxHeight: 440)
+                .frame(maxHeight: .infinity)
             }
         } foot: {
             HStack(spacing: 8) {

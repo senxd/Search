@@ -1,5 +1,9 @@
 # Agent SDK — driving Search from outside
 
+[Inspection and handoff guide](INSPECTION.md) covers `a.surface`, `a.inspector_attach`,
+`a.inspector_send`, `a.inspector_events`, `a.inspector_detach`, `a.dialogs`,
+`a.answer_dialog`, `a.choose_files`, request cancellation and persistent `ask run`.
+
 Two doors in: `./ask` for shells, `sdk/search_agent.py` for programs. Both
 speak the op catalog in `PROTOCOL.md` over the same socket.
 

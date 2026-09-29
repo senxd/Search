@@ -26,7 +26,7 @@
 // `v` is the build of this file — the guard compares it so a newer drive.js
 // can replace an older one mid-session. It is not `version`, which is the
 // snapshot lineage the protocol speaks about.
-const BUILD = 1;
+const BUILD = 4;
 if (window.__drive && window.__drive.v >= BUILD) return;
 
 // ---------------------------------------------------------------- util
@@ -97,7 +97,7 @@ const consoleLines = [];                             // ring buffer, last 200
 function ensureRef(el, role, name, prefix) {
   const cur = el.__driveRef;
   if (cur && cur.role === role && cur.name === name && cur.prefix === (prefix || '')) return cur.ref;
-  const ref = (prefix || '') + 'e' + (++refCounter);
+  const ref = (window.__driveRefNamespace || '') + (prefix || '') + 'e' + (++refCounter);
   el.__driveRef = { ref, role, name, prefix: prefix || '' };
   refs.set(ref, new WeakRef(el));
   return ref;
@@ -302,6 +302,14 @@ const roleLoc = (role, name) => 'role:' + role + (name ? '[name="' + esc(name) +
 // function of the result.
 const WALK_CAP = 8000; // a safety bound for pathological pages, not a budget
 
+function children(el) {
+  if (el.tagName === 'SLOT') {
+    const assigned = el.assignedElements && el.assignedElements({ flatten: true });
+    if (assigned && assigned.length) return assigned;
+  }
+  return (el.shadowRoot || el).children || [];
+}
+
 function snapshotLines(opts) {
   const v = bumpVersion();
   const lines = [];
@@ -343,7 +351,7 @@ function snapshotLines(opts) {
     if (interactive && r && (r.top + offY) >= ctx.vh) ctx.belowFold++;
 
     let emitted = false;
-    if (shown && (role !== 'generic' || interactive)) {
+    if (shown && (!opts.interactive || interactive) && (role !== 'generic' || interactive)) {
       let line = '  '.repeat(depth) + '- ' + role;
       if (name) line += ' "' + esc(name) + '"';
       if (level != null) line += ' [level=' + level + ']';
@@ -380,16 +388,16 @@ function snapshotLines(opts) {
 
     // Text that was spent as the element's name doesn't get said twice.
     const muted = !!name && CONTENT_NAME_ROLES.has(role);
-    if (!muted && shown) {
+    if (!muted && shown && !opts.interactive) {
       const t = ownText(el);
       if (t) lines.push('  '.repeat(cd) + '- "' + esc(clip(t, 120)) + '"');
     }
     // A closed <select> is a popup, not children — only an open one lists.
     if (tag === 'SELECT' && !(el.multiple || parseInt(el.getAttribute('size'), 10) > 1)) return;
-    for (const c of el.children) visit(c, cd, offX, offY);
+    for (const c of children(el)) visit(c, cd, offX, offY);
   }
 
-  const root = document.body || document.documentElement;
+  const root = opts.ref ? resolve({ ref: opts.ref }) : opts.selector ? resolve({ css: opts.selector }) : document.body || document.documentElement;
   // A pathological nesting can run the stack out before the element cap;
   // the snapshot still answers with what it had.
   try { if (root) visit(root, 0, 0, 0); } catch (e) { ctx.capped = true; }
@@ -439,7 +447,7 @@ const notFound = (what) => ({ code: 'NOT_FOUND', message: 'nothing matches ' + w
 // search. Returning false from fn stops the walk.
 function eachElement(fn) {
   function into(root) {
-    for (const el of root.children || []) {
+    for (const el of children(root)) {
       const tag = el.tagName;
       if (!tag || SKIP_TAGS.has(tag)) continue;
       if (el.namespaceURI && el.namespaceURI.indexOf('svg') !== -1) continue;
@@ -452,6 +460,14 @@ function eachElement(fn) {
     return true;
   }
   try { if (document.documentElement) into(document.documentElement); } catch (e) { /* deep enough to burst the stack is an answer too */ }
+}
+
+function findCSS(selector) {
+  let found = document.querySelector(selector);
+  if (!found) eachElement((el) => {
+    if (el.matches(selector)) { found = el; return false; }
+  });
+  return found;
 }
 
 function pointArg(v) {
@@ -490,7 +506,7 @@ function resolve(query) {
       let el = null;
       // A malformed selector is a NOT_FOUND, not the DOMException's
       // numeric code leaking back over the wire.
-      try { el = document.querySelector(loc.slice(4)); } catch (e) { el = null; }
+      try { el = findCSS(loc.slice(4)); } catch (e) { el = null; }
       if (!el) throw notFound(loc);
       return el;
     }
@@ -527,7 +543,7 @@ function resolve(query) {
 
   if (query.css != null) {
     let el = null;
-    try { el = document.querySelector(String(query.css)); } catch (e) { el = null; }
+    try { el = findCSS(String(query.css)); } catch (e) { el = null; }
     if (!el) throw notFound('css:' + query.css);
     return el;
   }
@@ -718,61 +734,30 @@ function withSnap(out, args) {
 async function act(verb, query, args) {
   args = args || {};
   try {
+    const checkGuard = () => {
+      if (args.guardCheck && !args.guardCheck()) {
+        const error = new Error('The action changed. Review it again before continuing.');
+        error.code = 'GUARD_CHANGED';
+        throw error;
+      }
+    };
+    checkGuard();
     switch (verb) {
       case 'click': {
         const el = resolve(query);
-        const auto = !args.tier || args.tier === 'auto';
         const a = await actionable(el);
-        if (a.error) {
-          // Auto tier, and JS visibly cannot land it: hand the proven point
-          // to the real-event tier — a person's click at a covered control
-          // lands on the occluder too, so escalating is the honest move.
-          if (auto && a.at) {
-            return { ok: false, version, escalate: true, code: a.code, reason: a.error, at: a.at, button: args.button || 'left', double: !!args.double, modifiers: args.modifiers || [] };
-          }
-          // An explicit event-tier request gets the point regardless: real
-          // events don't care what JS could reach.
-          if (args.tier === 'event' && a.at) {
-            return { ok: false, version, handoff: 'event', code: a.code, reason: a.error, at: a.at, button: args.button || 'left', double: !!args.double, modifiers: args.modifiers || [] };
-          }
-          return Object.assign({ version }, a);
-        }
+        if (a.error) return Object.assign({ version }, a);
+        checkGuard();
         if (args.tier === 'event') {
           // The trusted tier is Swift's to send — actionability and the
           // coordinates it lands at are ours.
           return { ok: true, version, navChanged: false, handoff: 'event', at: a.at, button: args.button || 'left', double: !!args.double, modifiers: args.modifiers || [] };
         }
-        // Watch the document while the gesture settles: a DOM ripple is the
-        // best in-page evidence that a handler ran. Root it at the CLICKED
-        // element's own document, not the top one — a handler inside a
-        // same-origin iframe mutates that frame's DOM, which an observer
-        // on the top documentElement can't see. The miss reported
-        // ignored:true, Drive.swift escalated to a real NSEvent on the
-        // same point, and the button took the click twice.
-        let mutated = false, mo = null;
-        try {
-          const doc = el.ownerDocument || document;
-          const MO = (doc.defaultView && doc.defaultView.MutationObserver) || window.MutationObserver;
-          mo = new MO(() => { mutated = true; });
-          mo.observe(doc.documentElement || doc, { subtree: true, childList: true, attributes: true, characterData: true });
-        } catch (e) { mo = null; }
-        // Honest boundary: elements only reach here through documents this
-        // realm can already read — the snapshot walk can't enter a
-        // cross-origin frame (contentDocument throws), and a drive.js
-        // injected into the frame itself makes `document` that frame's
-        // document anyway. What still reads as silence: side effects
-        // confined to a cross-origin descendant or a sibling frame, and
-        // worlds with no MutationObserver at all.
-        const res = clickGesture(el, a.x, a.y, args);
+        // A handler can succeed without changing the DOM. Never retry a
+        // dispatched click based on its visible effects.
+        clickGesture(el, a.x, a.y, args);
         const navChanged = await waitNav(el);
-        try { if (mo) mo.disconnect(); } catch (e) {}
         const out = { ok: true, version, navChanged, tier: 'js', at: a.at };
-        // The `ignored` signal Drive.swift escalates on: no navigation, the
-        // click wasn't cancelled, and the DOM didn't so much as twitch. It
-        // can't separate "page ignored the synthetic event" from "button
-        // legitimately does nothing" — a false positive costs a second real
-        // click on the same point, which is the cheap direction to be wrong.
-        if (auto && !navChanged && !res.prevented && !mutated) out.ignored = true;
         return withSnap(out, args);
       }
       case 'clickAt': {
@@ -793,6 +778,7 @@ async function act(verb, query, args) {
           return { error: 'use select for a <select>', code: 'WRONG_VERB', version };
         const a = await actionable(el);
         if (a.error) return Object.assign({ version }, a);
+        checkGuard();
         try { el.focus && el.focus(); } catch (e) {}
         const value = args.text !== undefined ? String(args.text) : '';
         if (el.isContentEditable || (el.hasAttribute('contenteditable') && el.getAttribute('contenteditable') !== 'false')) {
@@ -869,6 +855,7 @@ async function act(verb, query, args) {
         const el = resolve(query);
         const a = await actionable(el);
         if (a.error) return Object.assign({ version }, a);
+        checkGuard();
         const o = { button: 0, buttons: 0, detail: 0, modifiers: args.modifiers };
         fireMouse(el, 'pointerover', a.x, a.y, o); fireMouse(el, 'mouseover', a.x, a.y, o); fireMouse(el, 'mousemove', a.x, a.y, o);
         // enter/leave don't bubble — they're separate events, not phases.
@@ -896,6 +883,7 @@ async function act(verb, query, args) {
         if (el.checked === on) return withSnap({ ok: true, version, navChanged: false, checked: el.checked }, args);
         const a = await actionable(el);
         if (a.error) return Object.assign({ version }, a);
+        checkGuard();
         // The real toggle, so handlers and indeterminate states agree —
         // with a manual flip behind it for realms whose click() can't
         // build its own activation event.
@@ -968,7 +956,7 @@ function mark() {
   // frame's own rect inside a frame. Geometry comes straight from each
   // element's rect plus the offsets accrued walking down through frames.
   function walk(root, offX, offY, clipR) {
-    for (const el of root.children || []) {
+    for (const el of children(root)) {
       const tag = el.tagName;
       if (!tag || SKIP_TAGS.has(tag)) continue;
       if (el.namespaceURI && el.namespaceURI.indexOf('svg') !== -1) continue;

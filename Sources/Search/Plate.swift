@@ -77,6 +77,64 @@ extension Plate where Foot == EmptyView {
     }
 }
 
+/// The same thing as a page: no card, no cross — the title set large at the
+/// top, the content in a column wide enough to read, the foot pinned to the
+/// bottom edge over a hairline. What was a panel filling the stage instead
+/// of floating over it (see NativePages.swift).
+struct PageSheet<Content: View, Foot: View>: View {
+    let title: String
+    var width: CGFloat = 640
+    @ViewBuilder let content: () -> Content
+    @ViewBuilder let foot: () -> Foot
+
+    init(
+        _ title: String,
+        width: CGFloat = 640,
+        @ViewBuilder content: @escaping () -> Content,
+        @ViewBuilder foot: @escaping () -> Foot
+    ) {
+        self.title = title
+        self.width = width
+        self.content = content
+        self.foot = foot
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(Palette.ink)
+                .padding(.top, 34)
+                .padding(.bottom, 20)
+
+            content()
+
+            if Foot.self != EmptyView.self {
+                Rectangle().fill(Palette.hairline).frame(height: 1)
+                    .padding(.top, 14)
+                foot()
+                    .padding(.vertical, 13)
+            } else {
+                Color.clear.frame(height: 18)
+            }
+        }
+        .frame(maxWidth: width, alignment: .leading)
+        .padding(.horizontal, 28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Palette.ground)
+    }
+}
+
+extension PageSheet where Foot == EmptyView {
+    init(
+        _ title: String,
+        width: CGFloat = 640,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.init(title, width: width, content: content, foot: { EmptyView() })
+    }
+}
+
 /// A group of lines in one hairline box.
 struct Card<Content: View>: View {
     @ViewBuilder let content: () -> Content

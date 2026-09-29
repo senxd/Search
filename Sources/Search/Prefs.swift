@@ -216,6 +216,13 @@ final class Preferences: ObservableObject {
         didSet { store.set(ask, forKey: "ask") }
     }
 
+    /// Whether a blank tab shows the chat and routine cards under the
+    /// field. On unless turned off — the shelf is the two lists' shop
+    /// window on the one surface every ⌘T passes through.
+    @Published var newTabCards: Bool {
+        didSet { store.set(newTabCards, forKey: "newtab.cards") }
+    }
+
     init() {
         // Carried over from when there were four ways of holding the browser
         // and this was one of them.
@@ -296,6 +303,7 @@ final class Preferences: ObservableObject {
         fastPages = fast
         FrameRate.fast = fast
         ask = store.object(forKey: "ask") as? Bool ?? true
+        newTabCards = store.object(forKey: "newtab.cards") as? Bool ?? true
         // Left behind by the Web Inspector's switch, from before it was
         // always there.
         store.removeObject(forKey: "inspector")

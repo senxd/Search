@@ -26,6 +26,7 @@ final class AgentSocket {
     private var sessions: [Int32: Session] = [:]
     /// Whether `onEvent` has been chained onto the driver yet.
     private var hooked = false
+    private var activeRequests = 0
 
     /// Beside the bench socket, so a test run's agent is as separate from the
     /// real one's as everything else it keeps.
@@ -87,6 +88,7 @@ final class AgentSocket {
     private func accept() {
         let fd = Darwin.accept(listener, nil, nil)
         guard fd >= 0 else { return }
+        guard sessions.count < 32 else { close(fd); return }
         // Only this user — the file mode says so already; this says it again,
         // for the day the folder's permissions are not what they were.
         var uid = uid_t(0)
@@ -102,6 +104,7 @@ final class AgentSocket {
             // — its tabs, its leases — dies with the connection that owned
             // it, not with a stray task that could land after the fd's next
             // owner has already registered.
+            session.requests.cancelAll()
             self?.sessions[session.fd] = nil
             (AskRuntime.drive as? Drive)?.leave(.socket(session.token))
         }
@@ -117,21 +120,40 @@ final class AgentSocket {
         // throw. `-1e999` and `NaN` parse to exactly those. Both are checked
         // before either is trusted: a bad request earns an error, never the
         // app's life.
-        guard Drive.jsonSafe(request["id"] ?? NSNull()) else {
-            session.say(["id": NSNull(), "error": "request id isn't JSON-safe"])
-            return
-        }
         let id = request["id"] ?? NSNull()
         let op = request["op"] as? String ?? ""
         let args = request["args"] as? [String: Any] ?? [:]
+        let (registered, rejection) = session.requests.begin(id: id, op: op, control: op == "request.status" || op == "request.cancel")
+        guard let receipt = registered else {
+            var error: [String: Any] = ["id": AgentRequests.key(id) == nil ? NSNull() : id,
+                                        "error": "request rejected", "code": rejection ?? "INVALID_REQUEST_ID"]
+            if let existing = session.requests.lookup(id) { error["receipt"] = existing.json }
+            session.say(error)
+            return
+        }
+        var started = false
+        let answer: ([String: Any]) -> Void = { [weak self] reply in
+            guard receipt.state == "running" else { return }
+            if started { self?.activeRequests -= 1 }
+            let control = op == "request.status" || op == "request.cancel"
+            session.requests.finish(receipt, reply: control && reply["error"] == nil ? ["ok": true] : reply)
+            if !receipt.answered {
+                receipt.answered = true
+                var reply = reply
+                reply["receipt"] = receipt.json
+                session.answer(id: id, reply)
+            } else if session.wants.contains("*") || session.wants.contains("request.finished") {
+                session.say(["event": "request.finished", "data": receipt.json])
+            }
+        }
         guard Drive.jsonSafe(args) else {
-            session.say(["id": id, "error": "args aren't JSON-safe — a number ran off the end, or a non-JSON type came in"])
+            answer(["error": "args aren't JSON-safe", "code": "INVALID_ARGS"])
             return
         }
 
         switch op {
         case "ping":
-            session.answer(id: id, ["pong": true])
+            answer(["pong": true])
         case "subscribe":
             let events = args["events"] as? [String] ?? ["*"]
             session.wants = Set(events)
@@ -147,28 +169,57 @@ final class AgentSocket {
                     (drive as? Drive)?.setMode(mode, for: .socket(session.token))
                 }
             }
-            session.answer(id: id, ["subscribed": true, "events": events])
-        case "":
-            session.say(["id": id, "error": "request needs an op"])
-        default:
-            guard let drive = AskRuntime.drive else {
-                session.say(["id": id, "error": "no driver"])
+            answer(["subscribed": true, "events": events])
+        case "request.status", "request.cancel":
+            guard let target = session.requests.lookup(args["requestId"]) else {
+                answer(["error": "request receipt not found in this session", "code": "REQUEST_NOT_FOUND"])
                 return
             }
+            if op == "request.cancel", target.state == "running" {
+                target.cancellation.cancel()
+                if !target.answered {
+                    target.answered = true
+                    session.answer(id: target.id, ["error": "cancellation requested; outcome unknown",
+                                                  "code": "CANCEL_REQUESTED", "receipt": target.json])
+                }
+            }
+            answer(target.json)
+        case "":
+            answer(["error": "request needs an op"])
+        default:
+            guard let drive = AskRuntime.drive else {
+                answer(["error": "no driver"])
+                return
+            }
+            guard activeRequests < 256 else {
+                answer(["error": "256 operations still running", "code": "TOO_MANY_REQUESTS"])
+                return
+            }
+            activeRequests += 1
+            started = true
             hook(drive)
-            var answered = false
-            let answer: ([String: Any]) -> Void = { reply in
-                guard !answered else { return }
-                answered = true
-                session.answer(id: id, reply)
+            let requestedWait = (args["seconds"] as? NSNumber)?.doubleValue ?? 30
+            let patience = op == "page.wait" ? min(max(requestedWait, 0), 3_600) + 5 : 30
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            receipt.timer = timer
+            timer.schedule(deadline: .now() + patience)
+            timer.setEventHandler { [weak session, weak receipt] in
+                guard let session, let receipt else { return }
+                guard receipt.state == "running", !receipt.answered else { return }
+                receipt.answered = true
+                receipt.timedOut = true
+                var timedOut = receipt.json
+                timedOut["cancelRequested"] = true
+                session.answer(id: id, ["error": "no answer within \(Int(patience)) s; outcome unknown",
+                                       "code": "TIMEOUT", "receipt": timedOut])
+                receipt.cancellation.cancel()
             }
-            // One answer, and always one — a page that never replies to an op
-            // would otherwise sit in the session's table of in-flight asks.
-            let patience = op == "page.wait" ? ((args["seconds"] as? NSNumber)?.doubleValue ?? 30) + 5 : 30
-            DispatchQueue.main.asyncAfter(deadline: .now() + patience) {
-                answer(["error": "no answer within \(Int(patience)) s"])
+            timer.resume()
+            if let native = drive as? Drive {
+                native.perform(op, args, from: .socket(session.token), cancellation: receipt.cancellation, done: answer)
+            } else {
+                drive.perform(op, args, from: .socket(session.token), done: answer)
             }
-            drive.perform(op, args, from: .socket(session.token), done: answer)
         }
     }
 
@@ -219,20 +270,24 @@ final class AgentSocket {
         /// The event names this session asked for — "*" or a list. Empty is
         /// unsubscribed: answers still come, events don't.
         var wants: Set<String> = []
+        let requests: AgentRequests
         private let queue = DispatchQueue(label: "Search.agent.session")
         private var reader: DispatchSourceRead?
         private var writer: DispatchSourceWrite?
         private var incoming = Data()
         private var outgoing = Data()
         private var dead = false
+        private var queuedRequests = 0
         private let line: (Session, [String: Any]) -> Void
         private let gone: (Session) -> Void
 
+        @MainActor
         init(
             fd: Int32,
             line: @escaping (Session, [String: Any]) -> Void,
             gone: @escaping (Session) -> Void
         ) {
+            self.requests = AgentRequests()
             self.fd = fd
             self.line = line
             self.gone = gone
@@ -274,9 +329,12 @@ final class AgentSocket {
                     say(["id": NSNull(), "error": "not a JSON object"])
                     continue
                 }
+                guard queuedRequests < 128 else { fail(); return }
+                queuedRequests += 1
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     MainActor.assumeIsolated { self.line(self, json) }
+                    self.queue.async { self.queuedRequests -= 1 }
                 }
             }
         }
@@ -307,9 +365,12 @@ final class AgentSocket {
             }
             var data = (try? JSONSerialization.data(withJSONObject: object))
                 ?? Data("{\"error\":\"unwritable answer\"}".utf8)
+            // A single large result and a slow reader must not grow the queue forever.
+            guard data.count <= 8_000_000 else { drop(); return }
             data.append(0x0A)
             queue.async { [weak self] in
                 guard let self, !self.dead else { return }
+                guard self.outgoing.count + data.count <= 8_000_000 else { self.fail(); return }
                 self.outgoing.append(data)
                 self.drain()
             }

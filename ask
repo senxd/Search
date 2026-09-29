@@ -2,6 +2,9 @@
 """Ask the Search you already have open to do something — the agent
 socket's shell driver, one session per command.
 
+    ./ask run FILE.py                run a Python program with a persistent `agent` SDK session
+    ./ask call OP JSON               one raw operation (use run for tab workflows)
+    ./ask surface ID                 attach a consented tab, then keep it as a normal tab
     ./ask tabs                       every tab, yours and the agent's
     ./ask agent-tabs                 only the ⚗ tabs
     ./ask open URL [--foreground]    an agent tab at URL → its id
@@ -141,7 +144,24 @@ def main(argv):
 
     try:
         with Agent(world) as a:
-            if verb == "tabs":
+            if verb == "run":
+                if len(args) != 1:
+                    sys.exit("usage: ask run FILE.py")
+                import runpy
+                runpy.run_path(args[0], init_globals={"agent": a}, run_name="__main__")
+            elif verb == "call":
+                if not 1 <= len(args) <= 2:
+                    sys.exit("usage: ask call OP [JSON]")
+                values = json.loads(args[1]) if len(args) == 2 else {}
+                if not isinstance(values, dict):
+                    sys.exit("JSON must be an object")
+                out(a.call(args[0], **values))
+            elif verb == "surface":
+                if len(args) != 1:
+                    sys.exit("usage: ask surface ID")
+                a.attach(args[0])
+                out(a.surface(args[0]))
+            elif verb == "tabs":
                 if args:
                     sys.exit("usage: ask tabs")
                 out({"tabs": a.tabs()})

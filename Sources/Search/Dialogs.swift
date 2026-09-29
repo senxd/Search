@@ -18,6 +18,8 @@ extension Browser {
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping () -> Void
     ) {
+        if AgentInteractions.shared.capture(webView, kind: "alert", message: message,
+            reply: { _, _, _ in completionHandler() }) { return }
         let alert = Dialogs.alert(from: frame, saying: message)
         alert.addButton(withTitle: "OK")
         Dialogs.show(alert, over: webView) { _ in completionHandler() }
@@ -29,6 +31,8 @@ extension Browser {
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping (Bool) -> Void
     ) {
+        if AgentInteractions.shared.capture(webView, kind: "confirm", message: message,
+            reply: { accept, _, _ in completionHandler(accept) }) { return }
         let alert = Dialogs.alert(from: frame, saying: message)
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
@@ -44,6 +48,8 @@ extension Browser {
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping (String?) -> Void
     ) {
+        if AgentInteractions.shared.capture(webView, kind: "prompt", message: prompt,
+            reply: { accept, text, _ in completionHandler(accept ? (text ?? defaultText ?? "") : nil) }) { return }
         let alert = Dialogs.alert(from: frame, saying: prompt)
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
@@ -64,6 +70,9 @@ extension Browser {
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping ([URL]?) -> Void
     ) {
+        if AgentInteractions.shared.capture(webView, kind: "file",
+            multiple: parameters.allowsMultipleSelection, directories: parameters.allowsDirectories,
+            reply: { accept, _, urls in completionHandler(accept ? urls : nil) }) { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = parameters.allowsDirectories

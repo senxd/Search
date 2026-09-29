@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // Fluid Functionalism, ported: the system's three spring tiers, its hover
@@ -21,6 +22,7 @@ enum FluidSpring {
 /// FF's neutral fills — the library's own tokens, carried rather than
 /// mapped onto Palette so the ports stay faithful to the source. The
 /// numeric comments are the globals.css values each NSColor stands for.
+/// oklch neutrals decode as srgb = encode(L³), never L itself.
 enum FluidTone {
     private static func dynamic(_ dark: NSColor, _ light: NSColor) -> Color {
         Color(nsColor: NSColor(name: nil) { a in
@@ -28,14 +30,15 @@ enum FluidTone {
         })
     }
 
-    /// --foreground: oklch 0.145 / 0.985 (~neutral-900 / neutral-50).
-    static let foreground = dynamic(NSColor(white: 0.985, alpha: 1), NSColor(srgbRed: 0x17/255, green: 0x17/255, blue: 0x17/255, alpha: 1))
-    /// --background: white / oklch 0.145.
-    static let background = dynamic(NSColor(srgbRed: 0x17/255, green: 0x17/255, blue: 0x17/255, alpha: 1), .white)
-    /// --muted-foreground: oklch 0.556 / 0.708 (~neutral-500 / neutral-400).
-    static let mutedForeground = dynamic(NSColor(srgbRed: 0xA3/255, green: 0xA3/255, blue: 0xA3/255, alpha: 1), NSColor(srgbRed: 0x73/255, green: 0x73/255, blue: 0x73/255, alpha: 1))
-    /// --accent / --muted: oklch 0.97 / 0.269 — the resting gray fill.
-    static let accent = dynamic(NSColor(white: 0.269, alpha: 1), NSColor(white: 0.97, alpha: 1))
+    /// --foreground: oklch 0.145 / 0.985 → #0A0A0A / #FAFAFA.
+    static let foreground = dynamic(NSColor(white: 0.980, alpha: 1), NSColor(white: 0.039, alpha: 1))
+    /// --background: white / oklch 0.145 → #0A0A0A.
+    static let background = dynamic(NSColor(white: 0.039, alpha: 1), .white)
+    /// --muted-foreground: oklch 0.556 / 0.708 → #737373 / #A1A1A1.
+    static let mutedForeground = dynamic(NSColor(srgbRed: 0xA1/255, green: 0xA1/255, blue: 0xA1/255, alpha: 1), NSColor(srgbRed: 0x73/255, green: 0x73/255, blue: 0x73/255, alpha: 1))
+    /// --accent / --muted: oklch 0.97 / 0.269 → #F5F5F5 / #262626 — the
+    /// resting gray fill.
+    static let accent = dynamic(NSColor(white: 0.149, alpha: 1), NSColor(white: 0.961, alpha: 1))
 
     /// The resting hover highlight: black 4% / white 6%.
     static let hover = dynamic(NSColor(white: 1, alpha: 0.06), NSColor(white: 0, alpha: 0.04))
@@ -46,10 +49,28 @@ enum FluidTone {
         NSColor(srgbRed: 0x52/255, green: 0x52/255, blue: 0x52/255, alpha: 1),
         NSColor(srgbRed: 0xD4/255, green: 0xD4/255, blue: 0xD4/255, alpha: 1)
     )
-    /// The muted track segmented controls and cards sit on: neutral-100ish.
-    static let muted = dynamic(NSColor(white: 0.269, alpha: 1), NSColor(white: 0.97, alpha: 1))
-    /// --border: neutral-200 / white 10%.
-    static let border = dynamic(NSColor(white: 1, alpha: 0.10), NSColor(white: 0.922, alpha: 1))
+    /// The muted track segmented controls and cards sit on — the same
+    /// --muted tokens as accent: oklch 0.269 / 0.97 → #262626 / #F5F5F5.
+    static let muted = dynamic(NSColor(white: 0.149, alpha: 1), NSColor(white: 0.961, alpha: 1))
+    /// --card: white / oklch 0.205 → #171717 — the focused input field's fill.
+    static let card = dynamic(NSColor(white: 0.091, alpha: 1), .white)
+    /// --destructive: oklch 0.577 0.245 27.325 → #E7000B light;
+    /// oklch 0.704 0.191 22.216 → #FF6467 dark (globals.css:140, :200).
+    static let destructive = dynamic(
+        NSColor(srgbRed: 0xFF/255, green: 0x64/255, blue: 0x67/255, alpha: 1),
+        NSColor(srgbRed: 0xE7/255, green: 0x00/255, blue: 0x0B/255, alpha: 1)
+    )
+    /// --destructive-light: #FEF2F2 / #450A0A — the errored field's tint.
+    static let destructiveLight = dynamic(
+        NSColor(srgbRed: 0x45/255, green: 0x0A/255, blue: 0x0A/255, alpha: 1),
+        NSColor(srgbRed: 0xFE/255, green: 0xF2/255, blue: 0xF2/255, alpha: 1)
+    )
+    /// User chat-bubble fill: color-mix(in oklab, accent, background 45%) —
+    /// oklab L-lerp (0.269·0.55+0.145·0.45 / 0.97·0.55+1·0.45) re-encoded
+    /// → #191919 / #F9F9F9.
+    static let bubble = dynamic(NSColor(white: 0.098, alpha: 1), NSColor(white: 0.978, alpha: 1))
+    /// --border: oklch 0.922 → #E5E5E5 / white 10%.
+    static let border = dynamic(NSColor(white: 1, alpha: 0.10), NSColor(white: 0.898, alpha: 1))
     /// The stronger border unchecked boxes show on hover: neutral-400 / -500.
     static let borderStrong = dynamic(
         NSColor(srgbRed: 0x73/255, green: 0x73/255, blue: 0x73/255, alpha: 1),
@@ -79,13 +100,60 @@ enum FluidTone {
 /// Foreground/background mixed toward each other — the ports of the
 /// color-mix() calls the registry uses for hover/active fills.
 enum FluidMix {
-    /// mix(foreground k%, background) — the primary button's hover (90)
-    /// and pressed (80) fills.
+    /// mix(in oklab, foreground k%, background) — the primary button's
+    /// hover (90) and pressed (80) fills. For achromatics oklab L = cbrt
+    /// of linear srgb and the mix stays achromatic, so the lerp runs in
+    /// L-space then re-encodes — the same pipeline overlayAccent uses.
+    /// Lands #1D1D1D / #323232 light, #DEDEDE / #C3C3C3 dark.
     static func fgOverBg(_ k: CGFloat, for scheme: ColorScheme) -> Color {
-        // mix(foreground k%, background): k% of fg over (100-k)% of bg.
-        scheme == .dark
-            ? Color(white: 0.985 * k / 100 + (0x17/255) * (100 - k) / 100)
-            : Color(white: (0x17/255) * k / 100 + (100 - k) / 100)
+        func linear(_ s: Double) -> Double {
+            s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4)
+        }
+        func srgb(_ l: Double) -> Double {
+            l <= 0.0031308 ? 12.92 * l : 1.055 * pow(l, 1 / 2.4) - 0.055
+        }
+        // The decoded srgb endpoints (oklch 0.985 → 0.980, 0.145 → 0.039,
+        // background white / #0A0A0A) — cbrt(linear()) hands the L-space
+        // lerp the oklch L back.
+        let fg = scheme == .dark ? 0.980 : 0.039
+        let bg = scheme == .dark ? 0.039 : 1.0
+        let t = Double(k) / 100
+        let l = cbrt(linear(fg)) * t + cbrt(linear(bg)) * (1 - t)
+        return Color(white: srgb(l * l * l))
+    }
+
+    /// color-mix(in oklab, accent, rgb(var(--overlay)) 10%) — the
+    /// off-state switch track's hover. For neutrals oklab L = cbrt of
+    /// linear srgb, so the mix is an L-space lerp then re-encode; overlay
+    /// is black in light mode, white in dark (globals.css:162).
+    static func overlayAccent(_ scheme: ColorScheme) -> Color {
+        func linear(_ s: Double) -> Double {
+            s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4)
+        }
+        func srgb(_ l: Double) -> Double {
+            l <= 0.0031308 ? 12.92 * l : 1.055 * pow(l, 1 / 2.4) - 0.055
+        }
+        // The decoded srgb accents (oklch 0.269 → 0.149, 0.97 → 0.961) —
+        // cbrt(linear()) hands the L-space lerp the oklch L back.
+        let accent = scheme == .dark ? 0.149 : 0.961
+        let overlayL = scheme == .dark ? 1.0 : 0.0
+        let l = cbrt(linear(accent)) * 0.9 + overlayL * 0.1
+        return Color(white: srgb(l * l * l))
+    }
+
+    /// color-mix(in oklab, accent 80%, background) — the secondary
+    /// button's hover fill (button.tsx:106). Same L-space pipeline.
+    static func accentOverBg(_ scheme: ColorScheme) -> Color {
+        func linear(_ s: Double) -> Double {
+            s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4)
+        }
+        func srgb(_ l: Double) -> Double {
+            l <= 0.0031308 ? 12.92 * l : 1.055 * pow(l, 1 / 2.4) - 0.055
+        }
+        let accent = scheme == .dark ? 0.149 : 0.961
+        let bg = scheme == .dark ? 0.039 : 1.0
+        let l = cbrt(linear(accent)) * 0.8 + cbrt(linear(bg)) * 0.2
+        return Color(white: srgb(l * l * l))
     }
 }
 
@@ -112,33 +180,38 @@ private struct FluidSurface: ViewModifier {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
         content
             .background {
-                shape.fill(FluidTone.surface(level))
-                if scheme == .dark {
-                    // dm-ring: inset ring + a top inner highlight.
-                    shape.strokeBorder(.white.opacity(level >= 4 ? 0.04 : 0.02), lineWidth: 1)
-                    shape.fill(
-                        LinearGradient(
-                            colors: [.white.opacity(level >= 5 ? 0.04 : 0.02), .clear],
-                            startPoint: .top, endPoint: .bottom
-                        )
-                    ).frame(height: 14).frame(maxHeight: .infinity, alignment: .top)
-                        .clipShape(shape)
-                } else {
-                    shape.strokeBorder(.black.opacity(0.06), lineWidth: 1)
+                // Shadows hang off the background composite, not the whole
+                // subtree — one small render target instead of re-rasterizing
+                // every text/icon layer three times.
+                ZStack {
+                    shape.fill(FluidTone.surface(level))
+                    if scheme == .dark {
+                        // dm-ring: inset ring + a top inner highlight.
+                        shape.strokeBorder(.white.opacity(level >= 4 ? 0.04 : 0.02), lineWidth: 1)
+                        shape.fill(
+                            LinearGradient(
+                                colors: [.white.opacity(level >= 5 ? 0.04 : 0.02), .clear],
+                                startPoint: .top, endPoint: .bottom
+                            )
+                        ).frame(height: 14).frame(maxHeight: .infinity, alignment: .top)
+                            .clipShape(shape)
+                    } else {
+                        shape.strokeBorder(.black.opacity(0.06), lineWidth: 1)
+                    }
                 }
+                .shadow(
+                    color: .black.opacity(scheme == .dark ? 0.18 : 0.06),
+                    radius: level >= 3 ? 1.5 : 0.5, y: 1
+                )
+                .shadow(
+                    color: .black.opacity(scheme == .dark ? 0.18 : 0.06),
+                    radius: level >= 3 ? 3 : 0, y: level >= 3 ? 1.5 : 0
+                )
+                .shadow(
+                    color: .black.opacity(scheme == .dark ? 0.18 : 0.06),
+                    radius: level >= 4 ? 6 : 0, y: level >= 4 ? 3 : 0
+                )
             }
-            .shadow(
-                color: .black.opacity(scheme == .dark ? 0.18 : 0.06),
-                radius: level >= 3 ? 1.5 : 0.5, y: 1
-            )
-            .shadow(
-                color: .black.opacity(scheme == .dark ? 0.18 : 0.06),
-                radius: level >= 3 ? 3 : 0, y: level >= 3 ? 1.5 : 0
-            )
-            .shadow(
-                color: .black.opacity(scheme == .dark ? 0.18 : 0.06),
-                radius: level >= 4 ? 6 : 0, y: level >= 4 ? 3 : 0
-            )
     }
 }
 
@@ -186,14 +259,14 @@ enum FluidHoverAxis {
 func fluidPickNearest(
     axis: FluidHoverAxis,
     point: CGPoint,
-    rects: [Int: CGRect],
+    rects: [(Int, CGRect)],
     isDisabled: (Int) -> Bool
 ) -> Int? {
     var closest: Int? = nil
     var closestDistance = CGFloat.infinity
     var containing: Int? = nil
 
-    for (index, r) in rects.sorted(by: { $0.key < $1.key }) {
+    for (index, r) in rects {
         if isDisabled(index) { continue }
         switch axis {
         case .xy:
@@ -213,14 +286,6 @@ func fluidPickNearest(
     return containing ?? closest
 }
 
-/// Item frames, reported in the container's named coordinate space.
-struct FluidItemRectsKey: PreferenceKey {
-    static var defaultValue: [Int: CGRect] { [:] }
-    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
-        value.merge(nextValue()) { a, _ in a }
-    }
-}
-
 /// The hover state for one list — rects the items publish, the index the
 /// pick resolves to, and the session counter that re-keys the highlight so a
 /// fresh entry fades in place instead of sliding in from the last row.
@@ -235,8 +300,30 @@ final class FluidHover {
     /// A click between items goes to the lit one — the highlight is a
     /// promise about the click. False keeps gaps inert.
     var gapClick = true
+    /// The source's `gapClick: { maxDistance }` — a gap click farther than
+    /// this from the lit rect does nothing (card.tsx uses 16).
+    var gapClickMaxDistance: CGFloat = .infinity
+    /// Freeze the current pick — while a row's popup is open the source
+    /// suppresses mouse-move, so the highlight stays pinned rather than
+    /// tracking (or clearing) under the cursor. Mouse-leave stays live
+    /// (onMouseLeave is ungated in the source).
+    var frozen = false
 
-    var rects: [Int: CGRect] = [:]
+    /// Points inside these rects produce no pick — accordion content areas
+    /// register here so a cursor inside an open panel isn't "hovering"
+    /// its trigger (the group's onMouseMove suppression in the source).
+    var deadRects: [CGRect] = []
+
+    var rects: [Int: CGRect] = [:] {
+        didSet { ordered = rects.sorted { $0.key < $1.key } }
+    }
+    /// Rects pre-sorted by index — the pick walks them on every mouse move,
+    /// so sorting once per layout change beats sorting per event.
+    @ObservationIgnored private(set) var ordered: [(Int, CGRect)] = []
+    /// Item labels for popup typeahead — the source reads textContent off
+    /// the DOM; rows that have a label report it here (Radix's typeahead
+    /// data). Optional; rows without a label just don't match.
+    var itemLabels: [Int: String] = [:]
     var activeIndex: Int? = nil
     var session = 0
     private var inside = false
@@ -249,15 +336,21 @@ final class FluidHover {
     }
 
     func moved(to point: CGPoint) {
+        guard !frozen else { return }
+        if deadRects.contains(where: { $0.contains(point) }) {
+            if activeIndex != nil { activeIndex = nil }
+            return
+        }
         if !inside { inside = true; session += 1 }
-        activeIndex = fluidPickNearest(
-            axis: axis, point: point, rects: rects, isDisabled: isItemDisabled
+        let pick = fluidPickNearest(
+            axis: axis, point: point, rects: ordered, isDisabled: isItemDisabled
         )
+        if pick != activeIndex { activeIndex = pick }
     }
 
     func exited() {
         inside = false
-        activeIndex = nil
+        if activeIndex != nil { activeIndex = nil }
     }
 }
 
@@ -269,6 +362,12 @@ extension EnvironmentValues {
     @Entry var fluidSize: FluidSize = .default
 }
 
+/// Debug/perf gate: FLUID_QUIET=1 freezes perpetual animations so idle CPU
+/// can be measured without display-linked state churn.
+enum FluidPerf {
+    static let quiet = ProcessInfo.processInfo.environment["FLUID_QUIET"] == "1"
+}
+
 // MARK: - Modifiers
 
 /// Marks a row as fluid-hover item `index`. The row reports its frame in the
@@ -278,14 +377,18 @@ struct FluidItem: ViewModifier {
     let index: Int
 
     func body(content: Content) -> some View {
-        content.background(
-            GeometryReader { geo in
-                Color.clear.preference(
-                    key: FluidItemRectsKey.self,
-                    value: hover.map { [index: geo.frame(in: .named($0.space))] } ?? [:]
-                )
+        content
+            // onGeometryChange reports straight into the store — one callback
+            // per item, no GeometryReader + preference merge per row.
+            .onGeometryChange(for: CGRect.self) { proxy in
+                hover.map { proxy.frame(in: .named($0.space)) } ?? .zero
+            } action: { frame in
+                guard let hover, frame != .zero, hover.rects[index] != frame else { return }
+                hover.rects[index] = frame
             }
-        )
+            // Index moves leave the old key behind — drop it explicitly.
+            .onChange(of: index) { old, _ in hover?.rects[old] = nil }
+            .onDisappear { hover?.rects[index] = nil }
     }
 }
 
@@ -306,6 +409,9 @@ struct FluidContainer<Content: View>: View {
     var from: CGRect? = nil
     /// The highlight's corner radius — the shape system's `bg`.
     var radius: CGFloat = 8
+    /// Input groups track the pick without drawing the highlight —
+    /// the hovered field paints its own bg + ring instead.
+    var showsHighlight = true
     /// Called when a gap click lands on the lit item — the routed click.
     var onGapPick: ((Int) -> Void)? = nil
     @ViewBuilder var content: () -> Content
@@ -314,9 +420,10 @@ struct FluidContainer<Content: View>: View {
         content()
             .coordinateSpace(name: hover.space)
             .background(alignment: .topLeading) {
-                if let rect = hover.activeRect {
+                if showsHighlight, let rect = hover.activeRect {
                     FluidHighlight(
-                        rect: rect, from: from, radius: radius,
+                        rect: rect, from: from, index: hover.activeIndex ?? -1,
+                        radius: radius,
                         fill: FluidTone.hover,
                         travel: !reduceMotion
                     )
@@ -325,7 +432,6 @@ struct FluidContainer<Content: View>: View {
                 }
             }
             .animation(.easeOut(duration: 0.06), value: hover.activeIndex != nil)
-            .onPreferenceChange(FluidItemRectsKey.self) { hover.rects = $0 }
             .onContinuousHover(coordinateSpace: .named(hover.space)) { phase in
                 switch phase {
                 case .active(let point): hover.moved(to: point)
@@ -333,11 +439,29 @@ struct FluidContainer<Content: View>: View {
                 }
             }
             .contentShape(Rectangle())
+            // Gap click → activate. NOTE: SwiftUI delivers this tap only
+            // over the container's own surface and gesture-less children;
+            // inert child regions (e.g. a sub-menu rail strip) swallow it
+            // — the DOM's document-level pointerdown has no hit-test-
+            // transparent equivalent. Reachable dead surface is ~8px.
+            // Interactive children keep their own clicks, which covers the
+            // source's closest(input,button,a,…) exclusion.
             .simultaneousGesture(
-                TapGesture().onEnded { _ in
-                    guard hover.gapClick, let i = hover.activeIndex else { return }
-                    onGapPick?(i)
-                }
+                SpatialTapGesture(coordinateSpace: .named(hover.space))
+                    .onEnded { value in
+                        guard hover.gapClick, let i = hover.activeIndex,
+                              !hover.isItemDisabled(i) else { return }
+                        // gapClick:{maxDistance} — clicks beyond the cap
+                        // from the lit rect are inert (use-fluid-hover).
+                        if hover.gapClickMaxDistance != .infinity,
+                           let r = hover.rects[i] {
+                            let p = value.location
+                            let dx = max(r.minX - p.x, 0, p.x - r.maxX)
+                            let dy = max(r.minY - p.y, 0, p.y - r.maxY)
+                            if hypot(dx, dy) > hover.gapClickMaxDistance { return }
+                        }
+                        onGapPick?(i)
+                    }
             )
             .environment(\.fluidHover, hover)
     }
@@ -348,8 +472,13 @@ struct FluidContainer<Content: View>: View {
 /// a fresh session mounts at `from` (or the rect itself) and fades in while
 /// it glides to the target. Exit is a 60ms fade, matching the registry.
 private struct FluidHighlight: View {
+    /// (index, rect) as one onChange payload — index moves spring,
+    /// same-row reflows snap (the source's rowChanged rule).
+    private struct Target: Equatable { var index: Int; var rect: CGRect }
+
     let rect: CGRect
     let from: CGRect?
+    let index: Int
     let radius: CGFloat
     let fill: Color
     /// Reduced motion drops the travel but keeps the fade.
@@ -357,14 +486,17 @@ private struct FluidHighlight: View {
 
     @State private var current: CGRect
     @State private var opacity = 0.0
+    @State private var last: Target
 
-    init(rect: CGRect, from: CGRect?, radius: CGFloat, fill: Color, travel: Bool) {
+    init(rect: CGRect, from: CGRect?, index: Int, radius: CGFloat, fill: Color, travel: Bool) {
         self.rect = rect
         self.from = from
+        self.index = index
         self.radius = radius
         self.fill = fill
         self.travel = travel
         _current = State(initialValue: from ?? rect)
+        _last = State(initialValue: Target(index: index, rect: rect))
     }
 
     var body: some View {
@@ -377,8 +509,211 @@ private struct FluidHighlight: View {
                 withAnimation(.easeOut(duration: 0.08)) { opacity = 1 }
                 withAnimation(travel ? FluidSpring.fast : nil) { current = rect }
             }
-            .onChange(of: rect) { _, new in
-                withAnimation(travel ? FluidSpring.fast : nil) { current = new }
+            .onChange(of: Target(index: index, rect: rect)) { _, new in
+                defer { last = new }
+                if new.index != last.index {
+                    withAnimation(travel ? FluidSpring.fast : nil) { current = new.rect }
+                } else {
+                    var t = Transaction(); t.disablesAnimations = true
+                    withTransaction(t) { current = new.rect }
+                }
+            }
+    }
+}
+
+// MARK: - shimmer sweep (thinking styles)
+
+/// The registry's shimmer — `background: linear-gradient(90deg, base,
+/// #525252, base)` at `background-size: 300%` sliding right-to-left across
+/// the glyphs (the sweep reads as a tint band because only the 35–65%
+/// window differs from the base). The band lives on a CAGradientLayer
+/// animated by Core Animation inside a cached `mask` of the content —
+/// nothing in the app ticks per frame, and the string rasterizes once.
+private struct FluidShimmerSweep: ViewModifier {
+    var tint: Color
+    var active: Bool
+    var duration: Double = 1.5
+    @State private var w: CGFloat = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        content
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { w = $0 }
+            .overlay(alignment: .leading) {
+                if active, !reduceMotion, !FluidPerf.quiet, w > 0 {
+                    FluidShimmerBand(tint: tint, width: w, duration: duration)
+                        .mask { content }
+                        .allowsHitTesting(false)
+                }
+            }
+    }
+}
+
+private struct FluidShimmerBand: NSViewRepresentable {
+    var tint: Color
+    var width: CGFloat
+    var duration: Double
+
+    func makeNSView(context: Context) -> FluidShimmerView { FluidShimmerView() }
+    func updateNSView(_ view: FluidShimmerView, context: Context) {
+        view.tint = NSColor(tint)
+        view.contentWidth = width
+        view.duration = duration
+    }
+}
+
+/// The sweep band: 0.9×content wide soft-dark-soft gradient (the CSS
+/// gradient's 35%→65% core), starting at 1.05× content width and sliding
+/// −2× content — `background-position: 0%→100%` on a 300% gradient.
+final class FluidShimmerView: NSView {
+    var tint = NSColor.gray { didSet { apply() } }
+    var contentWidth: CGFloat = 0 { didSet { apply() } }
+    var duration: Double = 1.5 { didSet { apply() } }
+    private let band = CAGradientLayer()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        band.colors = nil
+        band.startPoint = CGPoint(x: 0, y: 0.5)
+        band.endPoint = CGPoint(x: 1, y: 0.5)
+        layer?.addSublayer(band)
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() { super.layout(); apply() }
+
+    private func apply() {
+        guard bounds.height > 0 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        band.frame = CGRect(x: contentWidth * 1.05, y: 0,
+                            width: contentWidth * 0.9, height: bounds.height)
+        band.colors = [
+            tint.withAlphaComponent(0).cgColor, tint.cgColor, tint.withAlphaComponent(0).cgColor,
+        ]
+        CATransaction.commit()
+        band.removeAnimation(forKey: "sweep")
+        guard contentWidth > 0 else { return }
+        let sweep = CABasicAnimation(keyPath: "transform.translation.x")
+        sweep.fromValue = 0
+        sweep.toValue = -2 * contentWidth
+        sweep.duration = duration
+        sweep.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        sweep.repeatCount = .infinity
+        band.add(sweep, forKey: "sweep")
+    }
+}
+
+extension View {
+    /// Soft `tint` band sweeping the view's alpha — the registry's shimmer.
+    func fluidShimmerSweep(_ tint: Color, active: Bool,
+                           duration: Double = 1.5) -> some View {
+        modifier(FluidShimmerSweep(tint: tint, active: active, duration: duration))
+    }
+}
+
+// MARK: - scroll-fade (globals.css)
+//
+// The `.scroll-fade` viewport mask: a `--scroll-fade-size` gradient at the
+// top and bottom edges. With scroll-timeline support (the demos in Chrome)
+// each edge's fade ramps in only after you scroll away from it — at rest
+// the top edge is crisp. `.scroll-divider` draws a hairline at each
+// scrolled-away edge.
+
+/// Tracks a scroll viewport's fade state for `fluidScrollFade` — stores the
+/// derived edge alphas, not the content frame, so mid-scroll ticks (which
+/// don't change the fades) don't invalidate the mask.
+@Observable
+final class FluidScrollFadeState {
+    /// Unique coordinate space — the content sentinel measures in it.
+    let space = "fluid-fade-\(UUID().uuidString)"
+    /// Fade ramp length in points — set by the modifier at creation.
+    var fadeSize: CGFloat = 48
+    /// Edge alphas for the mask — 1 = crisp, ramps to 0 over `fadeSize`.
+    var topAlpha: CGFloat = 1
+    var bottomAlpha: CGFloat = 1
+    var overflowing = false
+    private(set) var viewHeight: CGFloat = 0
+    private var lastRect: CGRect = .zero
+
+    func update(_ rect: CGRect) {
+        lastRect = rect
+        let ov = rect.height > viewHeight + 0.5
+        if ov != overflowing { overflowing = ov }
+        let t = ov ? 1 - min(1, max(0, -rect.origin.y) / fadeSize) : 1
+        let b = ov ? 1 - min(1, max(0, rect.maxY - viewHeight) / fadeSize) : 1
+        if t != topAlpha { topAlpha = t }
+        if b != bottomAlpha { bottomAlpha = b }
+    }
+
+    /// Recompute with the last content rect — the viewport height and the
+    /// content frame arrive on separate callbacks, either can land first.
+    func setViewHeight(_ h: CGFloat) {
+        guard viewHeight != h else { return }
+        viewHeight = h
+        update(lastRect)
+    }
+}
+
+extension View {
+    /// Inside the ScrollView's content — reports the content frame so the
+    /// enclosing `fluidScrollFade` knows the scroll position.
+    func fluidFadeContent(_ state: FluidScrollFadeState) -> some View {
+        onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .named(state.space))
+        } action: { rect in
+            state.update(rect)
+        }
+    }
+
+    /// On the ScrollView — masks the top/bottom edges progressively (the
+    /// scroll-timeline scroll-fade) and, with `dividers`, draws a hairline
+    /// at each edge once scrolled away from it.
+    func fluidScrollFade(
+        _ size: CGFloat = 48,
+        state: FluidScrollFadeState,
+        dividers: Bool = false
+    ) -> some View {
+        state.fadeSize = size
+        return modifier(FluidScrollFade(size: size, state: state, dividers: dividers))
+    }
+}
+
+private struct FluidScrollFade: ViewModifier {
+    var size: CGFloat
+    @Bindable var state: FluidScrollFadeState
+    var dividers: Bool
+
+    func body(content: Content) -> some View {
+        let viewH = max(state.viewHeight, 1)
+        let p1 = min(size / viewH, 0.5), p2 = max(1 - size / viewH, 0.5)
+        return content
+            .coordinateSpace(name: state.space)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { h in
+                state.setViewHeight(h)
+            }
+            .mask(
+                LinearGradient(stops: [
+                    .init(color: .black.opacity(state.topAlpha), location: 0),
+                    .init(color: .black, location: p1),
+                    .init(color: .black, location: p2),
+                    .init(color: .black.opacity(state.bottomAlpha), location: 1),
+                ], startPoint: .top, endPoint: .bottom)
+            )
+            .overlay(alignment: .top) {
+                if dividers {
+                    Rectangle().fill(FluidTone.border)
+                        .frame(height: 1)
+                        .opacity(state.overflowing && state.topAlpha < 1 ? 1 : 0)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if dividers {
+                    Rectangle().fill(FluidTone.border)
+                        .frame(height: 1)
+                        .opacity(state.overflowing && state.bottomAlpha < 1 ? 1 : 0)
+                }
             }
     }
 }

@@ -1,7 +1,7 @@
 {
   "name": "click-covered",
   "tags": ["click"],
-  "prompt": "Click the Buy button on the page I have open.",
+  "prompt": "Click the Buy button on the open tab titled Buy It.",
   "setup": {"tabs": [
     {"url": "fixture:covered", "as": "c", "via": "bench"}
   ]},

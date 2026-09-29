@@ -33,7 +33,7 @@ import tempfile
 import threading
 import time
 
-__all__ = ["Agent", "AgentError", "SocketGone", "socket_path", "world_folder"]
+__all__ = ["Agent", "AgentError", "AgentTimeout", "SocketGone", "socket_path", "world_folder"]
 
 _NOT_GIVEN = object()
 _EVENT_END = object()          # pushed on the event queue when the socket dies
@@ -98,14 +98,31 @@ class AgentError(Exception):
     refused attach.  ``code`` carries the protocol's machine name for the
     failure when there is one ("STALE_REF", "NOT_FOUND", …)."""
 
-    def __init__(self, message, code=None):
+    def __init__(self, message, code=None, request_id=None, receipt=None, metadata=None):
         super().__init__(message)
         self.code = code
+        self.request_id = request_id
+        self.receipt = receipt
+        self.metadata = metadata or {}
+
+
+class AgentTimeout(TimeoutError):
+    """The caller stopped waiting. The operation's outcome is unknown."""
+
+    def __init__(self, message, request_id):
+        super().__init__(message)
+        self.request_id = request_id
+        self.receipt = {"requestId": request_id, "state": "running", "outcome": "unknown"}
 
 
 class SocketGone(Exception):
     """The socket itself isn't there or stopped answering — the browser
     isn't running this world, or "Let a script drive Search" is off."""
+
+    def __init__(self, message, request_id=None):
+        super().__init__(message)
+        self.request_id = request_id
+        self.outcome = "unknown" if request_id is not None else None
 
 
 def world_folder(world=None):
@@ -178,14 +195,22 @@ class Agent:
         self._cond = threading.Condition()
         self._send_lock = threading.Lock()
         self._results = {}               # id -> the whole answer object
-        self._orphans = set()            # ids a timeout abandoned — drop the late answer
-        self._events = queue.Queue()
+        self._pending = set()
+        self._events = queue.Queue(maxsize=256)
+        self.dropped_events = 0
+        self._event_lock = threading.Lock()
+        self._connect_lock = threading.RLock()
         self._dead = None                # why the socket went away, if it did
         self._next = 0
+        self._generation = 0
 
     # ------------------------------------------------------------ socket
 
     def connect(self, world=_NOT_GIVEN):
+        with self._connect_lock:
+            return self._connect(world)
+
+    def _connect(self, world):
         """Open the session (idempotent — and if the socket died since,
         this buries the corpse and dials again).  Raises SocketGone when
         there's nothing listening — is the browser running, with "Let a
@@ -209,11 +234,21 @@ class Agent:
                 f"running, with Settings › General › “Let a script drive "
                 f"Search” on?"
             ) from e
-        self._dead = None
+        with self._cond:
+            self._generation += 1
+            self._dead = None
+            self._results.clear()
+            self._cond.notify_all()
+        while not self._events.empty():
+            try:
+                self._events.get_nowait()
+            except queue.Empty:
+                break
         self._sock = s
         self._file = s.makefile("rb")
         self._reader = threading.Thread(
-            target=self._read, name="search-agent-reader", daemon=True
+            target=self._read, args=(self._file, self._generation),
+            name="search-agent-reader", daemon=True
         )
         self._reader.start()
         return self
@@ -267,22 +302,46 @@ class Agent:
         before the next call (or close()) notices."""
         return self._sock is not None and self._dead is None
 
-    def _fail(self, why):
+    def _fail(self, why, generation=None):
         """The socket went quiet: everyone waiting on an answer gets told,
         and the event stream ends."""
         with self._cond:
+            if generation is not None and generation != self._generation:
+                return
             if self._dead is None:
                 self._dead = why
             self._cond.notify_all()
-        self._events.put(_EVENT_END)
+        self._put_event(_EVENT_END)
 
-    def _read(self):
+    def _put_event(self, event):
+        with self._event_lock:
+            # Bound retained event bytes as well as count. Large payloads remain
+            # available through the requested operation's response.
+            if event is not _EVENT_END and len(json.dumps(event).encode()) > 65_536:
+                self.dropped_events += 1
+                return
+            try:
+                self._events.put_nowait(event)
+            except queue.Full:
+                try:
+                    self._events.get_nowait()
+                except queue.Empty:
+                    pass
+                self.dropped_events += 1
+                self._events.put_nowait(event)
+
+    def _read(self, reader=None, generation=None):
         """One line in is one object: an answer (has "id") or an event
         (has "event").  The socket's own error lines ("request too long")
         arrive with no id — they park under None, unread."""
+        reader = self._file if reader is None else reader
+        generation = self._generation if generation is None else generation
         try:
             while True:
-                line = self._file.readline()
+                line = reader.readline(8_000_002)
+                if len(line) > 8_000_001:
+                    self._fail("response exceeds 8 MB", generation)
+                    return
                 if not line:
                     break
                 try:
@@ -291,66 +350,87 @@ class Agent:
                     continue
                 if not isinstance(msg, dict):
                     continue
-                if "event" in msg:
-                    self._events.put({"event": msg["event"], "data": msg.get("data", {})})
-                else:
-                    with self._cond:
+                with self._cond:
+                    # A replaced reader may still have a buffered message.
+                    # Never deliver its events or answers to the new session.
+                    if generation != self._generation:
+                        return
+                    if "event" in msg:
+                        self._put_event({"event": msg["event"], "data": msg.get("data", {})})
+                    else:
                         mid = msg.get("id")
-                        if mid in self._orphans:
-                            # A call that timed out: its caller is gone,
-                            # so the late answer goes nowhere at all.
-                            self._orphans.discard(mid)
-                        else:
+                        if mid in self._pending:
                             self._results[mid] = msg
                         self._cond.notify_all()
         except OSError:
             pass
         except Exception as e:                      # never kill the caller silently
-            self._fail(f"reader died: {e}")
+            self._fail(f"reader died: {e}", generation)
             return
-        self._fail("connection closed")
+        self._fail("connection closed", generation)
 
     # ------------------------------------------------------------ calls
 
     def call(self, op, timeout=_NOT_GIVEN, **args):
-        """One request, one answer.  Returns the ``result`` object (a dict);
-        raises AgentError on ``{"error":…}``, SocketGone if the connection
-        drops underneath, TimeoutError if nothing answers in ``timeout``
-        seconds (default the instance's, 120s — the server's own pledge
-        lands first in practice)."""
+        """Send once. Timeouts and disconnects never retry an operation.
+
+        Errors expose request_id and receipt for request_status/request_cancel.
+        Reconnect explicitly with connect() after a lost session. Its receipts
+        belong to the old connection and cannot be queried on the new one.
+        """
         if timeout is _NOT_GIVEN:
             timeout = self.timeout
+        if self._dead is not None:
+            raise SocketGone(f"agent socket is gone: {self._dead}; call connect() explicitly")
         self.connect()
         with self._cond:
             if self._dead:
                 raise SocketGone(f"agent socket is gone: {self._dead}")
+            if len(self._pending) >= 64 and op not in ("request.status", "request.cancel"):
+                raise AgentError("64 requests already pending", code="TOO_MANY_REQUESTS")
             ident = self._next
+            generation = self._generation
+            request_socket = self._sock
             self._next += 1
-        line = json.dumps({"id": ident, "op": op, "args": args}) + "\n"
+            self._pending.add(ident)
         try:
-            with self._send_lock:
-                self._sock.sendall(line.encode())
-        except OSError as e:
-            self._fail(f"send failed: {e}")
-            raise SocketGone(f"agent socket is gone: {e}") from e
-        with self._cond:
-            deadline = None if timeout is None else time.monotonic() + timeout
-            while ident not in self._results:
-                if self._dead:
-                    raise SocketGone(f"agent socket is gone: {self._dead}")
-                left = None if deadline is None else deadline - time.monotonic()
-                if left is not None and left <= 0:
-                    # The server pledges an answer eventually — mark the id
-                    # so the reader drops it rather than parking it in
-                    # _results forever.
-                    self._orphans.add(ident)
-                    self._results.pop(ident, None)
-                    raise TimeoutError(f"{op} got no answer within {timeout} s")
-                self._cond.wait(left)
-            msg = self._results.pop(ident)
-        if "error" in msg:
-            raise AgentError(str(msg["error"]), code=msg.get("code"))
-        return msg.get("result", {})
+            line = (json.dumps({"id": ident, "op": op, "args": args}, allow_nan=False) + "\n").encode()
+            if len(line) > 4_000_000:
+                raise AgentError("request exceeds 4 MB", code="INVALID_ARGS", request_id=ident)
+            try:
+                with self._send_lock:
+                    if generation != self._generation:
+                        raise SocketGone("request belongs to the previous connection", request_id=ident)
+                    request_socket.sendall(line)
+            except (OSError, AttributeError) as e:
+                self._fail(f"send failed: {e}", generation)
+                raise SocketGone(f"agent socket is gone: {e}", request_id=ident) from e
+            with self._cond:
+                deadline = None if timeout is None else time.monotonic() + timeout
+                while ident not in self._results:
+                    if self._dead or generation != self._generation:
+                        raise SocketGone(f"agent socket is gone: {self._dead}", request_id=ident)
+                    left = None if deadline is None else deadline - time.monotonic()
+                    if left is not None and left <= 0:
+                        raise AgentTimeout(f"{op} got no answer within {timeout} s; outcome unknown", ident)
+                    self._cond.wait(left)
+                msg = self._results.pop(ident)
+            if "error" in msg:
+                raise AgentError(str(msg["error"]), code=msg.get("code"), request_id=ident,
+                                 receipt=msg.get("receipt"), metadata=msg)
+            return msg.get("result", {})
+        finally:
+            with self._cond:
+                self._pending.discard(ident)
+                self._results.pop(ident, None)
+
+    def request_status(self, request_id):
+        """Read a receipt on this connection. Finished receipts have a bounded lifetime."""
+        return self.call("request.status", requestId=request_id)
+
+    def request_cancel(self, request_id):
+        """Request cooperative cancellation. Running/unknown means effects may continue."""
+        return self.call("request.cancel", requestId=request_id)
 
     # ------------------------------------------------------------ events
 
@@ -398,7 +478,7 @@ class Agent:
         """Only the agent (⚗) tabs → same shape as tabs()."""
         return self.call("agent.tabs").get("tabs", [])
 
-    def open(self, url, foreground=None, space=None):
+    def open(self, url, foreground=None, space=None, agent_name=None):
         """Open an agent tab at ``url`` → its 8-char id.  ``foreground``
         selects it; ``space`` is passed through for builds that take one
         (this build's tabs.open ignores it)."""
@@ -407,6 +487,8 @@ class Agent:
             args["foreground"] = bool(foreground)
         if space is not None:
             args["space"] = space
+        if agent_name is not None:
+            args["agentName"] = str(agent_name)
         return self.call("tabs.open", **args).get("id")
 
     def attach(self, id, granted=False):
@@ -430,6 +512,44 @@ class Agent:
     def select(self, id):
         """Bring a tab to the front (this session's own or attached)."""
         return self.call("tabs.select", id=id)
+
+    def surface(self, tab, foreground=True):
+        """Keep the live agent tab as a normal user tab, including its draft."""
+        return self.call("tabs.surface", tab=tab, foreground=bool(foreground))
+
+    def inspector_attach(self, tab):
+        """Discover real WebKit protocol targets, commands, parameters and events."""
+        return self.call("inspector.attach", tab=tab)
+
+    def inspector_send(self, tab, method, params=None, target_id=None, save=False):
+        args = {"tab": tab, "method": method, "params": params or {}, "save": bool(save)}
+        if target_id is not None:
+            args["targetId"] = target_id
+        return self.call("inspector.send", **args)
+
+    def inspector_events(self, tab):
+        return self.call("inspector.events", tab=tab)
+
+    def inspector_read(self, tab, path, offset=0, length=16384):
+        return self.call("inspector.read", tab=tab, path=path, offset=offset, length=length)
+
+    def inspector_detach(self, tab):
+        return self.call("inspector.detach", tab=tab)
+
+    def dialogs(self, tab, enabled=None):
+        args = {"tab": tab}
+        if enabled is not None:
+            args["enabled"] = bool(enabled)
+        return self.call("page.dialogs", **args)
+
+    def answer_dialog(self, tab, dialog, accept, text=None):
+        args = {"tab": tab, "dialog": dialog, "accept": bool(accept)}
+        if text is not None:
+            args["text"] = text
+        return self.call("page.dialog", **args)
+
+    def choose_files(self, tab, dialog, paths):
+        return self.call("page.files", tab=tab, dialog=dialog, paths=[os.path.abspath(os.path.expanduser(p)) for p in paths])
 
     # ------------------------------------------------------------ page.*
 
@@ -460,13 +580,18 @@ class Agent:
         """→ {text,truncated,url,title} — document.body.innerText, 120k cap."""
         return self.call("page.text", tab=tab)
 
-    def snapshot(self, tab, scope="viewport", boxes=False, max_chars=None):
+    def snapshot(self, tab, scope="viewport", boxes=False, max_chars=None, interactive=False, selector=None, ref=None):
         """The semantic tree → {snapshot,version,url,title,truncated}.
         scope "viewport"|"full"; boxes adds [box=x,y,w,h]; refs die on
         navigation."""
         args = {"tab": tab, "scope": scope, "boxes": bool(boxes)}
         if max_chars is not None:
             args["maxChars"] = max_chars
+        args["interactive"] = bool(interactive)
+        if selector is not None:
+            args["selector"] = selector
+        if ref is not None:
+            args["ref"] = ref
         return self.call("page.snapshot", **args)
 
     def screenshot(self, tab, path=None, marks=False, width=None):
@@ -521,8 +646,8 @@ class Agent:
     def click(self, tab, target=None, tier="auto", **args):
         """act.click — ``target`` is a snapshot ref (``e3``) or a prefixed
         locator (``css:``, ``text:``, ``loc:``); or pass ref=/css=/text=/
-        loc= directly.  tier "auto"|"js"|"event" (auto escalates a click
-        the page ignored to a real NSEvent).  Extra args pass through:
+        loc= directly.  tier "auto"|"js"|"event" (auto uses one native click after
+        actionability checks; js explicitly opts into synthetic events).  Extra args pass through:
         button, double, modifiers, withSnapshot."""
         return self.call("act.click", tab=tab, tier=tier,
                          **_act_args("click", target, args))

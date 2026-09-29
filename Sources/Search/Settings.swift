@@ -4,8 +4,9 @@ import SwiftUI
 /// the right, each a short list of lines with a hairline between them —
 /// nothing to scroll through, nothing to hunt for. The same white and
 /// hairline as the rest of the app; the same pill for the page you are on
-/// as for the tab you are on.
-struct SettingsPanel: View {
+/// as for the tab you are on. A page of the app's own now, at
+/// search://settings, filling the stage rather than floating over it.
+struct SettingsPage: View {
     @ObservedObject var browser: Browser
     @ObservedObject var prefs: Preferences
 
@@ -17,6 +18,8 @@ struct SettingsPanel: View {
     /// Bumped when a Codex import lands, so its key line re-reads Keys and
     /// shows Set rather than an empty field.
     @State private var codexStamp = 0
+    /// Re-read persisted guard switches after a toggle.
+    @State private var guardStamp = 0
 
     enum Page: String, CaseIterable, Identifiable {
         case general, tabs, extensions, passwords, downloads, privacy, ask, about
@@ -47,9 +50,7 @@ struct SettingsPanel: View {
         }
     }
 
-    private static let rail: CGFloat = 168
-    private static let width: CGFloat = 660
-    private static let height: CGFloat = 500
+    private static let rail: CGFloat = 200
 
     var body: some View {
         HStack(spacing: 0) {
@@ -57,15 +58,17 @@ struct SettingsPanel: View {
             Rectangle().fill(Palette.hairline).frame(width: 1)
             content
         }
-        .frame(width: SettingsPanel.width, height: SettingsPanel.height)
-        .background(Palette.ground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Palette.hairline, lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .shadow(color: .black.opacity(0.16), radius: 34, y: 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Palette.ground)
         .onChange(of: page) { _, page in Store.settings.set(page.rawValue, forKey: "settings.page") }
+        // A deep link — "Settings › Ask" from a chip — lands on the section
+        // even when the tab is already open.
+        .onReceive(NotificationCenter.default.publisher(for: .nativePageSection)) { note in
+            guard note.userInfo?["page"] as? String == NativePage.settings.rawValue,
+                  let section = note.userInfo?["section"] as? String,
+                  let page = Page(rawValue: section) else { return }
+            self.page = page
+        }
     }
 
     // MARK: - the rail
@@ -84,7 +87,7 @@ struct SettingsPanel: View {
             Spacer(minLength: 0)
         }
         .padding(8)
-        .frame(width: SettingsPanel.rail, alignment: .leading)
+        .frame(width: SettingsPage.rail, alignment: .leading)
         .frame(maxHeight: .infinity, alignment: .top)
         .background(Palette.wash.opacity(0.45), in: Rectangle())
     }
@@ -127,12 +130,11 @@ struct SettingsPanel: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(page.title)
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(Palette.ink)
                 Spacer()
-                Door(icon: "xmark", help: "Done   esc") { browser.tuning = false }
             }
-            .padding(.bottom, 16)
+            .padding(.bottom, 20)
 
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 18) {
@@ -150,10 +152,11 @@ struct SettingsPanel: View {
                 .padding(.bottom, 4)
             }
         }
-        .padding(.horizontal, 22)
-        .padding(.top, 18)
+        .padding(.horizontal, 36)
+        .padding(.top, 30)
         .padding(.bottom, 18)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: 760, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - general
@@ -315,8 +318,7 @@ struct SettingsPanel: View {
             Card {
                 Line("Your passwords", "In the macOS keychain, shown with Touch ID") {
                     Pill("Open…") {
-                        browser.tuning = false
-                        browser.managing = true
+                        browser.openInternal(.passwords)
                     }
                 }
                 Rule()
@@ -351,8 +353,7 @@ struct SettingsPanel: View {
             Card {
                 Line("Bring yours in", "From Dia, Chrome, Arc, Brave or Edge on this Mac — nothing leaves it") {
                     Pill("Import…") {
-                        browser.tuning = false
-                        browser.managing = true
+                        browser.openInternal(.passwords)
                     }
                 }
             }
@@ -442,6 +443,10 @@ struct SettingsPanel: View {
                     Switch(on: $prefs.ask)
                 }
                 Rule()
+                Line("Show chats and routines on new tabs", "The blank tab's shelf — recent chats and your automations under the address field") {
+                    Switch(on: $prefs.newTabCards)
+                }
+                Rule()
                 Line("Ask with", "Which brain answers — the default is openrouter z-ai/glm-5.3-flash") {
                     Segmented(
                         options: [("openrouter", "OpenRouter"), ("codex", "Codex"), ("devin", "Devin")],
@@ -475,9 +480,46 @@ struct SettingsPanel: View {
                         options: [(AskMode.read, "Read"), (.guard, "Guard"), (.full, "Full")],
                         selection: Binding(
                             get: { AskMode(rawValue: Store.settings.string(forKey: "ask.mode") ?? "") ?? .guard },
-                            set: { Store.settings.set($0.rawValue, forKey: "ask.mode") }
+                            set: {
+                                Store.settings.set($0.rawValue, forKey: "ask.mode")
+                                guardStamp += 1
+                            }
                         )
                     )
+                }
+            }
+            Caption("Action confirmations")
+            Card {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Ask before the agent performs these actions in Guard mode.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Palette.muted)
+                        .padding(.horizontal, 14)
+                        .padding(.top, 11)
+
+                    ForEach(Array(GuardCategory.allCases.enumerated()), id: \.offset) { item in
+                        if item.offset > 0 { Rule() }
+                        let category = item.element
+                        Line(category.label) {
+                            Switch(on: Binding(
+                                get: {
+                                    _ = guardStamp
+                                    return category.enabled
+                                },
+                                set: {
+                                    Store.settings.set($0, forKey: category.settingsKey)
+                                    guardStamp += 1
+                                }
+                            ))
+                        }
+                    }
+                    if AskMode(rawValue: Store.settings.string(forKey: "ask.mode") ?? "") != .guard {
+                        Text("These settings apply when a chat or routine uses Guard mode.")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(Palette.muted)
+                            .padding(.horizontal, 14)
+                            .padding(.bottom, 10)
+                    }
                 }
             }
             Card {
@@ -690,7 +732,6 @@ struct SettingsPanel: View {
             Pill("Relaunch now", filled: true) { updater.relaunch() }
         case .offered(let next):
             Pill("Download", filled: true) {
-                browser.tuning = false
                 browser.open(next.dmg, foreground: true)
             }
         case .waiting:

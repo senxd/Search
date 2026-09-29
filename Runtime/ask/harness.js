@@ -225,6 +225,9 @@ var TOOLS = [
   { name: 'tab_open', op: 'tabs.open',
     description: 'Open a new agent tab at a URL and return its id. Background by default; foreground:true deliberately asks for the user\'s attention.',
     params: obj({ url: { type: 'string' }, foreground: { type: 'boolean' }, why: WHY }, ['url']) },
+  { name: 'surface_tab', op: 'tabs.surface',
+    description: 'Hand a finished agent tab to the user as a normal tab, preserving its live page and unsent draft. Selects it by default, marks it as agent-created, and keeps it after you disconnect. Use for drafts and results the user should review.',
+    params: withTab({ foreground: { type: 'boolean' }, why: WHY }) },
   { name: 'tab_attach', op: 'tabs.attach',
     description: 'Attach one of the user\'s tabs by id so you may read and drive it. Consent is required — a tab you were not given will refuse; report that and ask.',
     params: obj({ id: { type: 'string' }, why: WHY }, ['id']) },
@@ -239,7 +242,7 @@ var TOOLS = [
     params: withTab({ seconds: { type: 'number' } }) },
   { name: 'snapshot', op: 'page.snapshot',
     description: 'THE way to see a page: a compact semantic tree — text lines plus interactive elements as [ref=eN] handles. Prefer snapshot over read_text or screenshot when you need to act. scope:"viewport" narrows to what\'s visible; boxes:true adds coordinates; maxChars caps size.',
-    params: withTab({ scope: { type: 'string', enum: ['full', 'viewport'] }, boxes: { type: 'boolean' }, maxChars: { type: 'number' } }) },
+    params: withTab({ scope: { type: 'string', enum: ['full', 'viewport'] }, interactive: { type: 'boolean' }, selector: { type: 'string' }, ref: { type: 'string' }, boxes: { type: 'boolean' }, maxChars: { type: 'number' } }) },
   { name: 'screenshot', op: 'page.screenshot',
     description: 'A PNG of the tab, returned to you as an image. marks:true draws numbered boxes on the interactive elements first.',
     params: withTab({ marks: { type: 'boolean' } }) },
@@ -282,8 +285,32 @@ var TOOLS = [
   { name: 'click_at', op: 'act.clickAt',
     description: 'Click raw coordinates — for canvas/SVG where no element ref exists (get x,y from a boxes:true snapshot or a marked screenshot).',
     params: withTab({ x: { type: 'number' }, y: { type: 'number' }, why: WHY }, ['x', 'y']) },
+  { name: 'inspector_attach', op: 'inspector.attach',
+    description: 'Connect the WebKit inspector and discover current targets, protocol commands and parameters. Use before network capture, profiling, debugging, frame/worker evaluation, or object inspection. This is WebKit protocol, not CDP.',
+    params: withTab({ why: WHY }) },
+  { name: 'inspector_send', op: 'inspector.send',
+    description: 'Send a WebKit inspector protocol command. Discover commands with inspector_attach. Use targetId for worker targets and Runtime.evaluate params.contextId for frame contexts. Supports Runtime, Console, Network, Debugger, Timeline, Heap and profiling as exposed by the engine.',
+    params: withTab({ method: { type: 'string' }, params: { type: 'object' }, save: { type: 'boolean' }, targetId: { type: 'string' }, why: WHY }, ['method']) },
+  { name: 'inspector_events', op: 'inspector.events',
+    description: 'Drain this session\'s recent inspector events for a tab. dropped counts history overflow. Large events return a JSON artifact path; copy it if you need to keep it.',
+    params: withTab({ why: WHY }) },
+  { name: 'inspector_read', op: 'inspector.read',
+    description: 'Read a JSON artifact produced by this tab in UTF-8 chunks. Use the returned nextOffset to continue; length is 4 to 65536 bytes. Artifacts have bounded retention, so read them promptly.',
+    params: withTab({ path: { type: 'string' }, offset: { type: 'integer' }, length: { type: 'integer' }, why: WHY }, ['path']) },
+  { name: 'inspector_detach', op: 'inspector.detach',
+    description: 'Release this session\'s inspector connection when diagnostics are complete.',
+    params: withTab({ why: WHY }) },
+  { name: 'dialogs', op: 'page.dialogs',
+    description: 'Enable native dialog and file chooser automation before opening one; omit enabled to read pending dialog metadata. Pending dialogs time out after 120 seconds.',
+    params: withTab({ enabled: { type: 'boolean' }, why: WHY }) },
+  { name: 'answer_dialog', op: 'page.dialog',
+    description: 'Accept or dismiss a pending JavaScript dialog by its dialog id. text is the answer to prompt().',
+    params: withTab({ dialog: { type: 'string' }, accept: { type: 'boolean' }, text: { type: 'string' }, why: WHY }, ['dialog', 'accept']) },
+  { name: 'choose_files', op: 'page.files',
+    description: 'Answer an intercepted native file chooser using readable absolute local paths. Enable dialogs, click the file input, then get its dialog id. Empty paths cancels the chooser.',
+    params: withTab({ dialog: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } }, why: WHY }, ['dialog', 'paths']) },
   { name: 'console', op: 'page.console',
-    description: 'Recent console messages collected from the tab.',
+    description: 'Recent messages from the injected page collector. For engine console events, attach the inspector and use Console.messageAdded events, including engine-reported errors.',
     params: withTab({}) },
   { name: 'frames', op: 'page.frames',
     description: 'List a tab\'s frames (ref, url, sameOrigin).',
@@ -307,6 +334,8 @@ var SYSTEM = [
   'You work in real tabs: tabs the user attached (listed in context; yours to',
   'read and drive) and agent tabs you open with tab_open (in the background —',
   'they do not disturb the user unless you set foreground).',
+  'When a draft or result is ready for the user, call surface_tab before done.',
+  'This preserves the live page and moves it into their normal tabs. Never submit a draft just to hand it over.',
   '',
   'Seeing: `snapshot` is the way — a compact tree of the page\'s text and its',
   'interactive elements as [ref=eN] handles. Act on refs (or loc/css/text',
@@ -722,11 +751,12 @@ async function attachTabs(tabs) {
 // ── tool results ─────────────────────────────────────────────────
 
 // Strip the image payload for JSON-shaped copies of a result; the picture
-// itself travels as a message part, not inside the JSON.
+// itself travels as a message part, not inside the JSON. `data` goes too —
+// a screenshot's base64 would otherwise land inside the trimmed card text.
 function slim(result) {
   if (!result || typeof result !== 'object') return result;
   var copy = {};
-  for (var k in result) if (k !== 'image') copy[k] = result[k];
+  for (var k in result) if (k !== 'image' && k !== 'data') copy[k] = result[k];
   return copy;
 }
 function resultText(result) {
@@ -756,10 +786,13 @@ async function runCalls(calls, ctx, job, messages, provider, cardSink) {
     var def = null;
     for (var j = 0; j < TOOLS.length; j++) if (TOOLS[j].name === call.name) def = TOOLS[j];
     emit(ctx, 'activity', { chat: chatId, text: call.name });
+    // done is the turn's boundary, not work — it never earns a card.
+    var isDone = call.name === 'done';
     var card = { id: call.id, name: call.name, args: trim(JSON.stringify(call.args || {}), 500), result: null, failed: false };
-    cardSink(card);
+    if (call.args && call.args.why) card.why = String(call.args.why);
+    if (!isDone) cardSink(card);
     var result;
-    if (call.name === 'done') {
+    if (isDone) {
       finished = String((call.args && call.args.summary) || '');
       result = { ok: true };
     } else if (!def || !def.op) {
@@ -770,13 +803,25 @@ async function runCalls(calls, ctx, job, messages, provider, cardSink) {
     }
     card.failed = !!(result && result.error);
     card.result = trim(result && result.error ? result.error : resultText(result), 500);
-    cardSink(card);
+    // A picture the tool wrote survives slim() as a path — the stream's
+    // shot card reads it (screenshots carry both path and image).
+    if (result && result.path && result.image) card.shot = String(result.path);
+    if (!isDone) cardSink(card);
     messages.push({ role: 'tool', callId: call.id, text: trim(resultText(result), 24000) });
     if (result && result.image && provider.images) {
       messages.push({ role: 'user', text: '[screenshot of tab ' + (call.args && call.args.tab || '?') + ']', image: result.image });
     }
     // The turn ended — a call after done in the same batch must not run:
     // it would mutate pages the user thinks the agent is done with.
+    if (result && (result.guardStopped || /^GUARD_(CANCELLED|CHANGED|UNAVAILABLE|WAITING)$/.test(result.code || ''))) {
+      // Complete the provider's call batch without executing any remaining
+      // actions, then stop. A correction starts a fresh turn from the UI.
+      for (var skipped = i + 1; skipped < calls.length; skipped++) {
+        messages.push({ role: 'tool', callId: calls[skipped].id,
+          text: JSON.stringify({ error: 'Not executed: the guard stopped this batch.' }) });
+      }
+      finished = '';
+    }
     if (finished != null) break;
   }
   return finished;
@@ -784,17 +829,34 @@ async function runCalls(calls, ctx, job, messages, provider, cardSink) {
 
 async function loop(job, ctx) {
   var chatId = job.chat.id;
-  var text = '', toolsShown = [];
+  var text = '', toolsShown = [], blocks = [];
   var error = null;
+  // Words the stream folds: a paragraph after tool work is a new block,
+  // not a tail on the previous one — each accordion section starts at one.
+  var deltaBlock = function (t) {
+    var last = blocks[blocks.length - 1];
+    if (last && last.kind === 'text') last.text += t;
+    else blocks.push({ kind: 'text', text: t });
+  };
   // Tool cards go to the panel as they happen and into the saved message.
   var cardSink = function (card) {
     var held = toolsShown.filter(function (t) { return t.id === card.id; })[0];
     if (held) { held.result = card.result; held.failed = card.failed; }
     else toolsShown.push({ id: card.id, name: card.name, args: card.args, result: card.result, failed: card.failed });
-    emit(ctx, 'tool', { chat: chatId, tool: {
-      id: card.id, name: card.name, args: card.args,
-      result: card.result, failed: card.failed
-    } });
+    var shown = { id: card.id, name: card.name, args: card.args,
+      result: card.result, failed: card.failed };
+    if (card.why) shown.why = card.why;
+    if (card.shot) shown.shot = card.shot;
+    // The block mirror keeps the turn's order — a result landing rewrites
+    // its block in place (search from the end; cards settle in order).
+    for (var b = blocks.length - 1; b >= 0; b--) {
+      if (blocks[b].kind === 'tool' && blocks[b].tool.id === card.id) {
+        blocks[b].tool = shown;
+        break;
+      }
+    }
+    if (b < 0) blocks.push({ kind: 'tool', tool: shown });
+    emit(ctx, 'tool', { chat: chatId, tool: shown });
   };
   try {
     var resolved = providerFor(job.chat && job.chat.model);
@@ -826,7 +888,7 @@ async function loop(job, ctx) {
     }
 
     var hooks = {
-      delta: function (t) { text += t; emit(ctx, 'delta', { chat: chatId, text: t }); },
+      delta: function (t) { text += t; deltaBlock(t); emit(ctx, 'delta', { chat: chatId, text: t }); },
       activity: function (t) { emit(ctx, 'activity', { chat: chatId, text: t }); },
       track: function (res) { ctx.fetchId = res.id; }
     };
@@ -854,6 +916,7 @@ async function loop(job, ctx) {
       // something.
       if (finished != null && !turnText && finished) {
         text += finished;
+        deltaBlock(finished);
         emit(ctx, 'delta', { chat: chatId, text: finished });
       }
     }
@@ -864,7 +927,7 @@ async function loop(job, ctx) {
   if (text || toolsShown.length) {
     emit(ctx, 'message', { chat: chatId, message: {
       id: uuid(), role: 'agent', text: text,
-      tools: toolsShown, attachments: [], when: now()
+      tools: toolsShown, blocks: blocks, attachments: [], when: now()
     } });
   }
   emit(ctx, 'activity', { chat: chatId, text: '' });
@@ -892,7 +955,9 @@ function run(job) {
   while (queuedSteer.length) {
     var held = String(queuedSteer.shift());
     ctx.steered.push(held);
-    emit(ctx, 'delta', { chat: job.chat.id, text: '(queued: ' + trim(held, 160) + ')\n' });
+    // Out of band — the words are already the user's own .you bubble;
+    // echoing them as agent text would draw them twice.
+    emit(ctx, 'activity', { chat: job.chat.id, text: '(queued: ' + trim(held, 160) + ')' });
   }
   loop(job, ctx).catch(function (e) { log('loop fell: ' + (e && e.stack || e)); })
     .finally(function () { if (current === ctx) current = null; });

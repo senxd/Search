@@ -217,6 +217,7 @@ struct TabBar: View {
                     // Back, forward, reload, and the bookmarks, at the far end
                     // of the row. The dropdown hangs from the last one.
                     HStack(spacing: Metrics.tabGap) {
+                        AgentTabsButton(browser: browser)
                         ExtensionSlot()
                         Helm(browser: browser)
                             .padding(.trailing, 8)
@@ -293,9 +294,10 @@ struct TabBar: View {
                 : browser.parked[space.id] ?? Parked(tabs: [], active: nil)
             // The row's groups, so a member's pill wears its colour here too.
             let rowGroups = live ? browser.groups : row.groups
-            let each = width(in: strip, pinned: row.tabs.filter { $0.pin != nil }.count, count: row.tabs.count)
+            let tabs = row.tabs.filter { !$0.bench }
+            let each = width(in: strip, pinned: tabs.filter { $0.pin != nil }.count, count: tabs.count)
             HStack(spacing: Metrics.tabGap) {
-                ForEach(row.tabs) { tab in
+                ForEach(tabs) { tab in
                     TabPill(
                         browser: browser,
                         prefs: browser.prefs,
@@ -804,6 +806,9 @@ private struct TabPill: View {
                 loose
             }
         }
+        .overlay(alignment: .bottomTrailing) {
+            if tab.surfaced && (pinned || compact) { AgentTabIndicator().padding(3) }
+        }
         .background { ground }
         .modifier(Shake(travel: shake))
         .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
@@ -881,11 +886,12 @@ private struct TabPill: View {
                     .frame(width: 15, height: 15)
                     .animation(Motion.quick, value: tab.loading)
                 }
-                if tab.bench {
-                    // A script's tab, not yours.
+                if tab.surfaced {
                     Image(systemName: "flask")
                         .font(.system(size: 9))
                         .foregroundStyle(colour.opacity(0.7))
+                        .help("Kept from an agent")
+                        .accessibilityLabel("Kept from an agent")
                 }
                 if tab.shy {
                     // Quiet, and only on the tabs that keep nothing.
@@ -1198,13 +1204,13 @@ struct TabMenu: View {
             browser.select(tab)
             browser.duplicate()
         }
-        .disabled(tab.isBlank)
+        .disabled(tab.isBlank || tab.native != nil)
         // The card a click on the tab you are on shows under its address.
         Button("Site Information…") {
             if browser.activeID != tab.id { browser.select(tab) }
             browser.beginTabEdit(tab)
         }
-        .disabled(tab.isBlank || tab.address == nil || tab.pin != nil)
+        .disabled(tab.isBlank || tab.address == nil || tab.pin != nil || tab.native != nil)
         Button("Copy Address") {
             browser.select(tab)
             browser.copyAddress()
@@ -1216,6 +1222,7 @@ struct TabMenu: View {
         }
         .disabled(tab.isBlank)
         Button(tab.muted ? "Unmute Tab" : "Mute Tab") { tab.toggleMute() }
+            .disabled(tab.native != nil)
         // A pin is already a place kept for a page, which is all a group is —
         // for a pinned tab the group offers simply aren't there.
         if tab.pin == nil {

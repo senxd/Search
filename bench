@@ -63,7 +63,7 @@
     ./bench group space G              test run: the group becomes a space of its own
     ./bench group menu G [PATH]        test run: the menu a chip's right-click builds → its items,
                                        and its hand-made views drawn to a PNG at PATH
-    ./bench hit X Y [double|middle|right]
+    ./bench hit X Y [double|middle|right|press]
                                        what a press at X Y (points from the window's top left) lands on,
                                        and whether a drag from there would move the window;
                                        double: test run, a double-click there (start the probe hidden);
@@ -84,10 +84,21 @@
     ./bench picture PATH               test run: the whole window, pages included, drawn to a PNG (start the probe hidden)
     ./bench pin ID [on|off]            pin a tab to the head of the row, or take the pin off — --test runs only
     ./bench film peek|unpeek|fold PATH [N] [SECS]  the window drawn N times while it animates → PATH-00.png… — --test runs only
-    ./bench winshot PATH               the whole window — chrome, lights, tabs and page — drawn to a PNG
+    ./bench winshot PATH [ask]         the whole window — chrome, lights, tabs and page — drawn to a PNG;
+                                       'ask' takes the Ask window instead of the browser's
+    ./bench askkey CHARS CODE [MODS]   test run: a key press as the Ask window sees it — routed through
+                                       take() with its window pinned, so ⌘W/⌘F/⌘K/Esc gates can be probed;
+                                       MODS is command,shift,option — add 'send' to dispatch the event
+                                       through NSApp.sendEvent instead (a view's own monitor path)
     ./bench ui KEY VALUE               settings/passwords/welcome/history/downloads/bookmarks/hidden on|off,
                                        look light|dark|system, sidebar on|off, spaces on|off, hides on|off,
                                        folded on|off, peek on|off, peeklink keep|close, pages120 on|off
+    ./bench routine [ACT] [...]        the automations board — ACT is:
+                                       list (default), add NAME PROMPT [FREQ] [HH:MM|cron:EXPR]
+                                       [PROVIDER/MODEL] [read|guard|full] [off],
+                                       run NAME|ID, stop RUNID|ROUTINE, enable NAME|ID on|off,
+                                       answer RUNID TEXT..., pass RUNID, approve|deny RUNID [always],
+                                       demo (seed the echo routine — debug builds only)
 
 Needs Settings › General › "Let a script drive Search" switched on in the
 running app. IDs are the first characters of a tab's id, as `tabs` prints
@@ -169,7 +180,37 @@ def main(argv):
     elif verb == "ui":
         if len(args) != 2: sys.exit("usage: bench ui KEY VALUE")
         key, value = args
-        request[key] = value if key in ("look", "edittab", "peeklink") else value in ("on", "true", "1", "yes")
+        request[key] = value if key in ("look", "edittab", "peeklink", "settingssection") else value in ("on", "true", "1", "yes")
+    elif verb == "routine":
+        request["act"] = args[0] if args else "list"
+        rest = args[1:]
+        if request["act"] == "add":
+            if len(rest) < 2: sys.exit("usage: bench routine add NAME PROMPT [FREQ] [HH:MM|cron:EXPR] [PROVIDER/MODEL] [MODE]")
+            request["name"], request["prompt"] = rest[0], rest[1]
+            for extra in rest[2:]:
+                if extra.startswith("cron:"): request["cron"] = extra[5:]
+                elif ":" in extra: request["at"] = extra
+                elif "/" in extra: request["model"] = extra
+                elif extra in ("read", "guard", "full"): request["mode"] = extra
+                elif extra in ("hourly", "daily", "weekdays", "weekly", "custom"): request["frequency"] = extra
+                elif extra == "off": request["disabled"] = True
+        elif request["act"] in ("run", "stop"):
+            if not rest: sys.exit(f"usage: bench routine {request['act']} NAME|ID")
+            request["name"] = rest[0]
+        elif request["act"] == "enable":
+            if not rest: sys.exit("usage: bench routine enable NAME|ID [on|off]")
+            request["name"] = rest[0]
+            request["on"] = rest[1] in ("on", "true", "1", "yes") if len(rest) > 1 else True
+        elif request["act"] in ("answer", "pass"):
+            if not rest: sys.exit(f"usage: bench routine {request['act']} RUNID [TEXT]")
+            request["name"] = rest[0]
+            if request["act"] == "answer":
+                if len(rest) < 2: sys.exit("usage: bench routine answer RUNID TEXT")
+                request["text"] = " ".join(rest[1:])
+        elif request["act"] in ("approve", "deny"):
+            if not rest: sys.exit(f"usage: bench routine {request['act']} RUNID [always]")
+            request["name"] = rest[0]
+            request["always"] = len(rest) > 1 and rest[1] == "always"
     elif verb in ("ext-add", "ext-press", "ext-remove", "ext-reload"):
         if len(args) != 1: sys.exit(f"usage: bench {verb} ID")
         request["id"] = args[0]
@@ -275,7 +316,7 @@ def main(argv):
             if len(args) == 3: request["path"] = os.path.abspath(args[2])
         else: sys.exit("usage: bench group [list | new ID [NAME] | add G ID | out ID | fold G on|off | rename G NAME | renameui [G] | colour G N | icon G SYM | newtab G | move G INDEX | ungroup G | close G | reopen | bookmark G [NAME] | space G | menu G [PATH]]")
     elif verb == "hit":
-        if len(args) not in (2, 3) or (len(args) == 3 and args[2] not in ("double", "middle", "right")): sys.exit("usage: bench hit X Y [double|middle|right]")
+        if len(args) not in (2, 3) or (len(args) == 3 and args[2] not in ("double", "middle", "right", "press")): sys.exit("usage: bench hit X Y [double|middle|right|press]")
         request["x"], request["y"] = float(args[0]), float(args[1])
         if len(args) == 3: request[args[2]] = True
     elif verb == "place":
@@ -323,8 +364,15 @@ def main(argv):
         if len(args) > 2: request["frames"] = int(args[2])
         if len(args) > 3: request["every"] = float(args[3])
     elif verb == "winshot":
-        if len(args) != 1: sys.exit("usage: bench winshot PATH")
+        if not 1 <= len(args) <= 2: sys.exit("usage: bench winshot PATH [ask]")
         request["path"] = os.path.abspath(args[0])
+        if len(args) > 1:
+            if args[1] != "ask": sys.exit("usage: bench winshot PATH [ask]")
+            request["window"] = "ask"
+    elif verb == "askkey":
+        if len(args) < 2: sys.exit("usage: bench askkey CHARS CODE [MODS]")
+        request["chars"], request["code"] = args[0], int(args[1])
+        if len(args) > 2: request["mods"] = args[2].split(",")
     elif verb not in ("tabs", "probe", "extensions"):
         sys.exit(f"unknown command “{verb}” — see bench help")
 

@@ -247,7 +247,7 @@ struct SideBar: View {
     /// it is the one on screen. Groups parked with it keep their blocks: a
     /// folded run goes by as its header, an open one as the whole card.
     private func preview(_ row: Parked, pill: Namespace.ID) -> some View {
-        let pins = row.tabs.filter { $0.pin != nil }
+        let pins = row.tabs.filter { $0.pin != nil && !$0.bench }
         let cols = SideBar.pinColumns(pins.count)
         let width = pinWidth(for: pins.count)
         let height = min(SideBar.square, width)
@@ -328,7 +328,7 @@ struct SideBar: View {
 
     // MARK: - the pinned squares
 
-    private var pinnedTabs: [Tab] { browser.tabs.filter { $0.pin != nil } }
+    private var pinnedTabs: [Tab] { browser.tabs.filter { $0.pin != nil && !$0.bench } }
 
     /// Three columns is the block's own shape — up to six pins, that's two
     /// full rows, and one or two is just those same three places with a
@@ -526,7 +526,7 @@ struct SideBar: View {
     private static func items(in row: Parked) -> [TabItem] {
         var out: [TabItem] = []
         var headed: Set<UUID> = []
-        for tab in row.tabs where tab.pin == nil {
+        for tab in row.tabs where tab.pin == nil && !tab.bench {
             guard let id = tab.groupID,
                   let group = row.groups.first(where: { $0.id == id })
             else {
@@ -911,6 +911,7 @@ struct SideBar: View {
     private var foot: some View {
         HStack(spacing: 2) {
             if browser.prefs.usesSpaces { SpaceDot(browser: browser) }
+            AgentTabsButton(browser: browser, edge: .trailing)
             ExtensionSlot(edge: .trailing)
             Door(icon: "bookmark", help: "Bookmarks") { browser.bookmarksOpen.toggle() }
                 .popover(isPresented: $browser.bookmarksOpen, arrowEdge: .trailing) {
@@ -1001,6 +1002,9 @@ private struct PinSquare: View {
         }
         .frame(width: scale * 16 / 34, height: scale * 16 / 34)
         .frame(width: width, height: height)
+        .overlay(alignment: .bottomTrailing) {
+            if tab.surfaced { AgentTabIndicator().padding(3) }
+        }
         .background {
             if live {
                 RoundedRectangle(cornerRadius: scale * 9 / 34, style: .continuous)
@@ -1075,11 +1079,12 @@ private struct SideRow: View {
                     .frame(width: 15, height: 15)
                     .animation(Motion.quick, value: tab.loading)
                 }
-                if tab.bench {
-                    // A script's tab, not yours.
+                if tab.surfaced {
                     Image(systemName: "flask")
                         .font(.system(size: 9))
                         .foregroundStyle(colour.opacity(0.7))
+                        .help("Kept from an agent")
+                        .accessibilityLabel("Kept from an agent")
                 }
                 if tab.shy {
                     Image(systemName: "eye.slash")

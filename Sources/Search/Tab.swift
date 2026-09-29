@@ -207,7 +207,7 @@ final class Tab: ObservableObject, Identifiable {
     /// restoring the HTML gives you a page that looks right and does nothing,
     /// because every listener the page had was thrown away with it.
     func toggleReader(_ done: @escaping (Bool) -> Void) {
-        guard !isBlank else {
+        guard !isBlank, native == nil else {
             done(false)
             return
         }
@@ -236,6 +236,13 @@ final class Tab: ObservableObject, Identifiable {
     }
 
     private func adoptIcon() {
+        // One of our own pages has no site to fetch a mark from — it wears
+        // the thing's own symbol instead.
+        if let page = address.flatMap(NativePage.init) {
+            icon = NSImage(systemSymbolName: page.icon,
+                           accessibilityDescription: page.title)
+            return
+        }
         guard let host = address?.host()?.lowercased() else { return }
         icon = Favicons.shared.cached(host)
     }
@@ -263,7 +270,7 @@ final class Tab: ObservableObject, Identifiable {
     }
 
     func applyRememberedZoom() {
-        guard let host = address?.host() else { return }
+        guard native == nil, let host = address?.host() else { return }
         let kept = Store.settings.object(forKey: "zoom." + host) as? Double ?? 1
         guard abs(CGFloat(kept) - web.pageZoom) > 0.004 else { return }
         web.pageZoom = CGFloat(kept)
@@ -327,6 +334,9 @@ final class Tab: ObservableObject, Identifiable {
     /// WebKit keeps each kind of view to its own pages, so the tab has to be
     /// swapped for one built for the address (see Browser.replace).
     var onCross: ((Tab, URL) -> Void)?
+    /// Sent one of the app's own pages — answer whether another tab already
+    /// holds it and was brought forward instead, so this one stands still.
+    var onNative: ((Tab, NativePage) -> Bool)?
     /// The extension whose store page has its own "Add to Search" button in
     /// place — so the bar at the bottom of the window doesn't offer it twice.
     @Published var storePlaced: String?
@@ -349,7 +359,11 @@ final class Tab: ObservableObject, Identifiable {
     /// A tab a script opened through the bench, beside yours. Signed in as
     /// you, so it sees what you see — but never selected for you, never in
     /// the session or the history, and gone when the script is done.
-    let bench: Bool
+    @Published var bench: Bool
+    /// Kept from an agent, with the same live page and form state.
+    @Published var surfaced = false
+    @Published var agentName: String?
+    @Published var agentGroup: String?
 
     /// The tab whose page opened this one, when a script did. Sign-in flows
     /// hand you back to it when they are done.
@@ -400,6 +414,11 @@ final class Tab: ObservableObject, Identifiable {
     /// A tab that has never been anywhere shows the address field instead of a
     /// page. It still owns a web view — built now, warm by the time it's needed.
     var isBlank: Bool { address == nil }
+
+    /// One of the app's own pages — Settings, History and the rest — rather
+    /// than a page fetched from anywhere. The address is real, the stage draws
+    /// it natively, and the web view under it never loads (see NativePages.swift).
+    var native: NativePage? { address.flatMap(NativePage.init) }
 
     /// The title if the page has offered one, the address until it does. A tab
     /// that says nothing at all for the first second of every load is a tab you
@@ -522,6 +541,7 @@ final class Tab: ObservableObject, Identifiable {
     /// Between two fifths and three times, which is as far as a page is worth
     /// pushing in either direction.
     func magnify(to value: CGFloat) {
+        guard let web = built else { return }
         let wanted = min(3, max(0.4, value))
         guard abs(wanted - web.pageZoom) > 0.004 else { return }
         web.pageZoom = wanted
@@ -530,12 +550,12 @@ final class Tab: ObservableObject, Identifiable {
         onZoom?(self, wanted)
     }
 
-    func magnify(by factor: CGFloat) { magnify(to: web.pageZoom * factor) }
+    func magnify(by factor: CGFloat) { magnify(to: (built?.pageZoom ?? 1) * factor) }
 
     /// ⌘0 undoes both kinds of zoom at once — whichever one you reached for.
     func resetZoom() {
         magnify(to: 1)
-        web.clearPinch()
+        built?.clearPinch()
     }
 
     // MARK: - taking things off the page
@@ -749,6 +769,10 @@ final class Tab: ObservableObject, Identifiable {
             onCross(self, url)
             return
         }
+        // One of ours another tab already holds is a selection, not a
+        // navigation — typed, pasted or ghosted, there is still only ever
+        // one. This tab is left exactly as it was.
+        if let page = NativePage(url: url), onNative?(self, page) == true { return }
         // Set straight away rather than waiting for the observer: the tab has to
         // stop being blank in the same frame the field disappears, or the empty
         // state flashes back for an instant on its way out.
@@ -767,6 +791,21 @@ final class Tab: ObservableObject, Identifiable {
         picture = nil
         cover = nil
         adoptIcon()
+        // An address of ours is the page itself — nothing is fetched, the
+        // title is already known, and the web view is torn down rather than
+        // woken: kept, it could finish a load in flight and write its old
+        // address back over the page's.
+        if let page = NativePage(url: url) {
+            title = page.title
+            discard()
+            return
+        }
+        // A search:// nothing owns: as good a dead end as a typo'd host,
+        // and it says so on the page rather than going nowhere.
+        if url.scheme == "search" {
+            failure = "There is no such page."
+            return
+        }
         web.open(url)
     }
 
@@ -956,6 +995,9 @@ final class Tab: ObservableObject, Identifiable {
     /// Asked anything at all, the page answers with one particular error, and
     /// the answer to that is to load it again.
     func revive() {
+        // Our own pages are never hollow: there is no process behind them
+        // to have died, and no document for a reload to bring back.
+        if native != nil { return }
         if stale {
             stale = false
             recoverFromCrash()
@@ -994,6 +1036,14 @@ final class Tab: ObservableObject, Identifiable {
         reader = false
         typing = false
         immersed = false
+        // Our own pages hold no state to hand back: the address being set is
+        // all the waking one of them ever needs.
+        if let page = NativePage(url: url) {
+            title = page.title
+            memory = nil
+            picture = nil
+            return true
+        }
         let state = memory
         memory = nil
         if let picture, let image = NSImage(data: picture) {
@@ -1010,6 +1060,10 @@ final class Tab: ObservableObject, Identifiable {
     /// loading it yet. Saying so now keeps the empty state from flashing up in
     /// the frame between the tab appearing and the page committing.
     func setAddressOptimistically(_ url: URL) {
+        // A page must not walk a window.open into one of ours — the address
+        // is the whole of a native page, so a site that mints the address
+        // would be minting the page.
+        guard NativePage(url: url) == nil else { return }
         address = url
         failure = nil
         adoptIcon()
@@ -1020,6 +1074,8 @@ final class Tab: ObservableObject, Identifiable {
     /// True when the web view holds nothing — never loaded, or emptied —
     /// while the tab still names a page. The white page, in other words.
     var hollow: Bool {
+        // One of ours is never an empty shell — the page is drawn, not fetched.
+        if native != nil { return false }
         guard let built else { return address != nil }
         guard let there = built.url else { return address != nil }
         return there.absoluteString == "about:blank" && pending == nil && address != nil
@@ -1031,17 +1087,20 @@ final class Tab: ObservableObject, Identifiable {
         // A pin put down with ⌘W has no view left to reload; waking it is
         // the reload.
         guard !wake() else { return }
+        // Our own pages are already drawn — the view they would reload in
+        // does not exist.
+        guard native == nil else { return }
         if hollow, let address {
             web.open(address)
         } else {
             web.reloadFromOrigin()
         }
     }
-    func stop() { web.stopLoading() }
+    func stop() { if native == nil { web.stopLoading() } }
     /// Straight through, every time. A page that has to be fetched again is
     /// fetched again — nothing is kept behind to make that look otherwise.
-    func back() { web.goBack() }
-    func forward() { web.goForward() }
+    func back() { if native == nil { web.goBack() } }
+    func forward() { if native == nil { web.goForward() } }
 
     /// Called when the tab is thrown away. Without it the view keeps running
     /// whatever the page left behind — timers, video, sockets.

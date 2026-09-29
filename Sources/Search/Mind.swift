@@ -25,6 +25,66 @@ struct AskTab: Codable, Identifiable, Equatable {
     var address: String
 }
 
+/// One piece of what a turn did, in the order it happened — the reason the
+/// stream can draw "wrote a paragraph, ran these calls, wrote again" instead
+/// of one flattened blob. Display-only: `toHistory` keeps reading `text` and
+/// `tools`, which still carry the same content unfolded.
+struct AskBlock: Codable, Equatable, Identifiable {
+    enum Kind: String, Codable { case text, tool, artifact }
+    /// Minted when the block is pushed — stable across in-place updates
+    /// (a text block growing by deltas, a tool's result landing).
+    var id = UUID()
+    var kind: Kind
+    /// The paragraph text for `.text` blocks.
+    var text = ""
+    /// The call for `.tool` blocks — the same value the `tools` array holds.
+    var tool: AskMessage.Tool?
+    /// A picture's place on disk for `.artifact` blocks (a screenshot the
+    /// turn took); `tab` names the agent tab it came from when it did.
+    var path: String?
+    var tab: String?
+
+    /// The memberwise init, spelled out — the custom decoder below would
+    /// otherwise be the only one and the factories couldn't mint.
+    init(id: UUID = UUID(), kind: Kind, text: String = "", tool: AskMessage.Tool? = nil,
+         path: String? = nil, tab: String? = nil) {
+        self.id = id; self.kind = kind; self.text = text
+        self.tool = tool; self.path = path; self.tab = tab
+    }
+
+    static func text(_ text: String) -> AskBlock { AskBlock(kind: .text, text: text) }
+    static func tool(_ tool: AskMessage.Tool) -> AskBlock { AskBlock(kind: .tool, tool: tool) }
+    static func artifact(_ path: String, tab: String? = nil) -> AskBlock {
+        AskBlock(kind: .artifact, path: path, tab: tab)
+    }
+
+    /// The wire shape — `{kind:"text", text:…}`, `{kind:"tool", tool:{…}}`,
+    /// `{kind:"artifact", path:…, tab:…}` — what harness.js emits. `id` is
+    /// a view concern, minted on decode rather than carried.
+    private enum Wire: String, CodingKey { case kind, text, tool, path, tab }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Wire.self)
+        kind = try c.decode(Kind.self, forKey: .kind)
+        text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
+        tool = try c.decodeIfPresent(AskMessage.Tool.self, forKey: .tool)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        tab = try c.decodeIfPresent(String.self, forKey: .tab)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: Wire.self)
+        try c.encode(kind, forKey: .kind)
+        switch kind {
+        case .text: try c.encode(text, forKey: .text)
+        case .tool: try c.encodeIfPresent(tool, forKey: .tool)
+        case .artifact:
+            try c.encodeIfPresent(path, forKey: .path)
+            try c.encodeIfPresent(tab, forKey: .tab)
+        }
+    }
+}
+
 /// One line in a chat, kept on disk between launches.
 struct AskMessage: Codable, Identifiable, Equatable {
     enum Role: String, Codable { case you, agent, note }
@@ -37,11 +97,26 @@ struct AskMessage: Codable, Identifiable, Equatable {
         /// showing, not the tool's whole reply.
         var result: String?
         var failed = false
+        /// The PNG the result wrote, when it wrote one (a page.screenshot
+        /// lands here as a path the panel can thumb through).
+        var shot: String?
+        /// The model's own one-line reason for the call, when it gave one —
+        /// the `</>` lines' caption.
+        var why: String?
     }
     var id = UUID()
     var role: Role
     var text: String
     var tools: [Tool] = []
+    /// What the turn did, in order — nil on chats written before blocks
+    /// existed; `orderedBlocks` derives them when it is.
+    var blocks: [AskBlock]? = nil
+    /// How long the turn this message ends worked — stamped on `.done`,
+    /// feeding the "Worked for 4m 39s" header; nil while it still runs.
+    var workedFor: TimeInterval?
+    /// A .note that is an error (a provider's refusal, a dead turn) —
+    /// draws the tinted card with the retry pill instead of a quiet line.
+    var isError = false
     /// The tabs the message rode in on — the consent chips, kept on the
     /// message because the composer lets its chips go. (Renamed from
     /// `attachments` when the typed pieces below arrived.)
@@ -56,6 +131,58 @@ struct AskMessage: Codable, Identifiable, Equatable {
     /// How many times the turn it began has been re-run — the bubble's
     /// quiet "· retried ×N"; never told to the model.
     var retries = 0
+    var approval: AskApproval?
+
+    /// The work in the order it happened. Messages written before blocks
+    /// existed read text-then-tools — the same flat order they always drew.
+    var orderedBlocks: [AskBlock] {
+        if let blocks { return blocks }
+        var derived: [AskBlock] = []
+        if !text.isEmpty { derived.append(.text(text)) }
+        derived.append(contentsOf: tools.map(AskBlock.tool))
+        return derived
+    }
+
+    /// Drop what `committed` already carries. A closing `.message`
+    /// re-states the whole run, but the stretch an earlier sealed message
+    /// holds (a steered turn's work) is already on screen — matching is
+    /// the run's own order: committed blocks are a prefix, committed text
+    /// a prefix of the text, committed calls known by id. A paragraph that
+    /// grew across the seam keeps only its tail here.
+    mutating func trim(committedBy committed: [AskMessage]) {
+        var words = ""
+        var prefix: [AskBlock] = []
+        var toolIDs: Set<String> = []
+        for message in committed {
+            words += message.text
+            prefix += message.orderedBlocks
+            toolIDs.formUnion(message.tools.map(\.id))
+        }
+        if text.hasPrefix(words) { text = String(text.dropFirst(words.count)) }
+        tools.removeAll { toolIDs.contains($0.id) }
+        guard var rest = blocks else { return }
+        var i = 0
+        outer: while i < prefix.count, i < rest.count {
+            switch (prefix[i].kind, rest[i].kind) {
+            case (.tool, .tool) where prefix[i].tool?.id == rest[i].tool?.id:
+                i += 1
+            case (.artifact, .artifact) where prefix[i].path == rest[i].path:
+                i += 1
+            case (.text, .text):
+                if rest[i].text == prefix[i].text {
+                    i += 1
+                } else if rest[i].text.hasPrefix(prefix[i].text) {
+                    rest[i].text = String(rest[i].text.dropFirst(prefix[i].text.count))
+                    i += 1
+                } else {
+                    break outer
+                }
+            default:
+                break outer
+            }
+        }
+        blocks = Array(rest.dropFirst(i))
+    }
 }
 
 extension AskMessage {
@@ -80,6 +207,13 @@ extension AskMessage {
         when = try c.decodeIfPresent(Date.self, forKey: .when) ?? Date()
         model = try c.decodeIfPresent(String.self, forKey: .model)
         retries = try c.decodeIfPresent(Int.self, forKey: .retries) ?? 0
+        approval = try c.decodeIfPresent(AskApproval.self, forKey: .approval)
+        // Blocks, workedFor and isError are newer than every file on disk —
+        // missing reads nil/0/false, and a malformed block array shouldn't
+        // eat the message, so it reads soft.
+        blocks = (try? c.decodeIfPresent([AskBlock].self, forKey: .blocks)) ?? nil
+        workedFor = try c.decodeIfPresent(TimeInterval.self, forKey: .workedFor)
+        isError = try c.decodeIfPresent(Bool.self, forKey: .isError) ?? false
     }
 }
 
@@ -106,6 +240,12 @@ struct AskChat: Codable, Identifiable, Equatable {
     /// a killed turn's trailing words can then be told from the live
     /// turn's and dropped.
     var turn: UUID?
+    /// When the live turn began — set beside `turn`; it drives the
+    /// "Working for M:SS" tick and the `workedFor` stamped on `.done`.
+    var turnStartedAt: Date?
+    /// The message the list had last drawn this chat through — a chat
+    /// with content past it wears the unread dot.
+    var lastSeen: UUID?
     /// The chat this one branched from (design/interaction.md §3) —
     /// nil for a chat that began life new.
     var parent: UUID?
@@ -124,6 +264,8 @@ extension AskChat {
         mode = try c.decodeIfPresent(AskMode.self, forKey: .mode) ?? .guard
         effort = try c.decodeIfPresent(String.self, forKey: .effort)
         turn = try c.decodeIfPresent(UUID.self, forKey: .turn)
+        turnStartedAt = try c.decodeIfPresent(Date.self, forKey: .turnStartedAt)
+        lastSeen = try c.decodeIfPresent(UUID.self, forKey: .lastSeen)
         parent = try c.decodeIfPresent(UUID.self, forKey: .parent)
     }
 
@@ -208,6 +350,113 @@ protocol AskEngine: AnyObject {
     var running: Bool { get }
 }
 
+// MARK: - the fold
+
+/// What an engine event does to a chat — the message/blocks/workedFor
+/// half of `Mind.hear`, lifted out so a routine's run chat folds the same
+/// stream without passing through Mind's seats (Routines.swift).
+/// `folds` is the caller's per-chat set of message ids this run has
+/// folded into — Mind keys it by chat, the run keys it by run.
+///
+///   delta    — begin or grow the live agent shell, mirror text blocks
+///   tool     — upsert the call on the shell, mirror a .tool block
+///   message  — the run's canonical record: committed work trimmed off,
+///              live shells superseded in place
+///   done     — the workedFor stamp on the turn's own last agent
+///              message (never a tail note), the error's note line
+///   activity — a seat concern; no chat mutation
+enum AskFold {
+    static func apply(_ event: AskEvent, to chat: inout AskChat, folds: inout Set<UUID>) {
+        switch event {
+        case .delta(_, let text):
+            if chat.messages.last?.role != .agent {
+                let shell = AskMessage(role: .agent, text: "", blocks: [])
+                chat.messages.append(shell)
+                folds.insert(shell.id)
+            } else if let last = chat.messages.last {
+                folds.insert(last.id)
+            }
+            let last = chat.messages.count - 1
+            chat.messages[last].text += text
+            // The same fold the harness's emit makes: words after a run of
+            // tool work are a new paragraph, not a tail on the last one —
+            // each section of the accordion begins at one of these.
+            var blocks = chat.messages[last].blocks ?? []
+            if blocks.last?.kind == .text {
+                blocks[blocks.count - 1].text += text
+            } else {
+                blocks.append(.text(text))
+            }
+            chat.messages[last].blocks = blocks
+        case .message(_, let arrived):
+            var message = arrived
+            // Who answered — the chat's model at the moment the message
+            // landed — so a chat that mixes brains can say which said this.
+            message.model = message.model ?? chat.model
+            // A steered run's closing message re-states the *whole* run:
+            // the stretch before the steer was already folded into the
+            // earlier turn's sealed message, so it's trimmed off what lands
+            // here — otherwise its paragraphs and calls draw twice.
+            let boundary = chat.messages.lastIndex(where: { $0.role == .you }).map { $0 + 1 } ?? 0
+            let committed = chat.messages[..<boundary].filter { $0.role == .agent && folds.contains($0.id) }
+            if !committed.isEmpty { message.trim(committedBy: committed) }
+            // The message is the run's canonical record — it supersedes
+            // every shell the live fold left in this turn (a mid-turn
+            // note can split the tail into a second one; keeping both
+            // would draw the run's blocks twice inside one accordion).
+            let tail = Array(chat.messages[boundary...])
+            let where_ = tail.firstIndex { $0.role == .agent } ?? tail.count
+            var kept = tail.filter { $0.role != .agent }
+            kept.insert(message, at: min(where_, kept.count))
+            chat.messages = Array(chat.messages.prefix(boundary)) + kept
+        case .tool(_, let tool):
+            if chat.messages.last?.role != .agent {
+                let shell = AskMessage(role: .agent, text: "", blocks: [])
+                chat.messages.append(shell)
+                folds.insert(shell.id)
+            } else if let last = chat.messages.last {
+                folds.insert(last.id)
+            }
+            let last = chat.messages.count - 1
+            if let held = chat.messages[last].tools.firstIndex(where: { $0.id == tool.id }) {
+                chat.messages[last].tools[held] = tool
+            } else {
+                chat.messages[last].tools.append(tool)
+            }
+            // The block mirror: the same call lives at its position in the
+            // turn's order — a result landing updates it in place.
+            var blocks = chat.messages[last].blocks ?? []
+            if let held = blocks.lastIndex(where: { $0.kind == .tool && $0.tool?.id == tool.id }) {
+                blocks[held].tool = tool
+            } else {
+                blocks.append(.tool(tool))
+            }
+            chat.messages[last].blocks = blocks
+        case .done(_, let error):
+            // The duration lands on the message that closed the turn —
+            // the accordion's "Worked for 4m 39s" reads it. A tail note
+            // (an error line lands after the words) isn't the answer —
+            // stamp the turn's own last agent message.
+            let boundary = chat.messages.lastIndex(where: { $0.role == .you }).map { $0 + 1 } ?? 0
+            if let started = chat.turnStartedAt,
+               let last = chat.messages.lastIndex(where: { $0.role == .agent }),
+               last >= boundary {
+                chat.messages[last].workedFor = Date().timeIntervalSince(started)
+            }
+            chat.turnStartedAt = nil
+            if let error, !error.isEmpty {
+                // One honest line — the raw provider dump's first row
+                // ("openrouter 400 — …"), the card carries the rest.
+                let clean = error.components(separatedBy: "\n").first ?? error
+                chat.messages.append(
+                    AskMessage(role: .note, text: String(clean.prefix(280)), isError: true))
+            }
+        case .activity:
+            break
+        }
+    }
+}
+
 // MARK: - the panel's state
 
 @MainActor
@@ -240,6 +489,25 @@ final class Mind: ObservableObject {
     }
     /// What the engine is doing right now, for the status line.
     @Published private(set) var activity = ""
+    /// The chat the live turn belongs to — `running` alone can't say it,
+    /// and a chat that isn't the running one must not wear its spinner or
+    /// feed it steers. Set on send/retry, cleared on that chat's `.done`.
+    @Published private(set) var runningChatID: UUID?
+
+    /// Half-typed composer text, keyed by chat — session-only, never
+    /// persisted. Shared by every surface so the rail and the Ask window
+    /// hold the same draft for the same chat (fullscreen-features §6.4);
+    /// `draftKey` is the nowhere-chat a first send is typed into.
+    @Published var drafts: [UUID: String] = [:]
+    static let draftKey = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
+
+    /// The composer's text binding for whichever chat is on screen.
+    var draft: Binding<String> {
+        Binding(
+            get: { self.drafts[self.currentID ?? Mind.draftKey] ?? "" },
+            set: { self.drafts[self.currentID ?? Mind.draftKey] = $0 }
+        )
+    }
 
     /// Ops the gate parked for the user's verdict (design/permissions.md
     /// §5) — a card each in the chat stream. Only the .app session can
@@ -252,6 +520,12 @@ final class Mind: ObservableObject {
     /// The 300-second patience a question carries — nobody answering is
     /// itself an answer ({declined:"timeout"}).
     private var questionClock: Task<Void, Never>?
+
+    /// Agent messages this run has folded into, per chat. A closing
+    /// `.message` re-states the whole run — anything before the current
+    /// turn's `.you` boundary that the run already streamed is trimmed off
+    /// it, so a steered turn's sealed work isn't drawn twice.
+    private var runFolds: [UUID: Set<UUID>] = [:]
 
     var current: AskChat? { chats.first { $0.id == currentID } }
     var running: Bool {
@@ -297,6 +571,30 @@ final class Mind: ObservableObject {
         // and the turn's stamp tells its events from a killed turn's tail.
         chat.model = model.id
         chat.turn = UUID()
+        chat.turnStartedAt = Date()
+        // One run at a time on the engine — starting here kills whatever
+        // was in flight, and that chat's done may never arrive (its events
+        // are another turn's tail, filtered stale). Its books close now:
+        // the accordion's clock freezes, its parked asks settle refused,
+        // and nothing keeps wearing the ring.
+        if let old = runningChatID, old != chat.id,
+           let at = chats.firstIndex(where: { $0.id == old }) {
+            let boundary = chats[at].messages.lastIndex(where: { $0.role == .you }).map { $0 + 1 } ?? 0
+            if let started = chats[at].turnStartedAt,
+               let last = chats[at].messages.lastIndex(where: { $0.role == .agent }),
+               last >= boundary, chats[at].messages[last].workedFor == nil {
+                chats[at].messages[last].workedFor = Date().timeIntervalSince(started)
+            }
+            chats[at].turnStartedAt = nil
+            if question?.chat == old {
+                questionClock?.cancel()
+                question = nil
+            }
+            pendingApprovals.removeAll { $0.chat == old }
+            AskStore.save(chats[at])
+            runFolds[old] = nil
+        }
+        runningChatID = chat.id
         // The typed attachments' send-time fill — a file's text inside its
         // cap, an image's bytes inside its own — so what persists on the
         // message is what the model could actually be shown.
@@ -340,10 +638,34 @@ final class Mind: ObservableObject {
     /// (design/interaction.md §1). Stays on screen as your message either
     /// way.
     func steer(_ text: String) {
+        let correction = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !correction.isEmpty, pendingApprovals.contains(where: { $0.chat == currentID }) {
+            for approval in pendingApprovals.filter({ $0.chat == currentID }) { resolve(approval, .deny) }
+            stop()
+            send(correction)
+            return
+        }
+        guard running else { return send(text) }
         guard let chat = current else { return send(text) }
+        // A word typed in a chat that isn't the one mid-turn can't ride
+        // the engine's steer — the live turn is another chat's, and
+        // engine.steer would feed it. It starts this chat's own turn
+        // instead (the harness's one-turn rule ends the other).
+        guard runningChatID == chat.id else { return send(text) }
         let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !words.isEmpty else { return }
         var copy = chat
+        // A steer cuts the turn open mid-flight: the message above it
+        // belongs to the pre-steer stretch — seal it with the span it
+        // actually ran so its accordion can say how long it worked. A note
+        // may sit on the tail (a verdict line landed after the words) —
+        // seal the turn's last agent message, not whatever is last.
+        let boundary = copy.messages.lastIndex(where: { $0.role == .you }).map { $0 + 1 } ?? 0
+        if let last = copy.messages.lastIndex(where: { $0.role == .agent }),
+           last >= boundary, copy.messages[last].workedFor == nil {
+            copy.messages[last].workedFor =
+                Date().timeIntervalSince(copy.turnStartedAt ?? copy.messages[last].when)
+        }
         copy.messages.append(AskMessage(role: .you, text: words))
         store(copy)
         if let q = question, q.chat == chat.id {
@@ -355,6 +677,22 @@ final class Mind: ObservableObject {
 
     func stop() {
         engine?.stop()
+        // The engine's done may never arrive (a dead page answers
+        // nothing) — the live flag comes down either way, and the killed
+        // turn's books close here the way .done would close them: its
+        // accordion's clock freezes at the span it actually ran.
+        if let chat = runningChatID, let at = chats.firstIndex(where: { $0.id == chat }) {
+            let boundary = chats[at].messages.lastIndex(where: { $0.role == .you }).map { $0 + 1 } ?? 0
+            if let started = chats[at].turnStartedAt,
+               let last = chats[at].messages.lastIndex(where: { $0.role == .agent }),
+               last >= boundary, chats[at].messages[last].workedFor == nil {
+                chats[at].messages[last].workedFor = Date().timeIntervalSince(started)
+            }
+            chats[at].turnStartedAt = nil
+            AskStore.save(chats[at])
+        }
+        runFolds = [:]
+        runningChatID = nil
         #if DEBUG
         demoRunning = false
         #endif
@@ -366,7 +704,19 @@ final class Mind: ObservableObject {
         question = nil
     }
 
+    /// Move a chat's read marker to its latest word — saved without
+    /// store()'s activity bump: looking is not doing. Called for the chat
+    /// being left (what landed while it was open was seen) and the one
+    /// arrived at (it starts read).
+    private func markSeen(_ chat: UUID) {
+        guard let at = chats.firstIndex(where: { $0.id == chat }),
+              chats[at].lastSeen != chats[at].messages.last?.id else { return }
+        chats[at].lastSeen = chats[at].messages.last?.id
+        AskStore.save(chats[at])
+    }
+
     func newChat() {
+        if let old = currentID { markSeen(old) }
         currentID = nil
         context = []
         attachments = []
@@ -379,21 +729,33 @@ final class Mind: ObservableObject {
     }
 
     func select(_ chat: AskChat) {
+        // The chat being left was watched — words that landed while it was
+        // open are read, so its marker moves to its latest before leaving.
+        if let old = currentID, old != chat.id { markSeen(old) }
         currentID = chat.id
+        markSeen(chat.id)
         pushMode()
     }
 
     func remove(_ chat: AskChat) {
         // Deleting the chat a turn is still writing to would leave the turn
-        // live, its events landing on a chat that isn't there — stop first.
-        if chat.id == currentID, running { stop() }
+        // live, its events landing on a chat that isn't there — stop first,
+        // whether it's the open one or a job running in the background.
+        if chat.id == runningChatID { stop() }
         chats.removeAll { $0.id == chat.id }
         AskStore.drop(chat.id)
-        if currentID == chat.id { currentID = chats.first?.id }
+        if currentID == chat.id {
+            currentID = chats.first?.id
+            if let now = currentID { markSeen(now) }
+        }
         pushMode()
         // Its grants die with it — consent was the chat's, not the app's —
         // and its parked asks with them (ungrantAll settles them refused).
-        pendingApprovals.removeAll()
+        pendingApprovals.removeAll { $0.chat == chat.id }
+        if question?.chat == chat.id {
+            questionClock?.cancel()
+            question = nil
+        }
         AskRuntime.drive?.perform("tabs.ungrantAll", [:], from: .app) { _ in }
     }
 
@@ -403,42 +765,17 @@ final class Mind: ObservableObject {
         AskStore.save(chats[at])
     }
 
-    /// An event from the engine, folded into the chat it names.
+    /// An event from the engine, folded into the chat it names. The
+    /// message-level work is AskFold's — shared with run chats — while the
+    /// seats (activity, question, approvals, the running ring) are this
+    /// class's own.
     func hear(_ event: AskEvent) {
         switch event {
-        case .delta(let chat, let text):
-            guard let at = chats.firstIndex(where: { $0.id == chat }) else { return }
-            if chats[at].messages.last?.role != .agent {
-                chats[at].messages.append(AskMessage(role: .agent, text: ""))
-            }
-            chats[at].messages[chats[at].messages.count - 1].text += text
-        case .message(let chat, let message):
-            guard let at = chats.firstIndex(where: { $0.id == chat }) else { return }
-            var message = message
-            // Who answered — the chat's model at the moment the message
-            // landed — so a chat that mixes brains can say which said this.
-            message.model = message.model ?? chats[at].model
-            if chats[at].messages.last?.role == .agent {
-                chats[at].messages[chats[at].messages.count - 1] = message
-            } else {
-                chats[at].messages.append(message)
-            }
-            store(chats[at])
-        case .tool(let chat, let tool):
-            guard let at = chats.firstIndex(where: { $0.id == chat }) else { return }
-            if chats[at].messages.last?.role != .agent {
-                chats[at].messages.append(AskMessage(role: .agent, text: ""))
-            }
-            let last = chats[at].messages.count - 1
-            if let held = chats[at].messages[last].tools.firstIndex(where: { $0.id == tool.id }) {
-                chats[at].messages[last].tools[held] = tool
-            } else {
-                chats[at].messages[last].tools.append(tool)
-            }
         case .activity(_, let doing):
             activity = doing
-        case .done(let chat, let error):
+        case .done(let chat, _):
             activity = ""
+            if runningChatID == chat { runningChatID = nil; pushMode() }
             // A turn that ended isn't waiting on anyone — its question
             // and its parked asks are over whether they answered or not.
             if question?.chat == chat {
@@ -446,24 +783,39 @@ final class Mind: ObservableObject {
                 question = nil
             }
             pendingApprovals.removeAll { $0.chat == chat }
-            if let at = chats.firstIndex(where: { $0.id == chat }) {
-                if let error, !error.isEmpty {
-                    chats[at].messages.append(AskMessage(role: .note, text: error))
-                }
-                store(chats[at])
-            }
+            defer { runFolds[chat] = nil }
+            guard let at = chats.firstIndex(where: { $0.id == chat }) else { return }
+            AskFold.apply(event, to: &chats[at], folds: &runFolds[chat, default: []])
+            store(chats[at])
+        case .delta(let chat, _), .tool(let chat, _):
+            guard let at = chats.firstIndex(where: { $0.id == chat }) else { return }
+            AskFold.apply(event, to: &chats[at], folds: &runFolds[chat, default: []])
+        case .message(let chat, _):
+            guard let at = chats.firstIndex(where: { $0.id == chat }) else { return }
+            AskFold.apply(event, to: &chats[at], folds: &runFolds[chat, default: []])
+            store(chats[at])
         }
     }
 
     // MARK: - the asks: approvals and questions
 
+    /// The rail's attention grab — a parked ask pops the panel open.
+    /// Suppressed while the Ask window is the one in front: its parked
+    /// zone already shows the card there, and popping the rail beside it
+    /// is asking for the same attention twice (fullscreen-features §6.3).
+    private func knock() {
+        if AskWindow.window?.isKeyWindow != true { open = true }
+    }
+
     /// A parked op wants the user's say (design/permissions.md §5) —
     /// Drive raises it the same way `ui.ask` opens the panel: the card
     /// lands in the chat's stream, and asking is deliberate
     /// attention-seeking.
+    func removeApproval(_ id: UUID) { pendingApprovals.removeAll { $0.id == id } }
+
     func raise(_ approval: AskApproval) {
+        pendingApprovals.removeAll { $0.id == approval.id }
         pendingApprovals.append(approval)
-        open = true
     }
 
     /// A card's verdict — the parked op settles in Drive, and the chat
@@ -471,16 +823,17 @@ final class Mind: ObservableObject {
     /// as `[note: …]` so the model sees its own record.
     func resolve(_ approval: AskApproval, _ verdict: ApprovalVerdict) {
         pendingApprovals.removeAll { $0.id == approval.id }
-        engine?.settleApproval(approval.id, verdict)
+        if let engine { engine.settleApproval(approval.id, verdict) }
+        else { (AskRuntime.drive as? Drive)?.settleApproval(approval.id, verdict) }
         guard let at = chats.firstIndex(where: { $0.id == approval.chat }) else { return }
         let what = approval.host.map { "\(approval.op) on \($0)" } ?? approval.op
         let text: String
         switch verdict {
         case .allow: text = "✓ allowed \(what)"
         case .deny: text = "✗ denied \(what)"
-        case .always: text = "✓ always allowed \(what)"
+        case .always: text = "✓ allowed \(what)"
         }
-        chats[at].messages.append(AskMessage(role: .note, text: text))
+        chats[at].messages.append(AskMessage(role: .note, text: text, approval: approval))
         store(chats[at])
     }
 
@@ -492,7 +845,7 @@ final class Mind: ObservableObject {
         questionClock?.cancel()
         let asked = AskQuestion(chat: chat, text: text, options: options)
         question = asked
-        open = true
+        knock()
         questionClock = Task { [weak self] in
             try? await Task.sleep(for: .seconds(300))
             guard let self, !Task.isCancelled, question?.id == asked.id else { return }
@@ -532,6 +885,8 @@ final class Mind: ObservableObject {
         copy.messages[at].retries += 1
         if let brain { copy.model = brain.id }
         copy.turn = UUID()
+        copy.turnStartedAt = Date()
+        runningChatID = chat.id
         store(copy)
         engine?.run(AskJob(chat: copy, tabs: message.tabs,
                            attachments: message.attachments, text: message.text))
@@ -555,7 +910,9 @@ final class Mind: ObservableObject {
         copy.when = Date()
         chats.insert(copy, at: 0)
         AskStore.save(copy)
+        if let old = currentID { markSeen(old) }
         currentID = copy.id
+        markSeen(copy.id)
         context = []
         attachments = []
         pendingApprovals.removeAll()
@@ -593,7 +950,7 @@ final class Mind: ObservableObject {
     /// send, select, new chat, fork and a mode change, the same push
     /// pattern `hear` uses. With no chat open the Settings default speaks.
     private func pushMode() {
-        let mode = current?.mode
+        let mode = runningChatID.flatMap { id in chats.first(where: { $0.id == id })?.mode } ?? current?.mode
             ?? AskMode(rawValue: Store.settings.string(forKey: "ask.mode") ?? "") ?? .guard
         (AskRuntime.drive as? Drive)?.setMode(mode, for: .app)
     }
@@ -631,17 +988,112 @@ final class Mind: ObservableObject {
             try? await Task.sleep(for: .seconds(1.6))
             guard let chat = current else { return }
             var copy = chat
-            copy.messages.append(AskMessage(
+            var ask = AskMessage(
                 role: .agent, text: "",
                 tools: [AskMessage.Tool(
                     id: "demo-ask", name: "ask_user",
                     args: #"{"question":"Which should I reorder?","options":["the cheap one","the sturdy one"]}"#
                 )]
-            ))
+            )
+            ask.blocks = [.tool(ask.tools[0])]
+            copy.messages.append(ask)
             store(copy)
             demoRunning = true
+            runningChatID = chat.id
             pose("Which should I reorder?", options: ["the cheap one", "the sturdy one"], in: chat.id)
         }
+    }
+
+    /// A probe-world lever for the turn stream (`defaults write
+    /// com.officecommun.search.test.<world> ask.demostream -bool true`,
+    /// then the panel's next opening fires this once): plants a finished
+    /// two-turn chat — user pill, a worked-for accordion holding paragraphs
+    /// between tool clusters and a real screenshot card, then the answer —
+    /// so the rail's stream can be audited without a live model.
+    func demoStream() {
+        guard Store.testing, Store.settings.bool(forKey: "ask.demostream") else { return }
+        Store.settings.set(false, forKey: "ask.demostream")
+
+        // A real PNG for the shot card, drawn into the world's own folder.
+        let shotPath = Store.file("demo-stream-shot.png").path
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 240, pixelsHigh: 150,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+        if let rep {
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            NSColor.systemTeal.setFill()
+            NSRect(x: 0, y: 0, width: 240, height: 150).fill()
+            NSColor.white.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 16, y: 16, width: 208, height: 118),
+                         xRadius: 10, yRadius: 10).fill()
+            NSColor.systemTeal.setFill()
+            NSRect(x: 30, y: 96, width: 120, height: 12).fill()
+            NSRect(x: 30, y: 74, width: 180, height: 8).fill()
+            NSRect(x: 30, y: 56, width: 150, height: 8).fill()
+            NSGraphicsContext.restoreGraphicsState()
+            try? rep.representation(using: .png, properties: [:])?
+                .write(to: URL(fileURLWithPath: shotPath))
+        }
+
+        func tool(_ id: String, _ name: String, _ args: String, _ result: String,
+                  why: String? = nil, shot: String? = nil) -> AskMessage.Tool {
+            AskMessage.Tool(id: id, name: name, args: args, result: result,
+                            failed: false, shot: shot, why: why)
+        }
+
+        var first = AskChat(title: "Desk lamp research")
+        first.model = "codex/gpt-6-luna"
+        first.messages = [
+            AskMessage(role: .you, text: "Find a good desk lamp under $80"),
+            AskMessage(
+                role: .agent, text: "",
+                blocks: [
+                    .text("One of the more promising listings is on vivo.com — checking the price and stock now."),
+                    .tool(tool("d1", "snapshot", #"{"tab":"abc123"}"#, #"{"lines":42}"#)),
+                    .tool(tool("d2", "navigate", #"{"tab":"abc123","url":"https://vivo.com/lamp"}"#, #"{"ok":true}"#)),
+                    .tool(tool("d3", "screenshot", #"{"tab":"abc123"}"#, #"{"path":"…"}"#,
+                               shot: shotPath)),
+                    .text("I found an important detail: the listing price excludes shipping, so I checked the checkout page instead."),
+                    .tool(tool("d4", "navigate", #"{"tab":"abc123","url":"https://vivo.com/checkout"}"#, #"{"ok":true}"#)),
+                    .tool(tool("d5", "act.fill", #"{"tab":"abc123","ref":"e9","value":"1"}"#, #"{"ok":true}"#,
+                               why: "Ruling out cheaper imports")),
+                    .text("The **lamp is $64.99 with free shipping** — under your $80 budget. [vivo.com](https://vivo.com/lamp) has it in stock, and the checkout page confirms the total."),
+                ],
+                workedFor: 243,
+                model: "codex/gpt-6-luna"),
+            AskMessage(role: .you, text: "How does it compare to the IKEA one?"),
+            AskMessage(
+                role: .agent, text: "",
+                blocks: [
+                    .tool(tool("d6", "navigate", #"{"tab":"abc124","url":"https://ikea.com/forsa"}"#, #"{"ok":true}"#)),
+                    .tool(tool("d7", "read_text", #"{"tab":"abc124"}"#, #"{"chars":8211}"#)),
+                    .text("The FORSÅ is $59.99 but shipping adds $19, so the vivo lamp ends up cheaper overall."),
+                ],
+                workedFor: 38,
+                model: "codex/gpt-6-luna"),
+            AskMessage(role: .you, text: "One with a warm bulb?"),
+            // The live turn, mid-flight: a paragraph, a settled call, a
+            // paragraph, then a call still out — the open accordion's
+            // "Working for Ns" ticks while its last row spins.
+            AskMessage(
+                role: .agent, text: "",
+                blocks: [
+                    .text("Checking the vivo listing's bulb options."),
+                    .tool(tool("d8", "navigate", #"{"tab":"abc123","url":"https://vivo.com/lamp"}"#, #"{"ok":true}"#)),
+                    .text("One of the two finishes ships with a 2700K bulb — confirming it's the dimmable one."),
+                    .tool(AskMessage.Tool(id: "d9", name: "snapshot", args: #"{"tab":"abc123"}"#)),
+                ],
+                model: "codex/gpt-6-luna"),
+        ]
+        first.turnStartedAt = Date().addingTimeInterval(-47)
+        chats.insert(first, at: 0)
+        AskStore.save(first)
+        currentID = first.id
+        demoRunning = true
+        runningChatID = first.id
+        activity = "reading the page"
     }
 
     /// A probe-world lever for the composer's chips (`defaults write
@@ -679,12 +1131,26 @@ final class Mind: ObservableObject {
         attachments.append(AskAttach.picked(file, image: false))
         attachments.append(.site(URL(string: "https://example.com")!))
     }
+
+    /// Every probe-world lever fired once, for whichever Ask surface is
+    /// appearing — the rail and the Ask window share this so test hooks
+    /// run identically from either (fullscreen-features §2).
+    func demoHooks(_ browser: Browser) {
+        demoCards()
+        demoAttach(browser)
+        demoStream()
+    }
     #endif
 
     private func store(_ chat: AskChat) {
         guard let at = chats.firstIndex(where: { $0.id == chat.id }) else { return }
-        chats[at] = chat
-        AskStore.save(chat)
+        var copy = chat
+        // The list orders by last activity — a chat that just heard
+        // something bubbles up instead of sitting at its birthday.
+        copy.when = Date()
+        chats[at] = copy
+        chats.sort { $0.when > $1.when }
+        AskStore.save(copy)
     }
 
     static func savedModel() -> AskModel {
@@ -817,10 +1283,16 @@ enum AskStore {
         let url = folder
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { return [] }
         return names.compactMap { name -> AskChat? in
-            guard name.hasSuffix(".json"),
-                  let data = try? Data(contentsOf: url.appendingPathComponent(name)),
+            guard name.hasSuffix(".json") else { return nil }
+            let file = url.appendingPathComponent(name)
+            guard let data = try? Data(contentsOf: file),
                   let chat = try? JSONDecoder().decode(AskChat.self, from: data)
-            else { return nil }
+            else {
+                // A chat that won't decode is set aside, not silently
+                // lost — the file stays recoverable beside its siblings.
+                Store.quarantine(file)
+                return nil
+            }
             return chat
         }.sorted { $0.when > $1.when }
     }

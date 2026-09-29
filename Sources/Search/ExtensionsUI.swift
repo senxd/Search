@@ -32,7 +32,6 @@ struct ExtensionsPage: View {
                                 .foregroundStyle(Palette.ink)
                             Spacer(minLength: 8)
                             Pill("Open the Store") {
-                                browser.tuning = false
                                 browser.open(Browser.webStore, foreground: true)
                             }
                         }

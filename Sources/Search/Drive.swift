@@ -24,6 +24,10 @@ import WebKit
 enum DriveOrigin: Hashable {
     case app
     case socket(UUID)
+    /// An unattended run (Routines.swift): the *routine's* id is the
+    /// session — its tabs, leases and remembered always-rules outlive
+    /// any single run of it.
+    case routine(UUID)
 
     /// The routing tag an event's `_session` carries: who it is for. Never
     /// goes on the wire — the socket strips it while fanning out.
@@ -31,6 +35,7 @@ enum DriveOrigin: Hashable {
         switch self {
         case .app: return "app"
         case .socket(let id): return "sock-" + id.uuidString
+        case .routine(let id): return "routine-" + id.uuidString.prefix(8)
         }
     }
 }
@@ -45,6 +50,7 @@ extension Driving {
 }
 
 final class Drive: Driving {
+    private static let agentWorld = WKContentWorld.world(name: "SearchAgent")
     /// The window's state, never owned: `AskRuntime.drive` is put up in
     /// Browser.init and the browser outlives everything that asks it things.
     unowned let browser: Browser
@@ -95,7 +101,10 @@ final class Drive: Driving {
         var summary: String
         var host: String
         var finish: ([String: Any]) -> Void
+        var evidence: [String: Any]?
     }
+    @MainActor private var guardChecks = Set<DriveOrigin>()
+    @MainActor private var guardGeneration: [DriveOrigin: Int] = [:]
     @MainActor private var pendingApprovals: [UUID: PendingApproval] = [:]
 
     /// The chat the `.app` session last sent into — learned in `ask`,
@@ -169,9 +178,13 @@ final class Drive: Driving {
     /// is still its own, before the fd can be handed out again.
     @MainActor
     func leave(_ origin: DriveOrigin) {
+        AgentInteractions.shared.release(origin)
+        for id in Array(inspectorClients.keys) { releaseInspector(id, from: origin) }
+        inspectorEvents[origin] = nil
+        inspectorDropped[origin] = nil
         guard let share = sessions.removeValue(forKey: origin) else { return }
         for id in share.mine {
-            if let tab = browser.tabs.first(where: { $0.id == id }), tab.bench {
+            if let tab = browser.allTabs.first(where: { $0.id == id }), tab.bench {
                 browser.close(tab)
             }
         }
@@ -180,7 +193,7 @@ final class Drive: Driving {
         // place on the watched row.
         for id in share.attached {
             let held = sessions.values.contains { $0.attached.contains(id) || $0.mine.contains(id) }
-            if !held, let tab = browser.tabs.first(where: { $0.id == id }), !tab.bench {
+            if !held, let tab = browser.allTabs.first(where: { $0.id == id }), !tab.bench {
                 grantedTabs.remove(Bench.short(tab))
                 seen.removeValue(forKey: id)
             }
@@ -193,6 +206,232 @@ final class Drive: Driving {
         // The closed rows — if anyone subscribed — announce themselves in
         // the diff, which also sweeps whatever state of theirs remains.
         diff()
+    }
+
+    /// A run ended — the routine's tab work is done: its parked asks settle
+    /// denied, its bench tabs close, its leases and attaches release. Unlike
+    /// `leave` the session's remembered always-rules and mode SURVIVE —
+    /// consent belongs to the routine, and the next run inherits it.
+    @MainActor
+    func endRun(_ origin: DriveOrigin) {
+        denyPending(for: origin, reason: "the run ended")
+        AgentInteractions.shared.release(origin)
+        for id in Array(inspectorClients.keys) { releaseInspector(id, from: origin) }
+        inspectorEvents[origin] = nil
+        inspectorDropped[origin] = nil
+        guard let share = sessions.removeValue(forKey: origin) else { diff(); return }
+        for id in share.mine {
+            if let tab = browser.allTabs.first(where: { $0.id == id }), tab.bench {
+                browser.close(tab)
+            }
+        }
+        // Attached user tabs lapse the way a detach leaves them — a routine
+        // only ever holds one while a live chat's chip covers it.
+        for id in share.attached {
+            let held = sessions.values.contains { $0.attached.contains(id) || $0.mine.contains(id) }
+            if !held, let tab = browser.allTabs.first(where: { $0.id == id }), !tab.bench {
+                grantedTabs.remove(Bench.short(tab))
+                seen.removeValue(forKey: id)
+            }
+        }
+        diff()
+    }
+
+    @MainActor private var inspectors: [UUID: AgentInspector] = [:]
+    @MainActor private var inspectorClients: [UUID: Set<DriveOrigin>] = [:]
+    @MainActor private var inspectorEvents: [DriveOrigin: [UUID: [[String: Any]]]] = [:]
+    @MainActor private var inspectorDropped: [DriveOrigin: [UUID: Int]] = [:]
+    @MainActor private var inspectorArtifacts: [UUID: Set<String>] = [:]
+
+    @MainActor
+    private func saveInspectorArtifact(_ value: [String: Any], tab: UUID) throws -> [String: Any] {
+        let result = try AgentInspectorArtifact.write(json: value, directory: Store.file("inspector-artifacts"))
+        if let artifact = result["artifact"] as? [String: Any], let path = artifact["path"] as? String {
+            for id in Array(inspectorArtifacts.keys) {
+                let kept = Set((inspectorArtifacts[id] ?? []).filter { FileManager.default.fileExists(atPath: $0) })
+                inspectorArtifacts[id] = kept.isEmpty ? nil : kept
+            }
+            inspectorArtifacts[tab, default: []].insert(path)
+        }
+        return result
+    }
+
+    @MainActor
+    private func releaseInspector(_ id: UUID, from origin: DriveOrigin) {
+        inspectors[id]?.release(owner: origin.tag)
+        inspectorClients[id]?.remove(origin)
+        inspectorEvents[origin]?[id] = nil
+        inspectorDropped[origin]?[id] = nil
+        if inspectorClients[id]?.isEmpty == true {
+            inspectors.removeValue(forKey: id)?.disconnect()
+            inspectorClients[id] = nil
+        }
+    }
+
+    @MainActor
+    private func inspect(_ op: String, _ args: [String: Any], from origin: DriveOrigin,
+                         done: @escaping ([String: Any]) -> Void) {
+        guard let tab = own(args, done, origin), let web = view(of: tab, done) else { return }
+        if op == "inspector.read" {
+            guard let path = args["path"] as? String, inspectorArtifacts[tab.id]?.contains(path) == true else {
+                done(["error": "artifact does not belong to this tab", "code": "NOT_FOUND"]); return
+            }
+            let offset = (args["offset"] as? NSNumber)?.doubleValue ?? 0
+            let length = (args["length"] as? NSNumber)?.doubleValue ?? 16_384
+            guard offset >= 0, offset <= Double(128 * 1024 * 1024), offset.rounded() == offset,
+                  length >= 4, length <= 65_536, length.rounded() == length else {
+                done(["error": "offset must be a nonnegative byte index; length must be 4...65536"]); return
+            }
+            do {
+                let file = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+                defer { try? file.close() }
+                let size = try file.seekToEnd()
+                try file.seek(toOffset: UInt64(offset))
+                var data = try file.read(upToCount: Int(length)) ?? Data()
+                var start = Int(offset)
+                while let first = data.first, first & 0xC0 == 0x80 { data.removeFirst(); start += 1 }
+                for _ in 0..<3 where String(data: data, encoding: .utf8) == nil { data.removeLast() }
+                done(["text": String(decoding: data, as: UTF8.self), "offset": start,
+                      "nextOffset": start + data.count, "eof": start + data.count >= size])
+            } catch { done(["error": error.localizedDescription, "code": "ARTIFACT_EXPIRED"]) }
+            return
+        }
+        if op == "inspector.detach" {
+            releaseInspector(tab.id, from: origin)
+            done(["detached": true]); return
+        }
+        if op == "inspector.events" {
+            let pending = inspectorEvents[origin]?[tab.id] ?? []
+            let events = pending.filter { event in
+                guard let artifact = event["artifact"] as? [String: Any],
+                      let path = artifact["path"] as? String else { return true }
+                return FileManager.default.fileExists(atPath: path)
+            }
+            let dropped = (inspectorDropped[origin]?[tab.id] ?? 0) + pending.count - events.count
+            inspectorEvents[origin]?[tab.id] = []
+            inspectorDropped[origin]?[tab.id] = 0
+            done(["events": events, "dropped": dropped]); return
+        }
+        if inspectors[tab.id] == nil {
+            let inspector = AgentInspector(web: web)
+            inspectors[tab.id] = inspector
+            inspector.onEvent = { [weak self, weak tab] event in
+                guard let self, let tab else { return }
+                var event = event
+                event["tab"] = Bench.short(tab)
+                let bytes = (try? JSONSerialization.data(withJSONObject: event).count) ?? 0
+                if bytes >= 65_536 {
+                    do {
+                        let artifact = try self.saveInspectorArtifact(event, tab: tab.id)
+                        event = ["tab": Bench.short(tab), "method": event["method"] ?? "",
+                                 "targetID": event["targetID"] ?? "", "artifact": artifact["artifact"]!]
+                    } catch {
+                        event = ["tab": Bench.short(tab), "method": "Search.artifactError", "error": error.localizedDescription]
+                    }
+                }
+                for client in self.inspectorClients[tab.id] ?? [] where self.granted(tab, client) {
+                    var history = self.inspectorEvents[client]?[tab.id] ?? []
+                    if history.count >= 64 {
+                        history.removeFirst()
+                        self.inspectorDropped[client, default: [:]][tab.id, default: 0] += 1
+                    }
+                    history.append(event)
+                    self.inspectorEvents[client, default: [:]][tab.id] = history
+                    self.emit("inspector.event", event, to: client)
+                }
+            }
+        }
+        inspectorClients[tab.id, default: []].insert(origin)
+        let finish: (Result<[String: Any], Error>) -> Void = { result in
+            switch result {
+            case .success(let reply):
+                if args["save"] as? Bool == true || ((try? JSONSerialization.data(withJSONObject: reply).count) ?? 0) > 262_144 {
+                    do { done(try self.saveInspectorArtifact(reply, tab: tab.id)) }
+                    catch { done(["error": error.localizedDescription, "code": "ARTIFACT", "outcome": "unknown"]) }
+                } else { done(reply) }
+            case .failure(let error):
+                var reply: [String: Any] = ["error": error.localizedDescription, "code": "INSPECTOR"]
+                if let code = (error as? AgentInspector.Failure)?.code { reply["protocolCode"] = code }
+                if error.localizedDescription.lowercased().contains("timed out") || error.localizedDescription.lowercased().contains("disconnect") {
+                    reply["outcome"] = "unknown"
+                }
+                done(reply)
+            }
+        }
+        if op == "inspector.attach" { inspectors[tab.id]?.capabilities(completion: finish) }
+        else {
+            guard let method = args["method"] as? String,
+                  args["params"] == nil || args["params"] is [String: Any] else {
+                done(["error": "inspector.send needs method and object params"]); return
+            }
+            inspectors[tab.id]?.perform(method: method, params: args["params"] as? [String: Any] ?? [:],
+                targetID: args["targetId"] as? String, owner: origin.tag, completion: finish)
+        }
+    }
+
+    @MainActor private var cancellations: [String: AgentCancellation] = [:]
+
+    @MainActor
+    func perform(_ op: String, _ args: [String: Any], from origin: DriveOrigin,
+                 cancellation: AgentCancellation, done: @escaping ([String: Any]) -> Void) {
+        let token = UUID().uuidString
+        cancellations[token] = cancellation
+        cancellation.onCancel = { [weak self] in
+            guard let self else { return }
+            if let view = self.tab(args)?.built {
+                self.drive(view, "function(d) { (d.__guardCancelled || (d.__guardCancelled = new Set())).add(\(self.json(token))); return {ok:true}; }") { _ in }
+            }
+            let ids = self.pendingApprovals.filter { $0.value.args["_cancelToken"] as? String == token }.map(\.key)
+            for id in ids {
+                Mind.shared.removeApproval(id)
+                Routines.shared.removeApproval(id)
+                self.pendingApprovals.removeValue(forKey: id)?.finish([
+                    "error": "cancelled before approval", "code": "GUARD_CANCELLED", "guardStopped": true])
+            }
+        }
+        var args = args
+        args["_cancelToken"] = token
+        perform(op, args, from: origin) { [weak self] result in
+            cancellation.onCancel = nil
+            self?.cancellations[token] = nil
+            done(result)
+        }
+    }
+
+    @MainActor
+    private func cancelled(_ args: [String: Any], _ done: ([String: Any]) -> Void) -> Bool {
+        guard let token = args["_cancelToken"] as? String,
+              cancellations[token]?.isCancelled == true else { return false }
+        done(["error": "cancelled before the next native action", "code": "GUARD_CANCELLED", "guardStopped": true])
+        return true
+    }
+
+    @MainActor
+    func surfaceTab(_ tab: Tab) {
+        for origin in Array(sessions.keys) {
+            if sessions[origin]?.mine.remove(tab.id) != nil { sessions[origin]?.attached.insert(tab.id) }
+        }
+    }
+
+    @MainActor
+    func adoptAgentTab(_ tab: Tab, from opener: Tab) {
+        guard tab.bench else { return }
+        for origin in Array(sessions.keys) where sessions[origin]?.mine.contains(opener.id) == true {
+            sessions[origin]?.mine.insert(tab.id)
+        }
+    }
+
+    @MainActor
+    func replaceTab(_ old: Tab, with new: Tab) {
+        if let web = old.built { AgentInteractions.shared.clear(web) }
+        for origin in Array(sessions.keys) {
+            if sessions[origin]?.mine.remove(old.id) != nil { sessions[origin]?.mine.insert(new.id) }
+            if sessions[origin]?.attached.remove(old.id) != nil { sessions[origin]?.attached.insert(new.id) }
+            if sessions[origin]?.leases.remove(old.id) != nil { sessions[origin]?.leases.insert(new.id) }
+        }
+        let consented = grantedTabs.contains(Bench.short(old))
+        drop(old.id)
+        if consented { grantedTabs.insert(Bench.short(new)) }
     }
 
     // MARK: - modes
@@ -211,6 +450,10 @@ final class Drive: Driving {
             return Store.settings.string(forKey: "ask.mode").flatMap(AskMode.init(rawValue:)) ?? .guard
         case .socket:
             return .full
+        case .routine:
+            // The routine's own pick, set at dispatch — and guard when a
+            // run somehow outruns it: unattended defaults to asking.
+            return .guard
         }
     }
 
@@ -221,6 +464,17 @@ final class Drive: Driving {
     @MainActor
     func setMode(_ mode: AskMode, for origin: DriveOrigin) {
         modes[origin] = mode
+    }
+
+    /// What a tab the session opens calls itself — the app's "Ask", a
+    /// routine's own name, a socket's plain "Agent".
+    @MainActor
+    private func agentLabel(for origin: DriveOrigin) -> String {
+        switch origin {
+        case .app: return "Ask"
+        case .routine(let id): return routineName?(id) ?? "Routine"
+        case .socket: return "Agent"
+        }
     }
 
     /// The session holding a tab, if one does — the download gate in
@@ -237,17 +491,71 @@ final class Drive: Driving {
     @MainActor
     func settleApproval(_ id: UUID, _ verdict: ApprovalVerdict) {
         guard let pending = pendingApprovals.removeValue(forKey: id) else { return }
-        switch verdict {
-        case .deny:
-            pending.finish(["error": "denied by user — \(pending.summary)", "code": "DENIED"])
-        case .allow:
-            dispatch(pending.op, pending.args, pending.finish, from: pending.origin)
-        case .always:
-            remembered[pending.origin, default: []]
-                .insert(Policy.AlwaysKey(op: pending.op, host: pending.host))
-            dispatch(pending.op, pending.args, pending.finish, from: pending.origin)
+        if verdict == .deny {
+            pending.finish(["error": "Action cancelled by you", "code": "GUARD_CANCELLED", "guardStopped": true])
+            return
+        }
+        if mode(for: pending.origin) == .read {
+            pending.finish(["error": "The run is now in Read mode", "code": "GUARD_CANCELLED", "guardStopped": true])
+            return
+        }
+        // Old persisted Always verdicts now approve this action once only.
+        let generation = guardGeneration[pending.origin, default: 0]
+        guardChecks.insert(pending.origin)
+        inspectGuard(pending.op, pending.args, from: pending.origin) { [weak self] evidence in
+            guard let self else { return }
+            self.guardChecks.remove(pending.origin)
+            if self.cancelled(pending.args, pending.finish) { return }
+            guard self.guardGeneration[pending.origin, default: 0] == generation else {
+                pending.finish(["error": "Approval cancelled", "code": "GUARD_CANCELLED", "guardStopped": true]); return
+            }
+            if let error = evidence["error"] {
+                pending.finish(["error": error, "code": "GUARD_CHANGED", "guardStopped": true]); return
+            }
+            guard evidence["fingerprint"] as? String == pending.evidence?["fingerprint"] as? String else {
+                if Store.testing,
+                   let before = (pending.evidence?["fingerprint"] as? String)?.data(using: .utf8),
+                   let after = (evidence["fingerprint"] as? String)?.data(using: .utf8),
+                   let a = try? JSONSerialization.jsonObject(with: before) as? NSDictionary,
+                   let b = try? JSONSerialization.jsonObject(with: after) as? NSDictionary {
+                    let changed = a.allKeys.compactMap { $0 as? String }.filter { !NSDictionary(dictionary: ["v": a[$0] ?? NSNull()]).isEqual(to: ["v": b[$0] ?? NSNull()]) }
+                    NSLog("[guard-test] changed evidence keys: %@", changed.joined(separator: ", "))
+                }
+                self.parkApproval(pending.op, pending.args, pending.finish, from: pending.origin,
+                                  tab: self.tab(pending.args), evidence: evidence)
+                return
+            }
+            var args = pending.args
+            if pending.op.hasPrefix("act."), !["act.hover", "act.scroll"].contains(pending.op) {
+                args["_guardFingerprint"] = evidence["fingerprint"]
+                args["_guardOp"] = pending.op
+            }
+            self.dispatch(pending.op, args, pending.finish, from: pending.origin)
         }
         diff()
+    }
+
+    @MainActor
+    func refreshApproval(_ id: UUID) {
+        guard let pending = pendingApprovals.removeValue(forKey: id) else { return }
+        // Resolve the old UI card before recapturing; this never executes it.
+        if pending.origin == .app { Mind.shared.removeApproval(id) }
+        else if case .routine = pending.origin { Routines.shared.removeApproval(id) }
+        let generation = guardGeneration[pending.origin, default: 0]
+        guardChecks.insert(pending.origin)
+        inspectGuard(pending.op, pending.args, from: pending.origin) { [weak self] evidence in
+            guard let self else { return }
+            self.guardChecks.remove(pending.origin)
+            if self.cancelled(pending.args, pending.finish) { return }
+            guard self.guardGeneration[pending.origin, default: 0] == generation else {
+                pending.finish(["error": "Action cancelled", "code": "GUARD_CANCELLED", "guardStopped": true]); return
+            }
+            if let error = evidence["error"] {
+                pending.finish(["error": error, "code": "GUARD_UNAVAILABLE", "guardStopped": true]); return
+            }
+            self.parkApproval(pending.op, pending.args, pending.finish, from: pending.origin,
+                              tab: self.tab(pending.args), evidence: evidence)
+        }
     }
 
     /// Every ask one session still holds, settled denied — a stopped or
@@ -256,16 +564,19 @@ final class Drive: Driving {
     /// never resolves, so the seat has to be emptied, not waited out.
     @MainActor
     func denyPending(for origin: DriveOrigin, reason: String = "the turn ended") {
+        guardGeneration[origin, default: 0] += 1
+        guardChecks.remove(origin)
         let ids = pendingApprovals.filter { $0.value.origin == origin }.map(\.key)
         for id in ids {
             guard let pending = pendingApprovals.removeValue(forKey: id) else { continue }
-            pending.finish(["error": "denied — \(reason)", "code": "DENIED"])
+            pending.finish(["error": "Cancelled: \(reason)", "code": "GUARD_CANCELLED", "guardStopped": true])
         }
     }
 
     @MainActor
     private func serve(_ op: String, _ args: [String: Any], from origin: DriveOrigin, done: @escaping ([String: Any]) -> Void) {
         armDiff()
+        let args = args.filter { !$0.key.hasPrefix("_guard") && $0.key != "says" && $0.key != "guardCheck" }
         // Check the args before they can reach JSONSerialization: a
         // non-finite number or a non-JSON type is an uncatchable
         // NSInvalidArgumentException there, not a throw — the request
@@ -281,6 +592,8 @@ final class Drive: Driving {
             // here where an unanswered request just sits pending forever.
             guard !fired else { return }
             fired = true
+            var reply = reply
+            if reply["outcome"] as? String == "unknown" { reply["guardStopped"] = true }
             done(reply)
             MainActor.assumeIsolated {
                 guard let self, var share = self.sessions[origin], share.pending > 0 else { return }
@@ -289,31 +602,44 @@ final class Drive: Driving {
                 if share.pending == 0 { self.emit("done", [:], to: origin) }
             }
         }
-        // The gate (design/permissions.md §3): after jsonSafe, before
-        // dispatch. The op's class against the session's mode decides —
-        // allow runs it, deny refuses it (read mode's whole point is that
-        // nothing asks), ask parks the finish on a card.
         let subject = tab(args)
         let leash = mode(for: origin)
-        let recalled = remembered[origin] ?? []
-        switch Policy.check(op, args: args, mode: leash, tab: subject,
-                            remembered: recalled) {
-        case .allow:
-            // Second look for an allowed act.* whose locator is an opaque
-            // handle — the escalation reads the target's words, and a
-            // `ref`/`loc`/`css` doesn't carry them. probeDanger resolves
-            // it page-side (the priced version of the check), then the
-            // same gate decides again with `says` folded into the args.
-            if let subject, subject.built != nil,
-               Policy.probesDanger(op, args: args, mode: leash, tab: subject, remembered: recalled) {
-                probeDanger(op, args, subject, finish, from: origin, mode: leash, remembered: recalled)
-            } else {
-                dispatch(op, args, finish, from: origin)
+        let mutates = Policy.classify(op, args: args, tab: subject).rawValue > OpClass.read.rawValue
+        if mutates && (guardChecks.contains(origin) || pendingApprovals.values.contains(where: { $0.origin == origin })) {
+            finish(["error": "This run is waiting for approval", "code": "GUARD_WAITING", "guardStopped": true])
+            return
+        }
+        if leash == .guard && mutates {
+            guardChecks.insert(origin)
+            let generation = guardGeneration[origin, default: 0]
+            inspectGuard(op, args, from: origin) { [weak self] evidence in
+                guard let self else { return }
+                self.guardChecks.remove(origin)
+                guard self.guardGeneration[origin, default: 0] == generation else {
+                    finish(["error": "Action cancelled", "code": "GUARD_CANCELLED", "guardStopped": true]); return
+                }
+                if let error = evidence["error"] {
+                    finish(["error": error, "code": "GUARD_UNAVAILABLE", "guardStopped": true]); return
+                }
+                if self.cancelled(args, finish) { return }
+                let categories = (evidence["categories"] as? [String] ?? ["unverified"]).compactMap(GuardCategory.init(rawValue:))
+                if categories.contains(where: { $0.enabled }) {
+                    self.parkApproval(op, args, finish, from: origin, tab: subject, evidence: evidence)
+                } else {
+                    var checked = args
+                    if op.hasPrefix("act."), !["act.hover", "act.scroll"].contains(op) {
+                        checked["_guardFingerprint"] = evidence["fingerprint"]
+                        checked["_guardOp"] = op
+                    }
+                    self.dispatch(op, checked, finish, from: origin)
+                }
             }
-        case .deny(let why):
-            finish(["error": why, "code": "MODE"])
-        case .ask:
-            parkApproval(op, args, finish, from: origin, tab: subject)
+        } else {
+            switch Policy.check(op, args: args, mode: leash, tab: subject, remembered: []) {
+            case .allow: dispatch(op, args, finish, from: origin)
+            case .deny(let why): finish(["error": why, "code": "MODE"])
+            case .ask: parkApproval(op, args, finish, from: origin, tab: subject)
+            }
         }
         diff()
     }
@@ -324,6 +650,7 @@ final class Drive: Driving {
     /// while its card was up errors the ordinary way.
     @MainActor
     private func dispatch(_ op: String, _ args: [String: Any], _ finish: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
+        if cancelled(args, finish) { return }
         switch op {
         case "ping":
             finish(["pong": true])
@@ -331,15 +658,16 @@ final class Drive: Driving {
             // Subscribing is the socket's business — it decides which clients
             // hear events. In-app there's nothing to mark; AgentSocket owns
             // onEvent today. Either way the op answers. A `mode` arg sets the
-            // session's leash along the way — a socket's own, never `.app`'s
-            // (that's the chat's, pushed by Mind).
-            if origin != .app,
+            // session's leash along the way — a socket's own only: `.app`'s
+            // is the chat's (pushed by Mind) and a routine's is the routine's
+            // (set at dispatch) — a model must never lift its own leash.
+            if case .socket = origin,
                let mode = (args["mode"] as? String).flatMap(AskMode.init(rawValue:)) {
                 modes[origin] = mode
             }
             finish(["subscribed": true])
         case "tabs.list":
-            finish(["tabs": browser.tabs.map { Bench.shared.describe($0, in: browser) }])
+            finish(["tabs": browser.allTabs.map { Bench.shared.describe($0, in: browser) }])
         case "tabs.open":
             open(args, finish, from: origin)
         case "tabs.attach":
@@ -354,6 +682,31 @@ final class Drive: Driving {
             closeTab(args, finish, from: origin)
         case "tabs.select":
             selectTab(args, finish, from: origin)
+        case "tabs.surface":
+            guard let tab = own(args, finish, origin) else { return }
+            guard browser.surfaceAgentTab(tab, select: args["foreground"] as? Bool ?? true) else {
+                finish(["error": "tab is already a normal tab", "code": "NOT_AGENT_TAB"])
+                return
+            }
+            emit("tab.surfaced", ["id": Bench.short(tab)], to: origin)
+            finish(["id": Bench.short(tab), "surfaced": true])
+        case "inspector.attach", "inspector.send", "inspector.events", "inspector.detach", "inspector.read":
+            inspect(op, args, from: origin, done: finish)
+        case "page.dialogs", "page.dialog", "page.files":
+            guard let tab = own(args, finish, origin), let web = view(of: tab, finish) else { return }
+            let interactions = AgentInteractions.shared
+            if op == "page.dialogs" {
+                if let enabled = args["enabled"] as? Bool {
+                    finish(interactions.configure(web, session: origin, enabled: enabled) { [weak self] data in
+                        guard let self, self.granted(tab, origin) else { return }
+                        var data = data
+                        data["tab"] = Bench.short(tab)
+                        self.emit("page.dialog", data, to: origin)
+                    })
+                } else { finish(interactions.status(web, session: origin)) }
+            } else {
+                finish(interactions.answer(web, session: origin, args: args, files: op == "page.files"))
+            }
         case "page.go":
             go(args, finish, from: origin)
         case "page.back", "page.forward", "page.reload":
@@ -385,17 +738,18 @@ final class Drive: Driving {
         case "act.fill", "act.hover", "act.scroll", "act.select", "act.check", "act.submit":
             actJS(op, args, finish, from: origin)
         case "agent.tabs":
-            finish(["tabs": browser.tabs.filter(\.bench).map { Bench.shared.describe($0, in: browser) }])
+            finish(["tabs": browser.allTabs.filter(\.bench).map { Bench.shared.describe($0, in: browser) }])
         case "agent.probe":
             finish(Bench.shared.probeReport(browser))
         case "agent.lease":
             lease(args, finish, from: origin)
         case "agent.mode":
             // A socket session sets its own leash. The app's session can't
-            // move its — that's the chat's, pushed by Mind — or the model
-            // would just ask for "full" and step out from under the gate.
-            guard origin != .app else {
-                finish(["error": "the app's mode is its chat's — set it in Ask"])
+            // move its — that's the chat's, pushed by Mind — and a routine's
+            // is the routine's, set at dispatch — or the model would just
+            // ask for "full" and step out from under the gate.
+            guard case .socket = origin else {
+                finish(["error": "this session's mode is set by its owner — sockets set their own only"])
                 return
             }
             guard let to = args["to"] as? String else {
@@ -409,53 +763,107 @@ final class Drive: Driving {
             modes[origin] = parsed
             finish(["mode": parsed.rawValue])
         case "ui.ask":
-            ask(args, finish)
+            // Posting/steering as the user is the interactive chat's door —
+            // an unattended run reaching it is prompt injection into the
+            // session that holds the grants, whatever its mode says.
+            if case .routine = origin {
+                finish(["error": "ui.ask is the app's door — a run can't speak for the user"])
+            } else {
+                ask(args, finish)
+            }
         default:
             finish(["error": "unknown op “\(op)”"])
         }
         diff()
     }
 
-    /// The escalation's priced half (AskPolicy.dangerHit): a `ref`/`loc`/
-    /// `css` locator names the target without carrying its accessible
-    /// name, so a guard-mode act.* the args allowed gets one read-only
-    /// `resolve` for the element's {role,name} — folded back as `says`,
-    /// the gate checked once more, and the op dispatched or parked on the
-    /// answer. Any failure — a stale ref, a page that won't say — falls
-    /// through to dispatch, where the act's own resolve reports it the
-    /// honest way.
+    /// Resolve the actual page effect; tool-supplied labels never decide consent.
     @MainActor
-    private func probeDanger(_ op: String, _ args: [String: Any], _ subject: Tab,
-                             _ finish: @escaping ([String: Any]) -> Void, from origin: DriveOrigin,
-                             mode: AskMode, remembered: Set<Policy.AlwaysKey>) {
-        guard let view = subject.built else {
-            dispatch(op, args, finish, from: origin)
+    private func inspectGuard(_ op: String, _ args: [String: Any], from origin: DriveOrigin,
+                              done: @escaping ([String: Any]) -> Void) {
+        if op == "act.type", let text = args["text"] as? String, text.contains("\n") || text.contains("\r") {
+            done(["error": "Use fill for multiline text, then a separate Enter action so submission can be reviewed.", "code": "GUARD_UNAVAILABLE"])
             return
         }
-        let verb = String(op.dropFirst(4))
-        drive(view, """
-        function (d) {
-          var el = d.resolve(\(json(query(verb, args))));
-          var dr = el.__driveRef || {};
-          var attr = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('placeholder'))) || '';
-          var says = ((dr.role || '') + ' ' + (dr.name || '') + ' ' + attr + ' ' + ((el.innerText || el.value || '') + ''));
-          return { says: says.slice(0, 400) };
+        if op.hasPrefix("act."), !["act.hover", "act.scroll"].contains(op) {
+            guard let subject = own(args, done, origin), let view = view(of: subject, done) else { return }
+            drive(view, "function(d) { return (\(GuardPage.inspect))(d, \(json(op)), \(json(actArgs(args)))); }") { out in
+                MainActor.assumeIsolated { done(out) }
+            }
+            return
         }
-        """) { [weak self] out in
+        if args["tab"] != nil, own(args, done, origin) == nil { return }
+        let subject = tab(args)
+        let categories = Policy.categories(op, args: args, tab: subject)
+        let material = ["op": op, "args": args.filter { !$0.key.hasPrefix("_") },
+                        "url": subject?.address?.absoluteString ?? "", "tab": subject?.id.uuidString ?? ""] as [String: Any]
+        let fingerprint = (try? JSONSerialization.data(withJSONObject: material, options: [.sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        var evidence: [String: Any] = ["categories": categories.map(\.rawValue),
+              "summary": Policy.describe(op, args: args, tab: subject),
+              "details": (categories.contains(.unverified) ? "This operation's effects cannot be verified. Review its full scope before allowing it.\n" : "") + (categories.isEmpty ? "" : json(args.filter { !$0.key.hasPrefix("_") && $0.key != "why" })),
+              "actionLabel": categories.contains(.sharing) ? "Share files" : "Allow action",
+              "fingerprint": fingerprint, "sensitive": true,
+              "url": subject?.address?.absoluteString ?? ""]
+        guard !categories.isEmpty, let view = subject?.built else { done(evidence); return }
+        drive(view, "function(d) { return (\(GuardPage.inspect))(d, 'guard.context', {}); }") { out in
             MainActor.assumeIsolated {
-                guard let self else { return }
-                var said = args
-                if let words = out["says"] as? String, !words.isEmpty { said["says"] = words }
-                switch Policy.check(op, args: said, mode: mode, tab: subject, remembered: remembered) {
-                case .allow:
-                    self.dispatch(op, args, finish, from: origin)
-                case .deny(let why):
-                    finish(["error": why, "code": "MODE"])
-                case .ask:
-                    self.parkApproval(op, args, finish, from: origin, tab: subject)
+                guard out["error"] == nil, let page = out["fingerprint"] as? String else {
+                    done(["error": "Cannot inspect the page for approval", "code": "GUARD_UNAVAILABLE"]); return
                 }
+                evidence["fingerprint"] = fingerprint + page
+                evidence["sensitive"] = out["sensitive"]
+                done(evidence)
             }
         }
+    }
+
+    /// Checked immediately before native input as well as when the card resolves.
+    @MainActor
+    private func validateGuard(_ view: PageView, _ args: [String: Any], _ done: @escaping ([String: Any]) -> Void, at point: [Double]? = nil,
+                               perform: @escaping () -> Void) {
+        guard let expected = args["_guardFingerprint"] as? String,
+              let op = args["_guardOp"] as? String else { perform(); return }
+        let hitCheck: String
+        if let point {
+            hitCheck = """
+            var target = d.resolve(\(json(query("click", args))));
+            var hit = document.elementFromPoint(\(point[0]), \(point[1]));
+            while (hit && hit.tagName === 'IFRAME' && hit.contentDocument && target.ownerDocument !== hit.ownerDocument) {
+              var box = hit.getBoundingClientRect();
+              hit = hit.contentDocument.elementFromPoint(\(point[0]) - box.left, \(point[1]) - box.top);
+            }
+            if (!hit || !(hit === target || target.contains(hit))) return {error:'Click target moved or is covered'};
+            """
+        } else { hitCheck = "" }
+        drive(view, "function(d) { \(hitCheck) return (\(GuardPage.inspect))(d, \(json(op)), \(json(actArgs(args)))); }") { out in
+            MainActor.assumeIsolated {
+                if self.cancelled(args, done) { return }
+                guard out["error"] == nil, out["fingerprint"] as? String == expected else {
+                    done(["error": "The action changed. Review it again before continuing.", "code": "GUARD_CHANGED", "guardStopped": true]); return
+                }
+                perform()
+            }
+        }
+    }
+
+    @MainActor
+    private func guardCall(_ op: String, _ args: [String: Any], query: Any, verb: String) -> String {
+        let plain = json(actArgs(args))
+        guard let expected = args["_guardFingerprint"] as? String else {
+            return "function(d) { return d.act(\(json(verb)), \(json(query)), \(plain)); }"
+        }
+        return """
+        function(d) {
+          var args = \(plain);
+          args.guardCheck = function() {
+            if (d.__guardCancelled && d.__guardCancelled.has(\(json(args["_cancelToken"] ?? "")))) return false;
+            var fresh = (\(GuardPage.inspect))(d, \(json(op)), args);
+            return !fresh.error && fresh.fingerprint === \(json(expected));
+          };
+          return d.act(\(json(verb)), \(json(query)), args);
+        }
+        """
     }
 
     /// One event out. `to` scopes it to a single session — a `done` or a
@@ -529,47 +937,79 @@ final class Drive: Driving {
     /// the same door `ui.ask` uses: `Mind.raise`. Socket sessions never
     /// get here: the wire owns no UI and its patience timer answers in 30s
     /// regardless, so their `ask` verdict resolves as the honest error.
+    ///
+    /// Who catches a parked card an unattended origin raises — the
+    /// routines controller parks it on the live run's waitingApprovals.
+    /// The sink owns the card's chat: it stamps the run's, never Mind's.
+    /// Registered at start; nil means nothing out there can show a card
+    /// and the op takes the honest NEEDS_UI the wire always got.
+    @MainActor var approvalSink: ((AskApproval, DriveOrigin) -> Void)?
+    /// The routine's name for a bench tab it opens — set by the
+    /// controller so the tab reads "nightly report", not "Agent".
+    @MainActor var routineName: ((UUID) -> String?)?
+
     @MainActor
     private func parkApproval(_ op: String, _ args: [String: Any], _ finish: @escaping ([String: Any]) -> Void,
-                              from origin: DriveOrigin, tab subject: Tab?) {
-        guard origin == .app else {
+                              from origin: DriveOrigin, tab subject: Tab?, evidence: [String: Any]? = nil) {
+        // Where the card goes up: the app's chat rail, or the live run's
+        // parked list through the sink. Anything else owns no UI — the
+        // wire's answer is the same error it has always been.
+        let raise: ((AskApproval) -> Void)?
+        switch origin {
+        case .app:
+            raise = { Mind.shared.raise($0) }
+        case .routine:
+            raise = approvalSink.map { sink in { sink($0, origin) } }
+        case .socket:
+            raise = nil
+        }
+        guard let raise else {
             finish(["error": "\(op) needs approval — the wire can't be shown a card",
                     "code": "NEEDS_UI"])
             return
         }
         let id = UUID()
-        // The chat the card lives in: the panel's current; failing that,
-        // the chat this session last sent into (appChat — kept for exactly
-        // this gap, currentID nil'd mid-turn); failing that, the newest
-        // on record, checked so a deleted chat can't be named. With no
-        // chat anywhere the card still raises — invisible but settleable —
-        // and the miss is logged rather than silent.
-        let chat = Mind.shared.currentID
-            ?? appChat.flatMap { id in Mind.shared.chats.contains(where: { $0.id == id }) ? id : nil }
-            ?? Mind.shared.chats.first?.id
-        if chat == nil {
-            NSLog("[drive] approval for %@ found no chat to live in — raising anyway", op)
+        // The chat the card lives in: for .app, the panel's current;
+        // failing that, the chat this session last sent into (appChat —
+        // kept for exactly this gap, currentID nil'd mid-turn); failing
+        // that, the newest on record, checked so a deleted chat can't be
+        // named. For a routine the sink stamps the run's chat — what
+        // stands in here is only a placeholder that never leaves Drive.
+        let chat: UUID?
+        if case .routine = origin {
+            chat = nil
+        } else {
+            chat = Mind.shared.runningChatID ?? Mind.shared.currentID
+                ?? appChat.flatMap { id in Mind.shared.chats.contains(where: { $0.id == id }) ? id : nil }
+                ?? Mind.shared.chats.first?.id
+            if chat == nil {
+                NSLog("[drive] approval for %@ found no chat to live in — raising anyway", op)
+            }
         }
         var approval = AskApproval(
             id: id,
             chat: chat ?? UUID(),
             op: op,
-            summary: Policy.describe(op, args: args, tab: subject),
+            summary: evidence?["summary"] as? String ?? Policy.describe(op, args: args, tab: subject),
             why: (args["why"] as? String).flatMap { $0.isEmpty ? nil : $0 },
             tabID: subject.map(Bench.short),
-            host: Policy.host(of: subject, args: args))
+            host: (evidence?["url"] as? String).flatMap { URL(string: $0)?.host } ?? Policy.host(of: subject, args: args))
+        approval.categories = (evidence?["categories"] as? [String])?.compactMap(GuardCategory.init(rawValue:))
+        approval.details = evidence?["details"] as? String
+        approval.actionLabel = evidence?["actionLabel"] as? String
         pendingApprovals[id] = PendingApproval(
             origin: origin, op: op, args: args,
-            summary: approval.summary, host: approval.host ?? "", finish: finish)
+            summary: approval.summary, host: approval.host ?? "", finish: finish, evidence: evidence)
         // Evidence: the tab as it stands. `built` only — the card is never
         // the reason a view exists. The shot lands on the card when it
         // can; the raise itself doesn't wait on paint.
-        guard let view = subject?.built else {
-            Mind.shared.raise(approval)
+        guard let view = subject?.built, evidence?["sensitive"] as? Bool == false else {
+            approval.previewUnavailable = "Preview omitted because it may contain credentials or unverified content."
+            raise(approval)
             return
         }
         let file = shotsFolder().appendingPathComponent("approval-\(id.uuidString).png")
-        Bench.shared.shoot(view, to: file, width: 480) { [weak self] out in
+        Bench.shared.shoot(view, to: file, width: 1000) { [weak self] out in
             // The ask may have settled while the shot painted — a stop or
             // denyPending answering it mid-flight. Raising now would post
             // a zombie card nobody can settle, so the seat's existence is
@@ -579,8 +1019,21 @@ final class Drive: Driving {
                     try? FileManager.default.removeItem(at: file)
                     return
                 }
-                approval.shotPath = out["path"] as? String
-                Mind.shared.raise(approval)
+                self.drive(view, "function(d) { return (\(GuardPage.inspect))(d, 'guard.context', {}); }") { context in
+                    MainActor.assumeIsolated {
+                        guard self.pendingApprovals[id] != nil else {
+                            try? FileManager.default.removeItem(at: file); return
+                        }
+                        if context["error"] != nil || context["sensitive"] as? Bool != false {
+                            try? FileManager.default.removeItem(at: file)
+                            approval.previewUnavailable = "Preview omitted because the page may contain credentials."
+                        } else {
+                            approval.shotPath = out["path"] as? String
+                            if approval.shotPath == nil { approval.previewUnavailable = "Preview unavailable. Review the action details before continuing." }
+                        }
+                        raise(approval)
+                    }
+                }
             }
         }
     }
@@ -599,6 +1052,8 @@ final class Drive: Driving {
         // session gets nothing else.
         let fresh = args["fresh"] as? Bool == true || mode(for: origin) == .read
         let tab = browser.benchOpen(url, shy: fresh)
+        tab.agentGroup = origin.tag
+        tab.agentName = String((args["agentName"] as? String ?? agentLabel(for: origin)).prefix(80))
         sessions[origin, default: Share()].mine.insert(tab.id)
         Bench.shared.house(tab)
         // Selecting on the real window is deliberately allowed for a tab the
@@ -694,16 +1149,25 @@ final class Drive: Driving {
         // closed has already left all three by way of `drop`.
         let ended = grantedTabs
         grantedTabs.removeAll()
-        let ids = Set(browser.tabs.filter { !$0.bench && ended.contains(Bench.short($0)) }.map(\.id))
-        for who in sessions.keys {
+        var revoked = Set<UUID>()
+        for who in Array(sessions.keys) {
+            let attached = sessions[who]?.attached ?? []
+            let ids = Set(browser.allTabs.filter {
+                !$0.bench && (ended.contains(Bench.short($0)) || (who == .app && attached.contains($0.id)))
+            }.map(\.id))
+            revoked.formUnion(ids)
             sessions[who]?.attached.subtract(ids)
+            for id in ids {
+                if sessions[who]?.leases.remove(id) != nil {
+                    emit("lease.lost", ["id": String(id.uuidString.prefix(8)).lowercased()], to: who)
+                }
+                releaseInspector(id, from: who)
+                if let web = browser.allTabs.first(where: { $0.id == id })?.built {
+                    AgentInteractions.shared.release(web, session: who)
+                }
+            }
         }
-        for id in ids {
-            // A held lease ends with the consent it rode on — `lease.lost`
-            // goes to the session that was holding it, as on a real touch.
-            release(id)
-            // Off the watched row without a `tab.closed` for a tab that is
-            // still open — the same forgetting a detach does.
+        for id in revoked where !sessions.values.contains(where: { $0.attached.contains(id) || $0.mine.contains(id) }) {
             seen.removeValue(forKey: id)
         }
         // The chat's asks and its remembered always-rules die with its
@@ -726,6 +1190,8 @@ final class Drive: Driving {
         // holds the tab the chip's grant is in use, and a rider releasing
         // its own attach mustn't burn it. A tab the session opened stays
         // `mine` regardless — detaching isn't disowning.
+        releaseInspector(tab.id, from: origin)
+        if let web = tab.built { AgentInteractions.shared.release(web, session: origin) }
         sessions[origin]?.attached.remove(tab.id)
         sessions[origin]?.leases.remove(tab.id)
         let held = sessions.values.contains { $0.attached.contains(tab.id) || $0.mine.contains(tab.id) }
@@ -746,6 +1212,8 @@ final class Drive: Driving {
     /// to whoever is listening.
     @MainActor
     private func drop(_ id: UUID) {
+        inspectorArtifacts[id] = nil
+        for client in inspectorClients[id] ?? [] { releaseInspector(id, from: client) }
         grantedTabs.remove(String(id.uuidString.prefix(8)).lowercased())
         for origin in Array(sessions.keys) {
             sessions[origin]?.attached.remove(id)
@@ -910,8 +1378,9 @@ final class Drive: Driving {
     /// so a commit mid-call still answers `navChanged`; any other op dying
     /// the same death produced nothing and is the error `navigated mid-call`.
     @MainActor
-    private func drive(_ view: PageView, _ call: String, mutating: Bool = false, _ done: @escaping ([String: Any]) -> Void) {
+    private func drive(_ view: PageView, _ call: String, mutating: Bool = false, world: WKContentWorld = Drive.agentWorld, _ done: @escaping ([String: Any]) -> Void) {
         let js = """
+        window.__driveRefNamespace = \(world == .page ? "'code-'" : "''");
         \(AskJS.load("drive.js"))
         ;return (async function () {
           var d = window.__drive;
@@ -937,7 +1406,7 @@ final class Drive: Driving {
         """
         // A navigation mid-call tears the context down before the completion
         // can run — park the answerer so `navigated` can settle it.
-        let tab = browser.tabs.first { $0.built === view }
+        let tab = browser.allTabs.first { $0.built === view }
         let ticket = nextFlight; nextFlight += 1
         var settled = false
         let settle: ([String: Any]) -> Void = { out in
@@ -947,7 +1416,7 @@ final class Drive: Driving {
             done(out)
         }
         if let tab { flying[tab.id, default: [:]][ticket] = (mutating, settle) }
-        view.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { result in
+        view.callAsyncJavaScript(js, arguments: [:], in: nil, in: world) { result in
             MainActor.assumeIsolated {
                 switch result {
                 case .success(let value):
@@ -966,7 +1435,7 @@ final class Drive: Driving {
     /// saying so is the honest answer.
     @MainActor
     private func navigated(_ view: WKWebView) {
-        guard let tab = browser.tabs.first(where: { $0.built === view }),
+        guard let tab = browser.allTabs.first(where: { $0.built === view }),
               let owed = flying.removeValue(forKey: tab.id) else { return }
         for flight in owed.values {
             flight.settle(flight.mutating
@@ -985,7 +1454,7 @@ final class Drive: Driving {
     private func snapshot(_ args: [String: Any], _ done: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
         guard let tab = own(args, done, origin), let view = view(of: tab, done) else { return }
         var opts: [String: Any] = [:]
-        for key in ["scope", "boxes", "maxChars"] { if let v = args[key] { opts[key] = v } }
+        for key in ["scope", "boxes", "maxChars", "interactive", "selector", "ref"] { if let v = args[key] { opts[key] = v } }
         drive(view, "function (d) { return d.snapshot(\(json(opts))); }", done)
     }
 
@@ -997,7 +1466,7 @@ final class Drive: Driving {
         // it, and how much the console heard meanwhile. A commit mid-run is
         // an error, not navChanged: a program torn down before it returned
         // produced nothing, whatever it was about to do.
-        drive(view, "function (d) { return d.run(\(json(js))); }", done)
+        drive(view, "function (d) { return d.run(\(json(js))); }", world: .page, done)
     }
 
     @MainActor
@@ -1010,7 +1479,7 @@ final class Drive: Driving {
           if (m) return { messages: m };
           return { messages: [] };
         }
-        """, done)
+        """, world: .page, done)
     }
 
     @MainActor
@@ -1045,15 +1514,9 @@ final class Drive: Driving {
         let marks = args["marks"] as? Bool == true
         let width = (args["width"] as? NSNumber)?.doubleValue
 
-        let mark = """
-        \(AskJS.load("drive.js"))
-        ;(window.__drive && typeof window.__drive.mark === 'function') ? window.__drive.mark() : null
-        """
-        let unmark = "(window.__drive && typeof window.__drive.unmark === 'function') ? window.__drive.unmark() : null"
-
         func finish(_ reply: [String: Any]) {
             if marks {
-                DriveJS.run(view, unmark) { _, _ in MainActor.assumeIsolated { done(reply) } }
+                drive(view, "function(d) { d.unmark(); return {ok:true}; }") { _ in done(reply) }
             } else {
                 done(reply)
             }
@@ -1097,7 +1560,7 @@ final class Drive: Driving {
             }
         }
         if marks {
-            DriveJS.run(view, mark) { _, _ in MainActor.assumeIsolated { snap(width, false) } }
+            drive(view, "function(d) { d.mark(); return {ok:true}; }") { _ in snap(width, false) }
         } else {
             snap(width, false)
         }
@@ -1121,7 +1584,7 @@ final class Drive: Driving {
     /// the page is not the card's business.
     @MainActor
     private func actArgs(_ args: [String: Any]) -> [String: Any] {
-        args.filter { $0.key != "tab" && !Policy.gateKeys.contains($0.key) }
+        args.filter { $0.key != "tab" && $0.key != "_cancelToken" && !$0.key.hasPrefix("_guard") && !Policy.gateKeys.contains($0.key) }
     }
 
     /// A mutating action through drive.js, with a fresh snapshot folded in
@@ -1137,7 +1600,7 @@ final class Drive: Driving {
             if (args["ref"] as? String) == "page" { q = "page" }
             else if (q as? [String: Any])?.isEmpty == true { q = NSNull() }
         }
-        drive(view, "function (d) { return d.act(\(json(verb)), \(json(q)), \(json(actArgs(args)))); }", mutating: true) { [weak self] out in
+        drive(view, guardCall(op, args, query: q, verb: verb), mutating: true) { [weak self] out in
             MainActor.assumeIsolated {
                 // drive.js folds a fresh snapshot in itself when asked; this
                 // is the backstop for one that doesn't know withSnapshot.
@@ -1159,73 +1622,29 @@ final class Drive: Driving {
     /// through bench's finder for `css`/`text=`, which need nothing page-side.
     @MainActor
     private func point(_ view: PageView, _ q: [String: Any], _ done: @escaping ([Double]?, String?) -> Void) {
-        if q["ref"] != nil || q["loc"] != nil {
-            drive(view, """
-            function (d) {
-              var el = d.resolve(\(json(q)));
-              if (!el) return { error: "nothing matches " + JSON.stringify(\(json(q))) };
-              el.scrollIntoView({ block: 'center', inline: 'nearest' });
-              var r = el.getBoundingClientRect();
-              return { at: [r.left + r.width / 2, r.top + r.height / 2] };
-            }
-            """) { out in
-                if let error = out["error"] as? String { done(nil, error); return }
-                done((out["at"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue }, nil)
-            }
-            return
+        drive(view, """
+        function(d) {
+          var el = d.resolve(\(json(q)));
+          el.scrollIntoView({block:'center',inline:'nearest'});
+          var r = el.getBoundingClientRect();
+          return {at:[r.left+r.width/2,r.top+r.height/2]};
         }
-        let selector = (q["css"] as? String) ?? (q["text"] as? String).map { "text=\($0)" }
-        guard let selector else {
-            done(nil, "no locator — ref, loc, css or text")
-            return
-        }
-        DriveJS.run(view, Bench.locate(selector)) { value, error in
-            if let point = value as? [Double], point.count == 2 {
-                done(point, nil)
-            } else {
-                done(nil, error ?? "nothing matches \(selector)")
-            }
+        """) { out in
+            done((out["at"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue }, out["error"] as? String)
         }
     }
 
-    /// Focus the element a locator names — the step before keys go to it the
-    /// way a person's typing would.
     @MainActor
     private func focus(_ view: PageView, _ q: [String: Any], _ done: @escaping (String?) -> Void) {
-        if q["ref"] != nil || q["loc"] != nil {
-            drive(view, """
-            function (d) {
-              var el = d.resolve(\(json(q)));
-              if (!el) return { error: "nothing matches " + JSON.stringify(\(json(q))) };
-              el.scrollIntoView({ block: 'center', inline: 'nearest' });
-              if (el.focus) el.focus();
-              return { ok: true };
-            }
-            """) { done($0["error"] as? String) }
-            return
-        }
-        let selector = (q["css"] as? String) ?? (q["text"] as? String).map { "text=\($0)" }
-        guard let selector else { done(nil); return }
-        DriveJS.run(view, """
-        (function () {
-          var s = \(json(selector)), el = null;
-          if (s.indexOf('text=') === 0) {
-            var want = s.slice(5).trim().toLowerCase();
-            el = Array.prototype.find.call(document.querySelectorAll('button, a, [role=button], input[type=submit], input, textarea'), function (e) {
-              return ((e.innerText || e.value || '').trim().toLowerCase()) === want;
-            }) || null;
-          } else {
-            el = document.querySelector(s);
-          }
-          if (!el) return 'nothing matches ' + s;
-          el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        guard !q.isEmpty else { done(nil); return }
+        drive(view, """
+        function(d) {
+          var el = d.resolve(\(json(q)));
+          el.scrollIntoView({block:'center',inline:'nearest'});
           if (el.focus) el.focus();
-          return 'ok';
-        })()
-        """) { value, error in
-            let said = value as? String
-            done(said == "ok" ? nil : (error ?? said ?? "nothing matches \(selector)"))
+          return {ok:true};
         }
+        """) { out in done(out["error"] as? String) }
     }
 
     /// A real press at a page point — down and up on the view itself, the way
@@ -1350,20 +1769,25 @@ final class Drive: Driving {
         guard let tab = own(args, done, origin), let view = view(of: tab, done) else { return }
         let q = query("click", args)
         var callArgs = actArgs(args)
-        callArgs["tier"] = tier == "event" ? "event" : "auto"
+        callArgs["tier"] = "event"
         // The driver does the actionability work — scrolls, waits the box
         // still, asks what sits at the centre — and for the event tier hands
         // the point back rather than clicking: the trusted part is ours.
-        drive(view, "function (d) { return d.act('click', \(json(q)), \(json(callArgs))); }", mutating: true) { [weak self] out in
+        callArgs["_guardFingerprint"] = args["_guardFingerprint"]
+        callArgs["_guardOp"] = args["_guardOp"]
+        drive(view, guardCall("act.click", callArgs, query: q, verb: "click"), mutating: true) { [weak self] out in
             MainActor.assumeIsolated {
                 guard let self else { return }
+                if self.cancelled(args, done) { return }
                 if let at = (out["at"] as? [Any])?.compactMap({ ($0 as? NSNumber)?.doubleValue }),
-                   (out["handoff"] as? String) == "event" || out["escalate"] as? Bool == true || out["ignored"] as? Bool == true {
-                    self.handClick(view, out: out, at: at, args: args, done)
+                   (out["handoff"] as? String) == "event" {
+                    self.validateGuard(view, args, done, at: at) {
+                        self.handClick(view, out: out, at: at, args: args, done)
+                    }
                     return
                 }
                 let missing = (out["error"] as? String) == "drive.js not loaded"
-                if missing, q["ref"] == nil, q["loc"] == nil {
+                if missing, args["_guardFingerprint"] == nil, q["ref"] == nil, q["loc"] == nil {
                     // No driver in the page — but css/text are locators the
                     // bench's own finder can still take to a point.
                     self.clickResolved(view, q, args: args, done)
@@ -1377,7 +1801,7 @@ final class Drive: Driving {
     /// A handoff or escalation answer became a real click: down and up at the
     /// point the driver proved out, with its button/double/modifiers.
     @MainActor
-    private func handClick(_ view: PageView, out: [String: Any], at: [Double], args: [String: Any], _ done: ([String: Any]) -> Void) {
+    private func handClick(_ view: PageView, out: [String: Any], at: [Double], args: [String: Any], _ done: @escaping ([String: Any]) -> Void) {
         let flags = flags((out["modifiers"] as? [String]) ?? args["modifiers"] as? [String])
         let clicks = (out["double"] as? Bool ?? args["double"] as? Bool) == true ? 2 : 1
         if let error = mouse(view, at: at, button: out["button"] as? String ?? args["button"] as? String ?? "left", clicks: clicks, flags: flags) {
@@ -1389,7 +1813,14 @@ final class Drive: Driving {
         reply["tier"] = "event"
         reply["handoff"] = nil
         reply["at"] = at.map { Int($0) }
-        done(reply)
+        reply["navChanged"] = nil
+        if args["withSnapshot"] as? Bool == true {
+            drive(view, "function (d) { return d.snapshot({}); }") { snapshot in
+                if let tree = snapshot["snapshot"] { reply["snapshot"] = tree }
+                if let error = snapshot["error"] { reply["snapshotError"] = error }
+                done(reply)
+            }
+        } else { done(reply) }
     }
 
     /// The event tier with no driver to ask: bench's finder takes a css/text
@@ -1398,6 +1829,7 @@ final class Drive: Driving {
     private func clickResolved(_ view: PageView, _ q: [String: Any], args: [String: Any], _ done: @escaping ([String: Any]) -> Void) {
         point(view, q) { at, error in
             MainActor.assumeIsolated {
+                if self.cancelled(args, done) { return }
                 guard let at else { done(["error": error ?? "nothing to click"]); return }
                 let flags = self.flags(args["modifiers"] as? [String])
                 let clicks = (args["double"] as? Bool == true) ? 2 : 1
@@ -1421,12 +1853,22 @@ final class Drive: Driving {
         let pace = max((args["delay"] as? NSNumber)?.doubleValue ?? 0, 16) / 1000
         focus(view, query("type", args)) { error in
             MainActor.assumeIsolated {
+                if self.cancelled(args, done) { return }
                 if let error { done(["error": error]); return }
                 view.window?.makeFirstResponder(view)
                 let characters = Array(text)
                 var sent = 0
                 func next() {
                     MainActor.assumeIsolated {
+                        if self.cancelled(args, { result in
+                            var result = result
+                            result["typedCount"] = sent
+                            done(result)
+                        }) { return }
+                        guard self.granted(tab, origin), tab.built === view else {
+                            done(["error": "tab ownership or page changed", "code": "CANCELLED", "typedCount": sent])
+                            return
+                        }
                         if sent >= characters.count {
                             done(["ok": true, "typed": text])
                             return
@@ -1437,7 +1879,7 @@ final class Drive: Driving {
                         DispatchQueue.main.asyncAfter(deadline: .now() + pace) { next() }
                     }
                 }
-                next()
+                self.validateGuard(view, args, done) { next() }
             }
         }
     }
@@ -1452,10 +1894,13 @@ final class Drive: Driving {
         // is a different press from Enter on the page.
         focus(view, query("press", args)) { error in
             MainActor.assumeIsolated {
+                if self.cancelled(args, done) { return }
                 if let error { done(["error": error]); return }
                 view.window?.makeFirstResponder(view)
-                self.key(view, code: code, chars: chars, flags: mflags)
-                done(["ok": true, "key": name])
+                self.validateGuard(view, args, done) {
+                    self.key(view, code: code, chars: chars, flags: mflags)
+                    done(["ok": true, "key": name])
+                }
             }
         }
     }
@@ -1478,6 +1923,8 @@ final class Drive: Driving {
         }
         """) { out in
             MainActor.assumeIsolated {
+                if self.cancelled(args, done) { return }
+                self.validateGuard(view, args, done) {
                 if let error = self.mouse(view, at: [x, y], button: args["button"] as? String ?? "left", clicks: clicks, flags: flags) {
                     done(["error": error])
                     return
@@ -1485,6 +1932,7 @@ final class Drive: Driving {
                 var reply: [String: Any] = ["ok": true, "at": [Int(x), Int(y)], "tier": "event"]
                 if let element = out["element"], !(element is NSNull) { reply["element"] = element }
                 done(reply)
+                }
             }
         }
     }
@@ -1636,13 +2084,13 @@ final class Drive: Driving {
 
     @MainActor
     private func touched(_ view: PageView) {
-        guard let tab = browser.tabs.first(where: { $0.built === view }) else { return }
+        guard let tab = browser.allTabs.first(where: { $0.built === view }) else { return }
         release(tab.id)
     }
 
     // MARK: - the row as events
 
-    /// The 0.5s coalesced diff that turns `browser.tabs` into `tab.added`,
+    /// The 0.5s coalesced diff that turns `browser.allTabs` into `tab.added`,
     /// `tab.navigated`, `tab.title` and `tab.closed` — on for as long as
     /// anyone is listening.
     @MainActor
@@ -1663,7 +2111,7 @@ final class Drive: Driving {
     @MainActor
     private func diff() {
         let held = Set(sessions.values.flatMap(\.attached))
-        let watched = browser.tabs.filter { $0.bench || held.contains($0.id) }
+        let watched = browser.allTabs.filter { $0.bench || held.contains($0.id) }
         let now = Dictionary(uniqueKeysWithValues: watched.map {
             ($0.id, ($0.address?.absoluteString ?? "", $0.title))
         })

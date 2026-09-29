@@ -48,7 +48,9 @@ struct FluidSelectItem: View {
     var icon: String? = nil
     let label: String
     var disabled = false
-    var size: FluidSize = .default
+    /// Omitted follows the ambient `\.fluidSize` (the popup pins it to
+    /// the trigger's ladder step).
+    var size: FluidSize? = nil
 
     @Environment(\.fluidSelect) private var select
     @Environment(\.fluidMenuDismiss) private var menuDismiss
@@ -86,15 +88,24 @@ struct FluidSelect<Content: View>: View {
     var variant: Variant = .bordered
     var icon: String? = nil
     var error: String? = nil
-    var size: FluidSize = .default
+    var disabled = false
+    /// `size` pins trigger and popup rows to one ladder step (the source's
+    /// SizeProvider wrap around the whole compound).
+    var size: FluidSize? = nil
     @ViewBuilder var content: () -> Content
 
     @State private var open = false
     @State private var items: [Int: FluidSelectItemInfo] = [:]
     @State private var hovered = false
+    /// useKeyboardNavGate seed — whether the trigger held keyboard focus
+    /// (:focus-visible approximation) when the popup opened.
+    @State private var navSeed = false
+    @FocusState private var focused: Bool
     @Environment(\.fluidShape) private var shape
+    @Environment(\.fluidSize) private var ambientSize
 
-    private var compact: Bool { size == .compact }
+    private var resolvedSize: FluidSize { size ?? ambientSize }
+    private var compact: Bool { resolvedSize == .compact }
 
     private var selectedIndex: Int? {
         items.first { $0.value.value == selection }?.key
@@ -107,22 +118,26 @@ struct FluidSelect<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button { open.toggle() } label: {
-                HStack(spacing: size.gap) {
+            Button {
+                navSeed = focused
+                open.toggle()
+            } label: {
+                HStack(spacing: resolvedSize.gap) {
                     if let icon {
-                        FluidIcon(icon, size: size.icon, bold: hovered)
+                        FluidIcon(icon, size: resolvedSize.icon, bold: hovered)
                             .foregroundStyle(hovered ? FluidTone.foreground : FluidTone.mutedForeground)
+                            .frame(width: resolvedSize.icon, height: resolvedSize.icon)
                     }
                     Text(selectedLabel ?? placeholder)
-                        .font(.system(size: size.text))
+                        .font(.system(size: resolvedSize.text))
                         .foregroundStyle(selectedLabel == nil ? FluidTone.mutedForeground : FluidTone.foreground)
                         .lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    FluidIcon("chevron.down", size: size.icon)
+                    FluidIcon("chevron.down", size: resolvedSize.icon)
                         .foregroundStyle(hovered ? FluidTone.foreground : FluidTone.mutedForeground)
                 }
-                .padding(.horizontal, size.px)
-                .frame(height: size.controlHeight)
+                .padding(.horizontal, resolvedSize.px)
+                .frame(height: resolvedSize.controlHeight)
                 .frame(minWidth: compact ? 128 : 160)
                 .background(
                     RoundedRectangle(cornerRadius: shape.input, style: .continuous)
@@ -132,14 +147,31 @@ struct FluidSelect<Content: View>: View {
                     RoundedRectangle(cornerRadius: shape.input, style: .continuous)
                         .strokeBorder(borderColor, lineWidth: 1)
                 )
+                // focus-visible:ring-1 — the blue ring sits 1px proud of the
+                // hairline border like the source's ring utility.
+                .overlay(
+                    RoundedRectangle(cornerRadius: shape.input + 1, style: .continuous)
+                        .strokeBorder(FluidTone.focusRing, lineWidth: 1)
+                        .padding(-1)
+                        .opacity(focused ? 1 : 0)
+                )
             }
             .buttonStyle(.plain)
+            .focused($focused)
+            .disabled(disabled)
+            // disabled:opacity-50 — plain style doesn't dim on its own.
+            .opacity(disabled ? 0.5 : 1)
             .onHover { h in withAnimation(FluidSpring.fast) { hovered = h } }
             .fluidMenuPopup(
                 isPresented: $open,
                 checkedIndex: selectedIndex,
                 disabledIndices: Set(items.filter { $0.value.disabled }.map(\.key)),
                 width: nil,
+                maxHeight: 300,
+                // selectionAckMs — the pick holds the popup 300ms so the
+                // checkmark draw + selected-bg spring land before closing.
+                selectionAck: 0.3,
+                navSeed: navSeed,
                 onPick: { i in if let item = items[i], !item.disabled { selection = item.value } }
             ) {
                 content()
@@ -147,8 +179,9 @@ struct FluidSelect<Content: View>: View {
                         selection: selection,
                         select: { v in selection = v }
                     ))
+                    // SizeProvider: the pin crosses into the popup tree.
+                    .environment(\.fluidSize, resolvedSize)
             }
-            .onPreferenceChange(FluidSelectItemsKey.self) { items = $0 }
 
             if let error {
                 Text(error)
@@ -158,15 +191,20 @@ struct FluidSelect<Content: View>: View {
             }
         }
         // Hidden twin: collects item info so the trigger can show the
-        // selected label before the popup has ever opened.
+        // selected label before the popup has ever opened. hidden() drops
+        // the subtree's preferences, so it stays rendered at zero size.
         .background(
             content()
                 .environment(\.fluidSelect, FluidSelectContext(
                     selection: selection, select: { _ in }
                 ))
                 .allowsHitTesting(false)
-                .hidden()
+                .accessibilityHidden(true)
+                .opacity(0)
+                .frame(height: 0)
+                .clipped()
         )
+        .onPreferenceChange(FluidSelectItemsKey.self) { items = $0 }
     }
 
     private var borderColor: Color {

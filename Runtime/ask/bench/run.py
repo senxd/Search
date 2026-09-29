@@ -79,7 +79,7 @@ PROVIDERS = {
 
 # Guardrails (design/benchmarks.md §Guardrails): a note matching the first
 # buys one 20 s backoff + resend; the second decides the codex fallback.
-RATE_LIMIT = re.compile(r"429|rate.?limit|5\d\d", re.IGNORECASE)
+RATE_LIMIT = re.compile(r"^(?:openrouter|codex|devin) (?:429|5\d\d)\b|\brate.?limit(?:ed)?\b", re.IGNORECASE)
 BAD_MODEL = re.compile(
     r"^openrouter (400|404)|no endpoints|not a valid model", re.IGNORECASE)
 
@@ -633,6 +633,9 @@ def main():
                     print(f"[app] relaunch failed: {e}")
                     aborted = True
 
+    except BenchError as e:
+        meta["preflight_error"] = str(e)
+        print(f"[run] {e}")
     except KeyboardInterrupt:
         print("\n[run] interrupted — writing what there is")
     finally:
@@ -655,7 +658,7 @@ def main():
     skipped = sum(1 for r in rows if r.get("skipped"))
     print(f"[run] {passed} passed, {failed} failed, {skipped} skipped"
           f" — results-{stamp}.json / summary-{stamp}.md")
-    return 1 if failed else 0
+    return 1 if failed or meta.get("preflight_error") else 0
 
 
 # ---------------------------------------------------------------- preflight
@@ -688,11 +691,15 @@ def preflight(get_agent, chats_dir, suite, provider, model, relaunch):
             provider, model = "codex", basename
             continue
         if not done:
-            print("[preflight] no answer within 60 s — continuing anyway")
-        else:
-            last = agent_texts(chat)
-            print(f"[preflight] {provider}/{model}: "
-                  f"{(last[-1][:80] if last else 'note: ' + note[:80])!r}")
+            raise BenchError(f"{provider}/{model} preflight timed out")
+        if note:
+            status = re.match(r"^(?:openrouter|codex|devin) (\d{3})\b", note)
+            detail = f"HTTP {status.group(1)}" if status else "provider error"
+            raise BenchError(f"{provider}/{model} preflight failed ({detail})")
+        last = agent_texts(chat)
+        if not last or last[-1].strip() != "OK":
+            raise BenchError(f"{provider}/{model} preflight did not reply OK")
+        print(f"[preflight] {provider}/{model}: 'OK'")
         break
     return f"{provider}/{model}", fell_back, chats
 
@@ -1052,6 +1059,8 @@ def write_results(stamp, meta, rows, chats_dir):
         "| scenario | result | s | detail |",
         "|---|---|---|---|",
     ]
+    if meta.get("preflight_error"):
+        lines[6:6] = [f"Preflight failed: {meta['preflight_error']}. No scenarios scored.", ""]
     for r in rows:
         if r.get("skipped"):
             mark, detail = "skip", r.get("reason", "")

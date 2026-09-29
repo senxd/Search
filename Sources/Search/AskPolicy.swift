@@ -59,6 +59,10 @@ struct AskApproval: Identifiable, Equatable, Codable {
     /// A screenshot of the tab at ask time, when there is one.
     var shotPath: String?
     var when = Date()
+    var categories: [GuardCategory]?
+    var details: String?
+    var actionLabel: String?
+    var previewUnavailable: String?
 }
 
 /// How a card was answered — `always` remembers (op, host) for the chat.
@@ -68,7 +72,7 @@ enum ApprovalVerdict: String, Codable {
 
 /// A question the agent asked mid-turn — rendered as the pending tool row's
 /// card, answered by text or a quick pick, settled by timeout or dismissal.
-struct AskQuestion: Identifiable, Equatable {
+struct AskQuestion: Identifiable, Equatable, Codable {
     var id = UUID()
     var chat: UUID
     var text: String
@@ -107,38 +111,6 @@ enum Policy {
     /// are stripped there.
     static let gateKeys: Set<String> = ["why", "says"]
 
-    /// Words whose click spends, sends or ends — the lexicon the driving
-    /// verbs escalate on (§2's note under act.*).
-    private static let dangerLexicon = try! NSRegularExpression(
-        pattern: #"\b(buy|pay|order|purchase|subscribe|send|post|delete|transfer|confirm)\b"#,
-        options: [.caseInsensitive])
-
-    /// Ops whose `text` arg is the payload, not a locator — Drive.query's
-    /// exclusion list, mirrored: a fill or a type is told what to *enter*,
-    /// a press is told keys, a clickAt coordinates. "send the report" in
-    /// a field can't be read as "click Send" — scanning it would ask on
-    /// the act's contents instead of its target.
-    private static let payloadTextOps: Set<String> = ["act.fill", "act.type", "act.press", "act.clickAt"]
-
-    /// Best-effort escalation, guard mode only: a locator carries the
-    /// target's accessible name in the args — `text=`, `loc=`, `css=`
-    /// (except where `text` is the payload, above) and `says`, the words
-    /// Drive's probe read off the resolved element itself — so "Buy now"
-    /// read off any of them escalates the op write → destructive. A bare
-    /// `ref` ("e3") has no words to read here; probeDanger resolves it
-    /// page-side before dispatch instead.
-    private static func dangerHit(_ op: String, _ args: [String: Any]) -> Bool {
-        var keys = ["says", "loc", "css"]
-        if !payloadTextOps.contains(op) { keys.append("text") }
-        for key in keys {
-            guard let said = args[key] as? String else { continue }
-            if dangerLexicon.firstMatch(in: said, range: NSRange(said.startIndex..., in: said)) != nil {
-                return true
-            }
-        }
-        return false
-    }
-
     /// The op's weight, from the table in permissions.md §2. `tab` is the
     /// tab the request names, when it names one — the same verb on a
     /// granted user tab weighs more than on a bench tab.
@@ -159,7 +131,7 @@ enum Policy {
             // `path` expands ~ and writes anywhere the app can — a
             // filesystem write hiding inside a read op.
             return args["path"] is String ? .write : .read
-        case "tabs.open", "tabs.attach", "tabs.detach", "tabs.select", "agent.lease",
+        case "tabs.open", "tabs.attach", "tabs.detach", "tabs.select", "tabs.surface", "agent.lease",
              "page.back", "page.forward",
              "act.hover", "act.scroll", "act.click", "act.clickAt", "act.fill",
              "act.type", "act.press", "act.select", "act.check":
@@ -174,7 +146,8 @@ enum Policy {
             return .destructive    // requestSubmit() is the buy/post vector
         case "tabs.close":
             return .destructive    // bench-only already; loses the tab's state
-        case "page.eval", "page.code":
+        case "page.eval", "page.code", "page.files", "page.dialog", "page.dialogs",
+             "inspector.attach", "inspector.send", "inspector.events", "inspector.detach", "inspector.read":
             return .privileged     // arbitrary JS = the tab's whole authority
         case "ui.ask":
             // send/steer post text *as the user* into the in-app agent —
@@ -235,45 +208,56 @@ enum Policy {
         (tab?.address?.host() ?? "").lowercased()
     }
 
-    /// The verdict matrix (§3): read allows ≤ read and refuses the rest —
-    /// refused, not asked; full allows everything the door does; guard
-    /// allows ≤ write and asks on the rest, unless an Always answer
-    /// remembered this (op, host) already.
+    /// Guard evaluates page effects in Drive before dispatch. Legacy Always
+    /// keys deliberately do not bypass category settings.
     @MainActor
     static func check(_ op: String, args: [String: Any], mode: AskMode, tab: Tab?,
                       remembered: Set<AlwaysKey>) -> Verdict {
-        var klass = classify(op, args: args, tab: tab)
-        if mode == .guard, klass == .write, op.hasPrefix("act."), dangerHit(op, args) {
-            klass = .destructive
-        }
+        let klass = classify(op, args: args, tab: tab)
         switch mode {
-        case .full:
-            return .allow
+        case .full: return .allow
         case .read:
-            return klass.rawValue <= OpClass.read.rawValue
-                ? .allow
-                : .deny("\(op) is above read mode")
+            return klass.rawValue <= OpClass.read.rawValue ? .allow : .deny("\(op) is above read mode")
         case .guard:
-            if klass.rawValue <= OpClass.write.rawValue { return .allow }
-            let key = AlwaysKey(op: op, host: host(of: tab, args: args))
-            return remembered.contains(key) ? .allow : .ask
+            return categories(op, args: args, tab: tab).contains(where: { $0.enabled }) ? .ask : .allow
         }
     }
 
-    /// Whether an `.allow` verdict earns a second look: a guard-mode
-    /// `act.*` whose locator is an opaque handle — `ref`, `loc` or `css`
-    /// — names its target without carrying the words dangerHit reads, so
-    /// Drive pays one read-only resolve for the element's {role,name} and
-    /// checks again with them folded in as `says`. Never for a remembered
-    /// (op, host): the answer kept can't be made stricter by looking.
     @MainActor
-    static func probesDanger(_ op: String, args: [String: Any], mode: AskMode,
-                             tab: Tab?, remembered: Set<AlwaysKey>) -> Bool {
-        guard mode == .guard, op.hasPrefix("act."), let tab,
-              classify(op, args: args, tab: tab) == .write,
-              args["ref"] is String || args["loc"] is String || args["css"] is String
-        else { return false }
-        return !remembered.contains(AlwaysKey(op: op, host: host(of: tab, args: args)))
+    static func categories(_ op: String, args: [String: Any], tab: Tab?) -> [GuardCategory] {
+        switch op {
+        case "tabs.close": return [.destructive]
+        case "page.go", "page.reload", "page.back", "page.forward":
+            // Unsaved-state inspection is unavailable here. A user's tab
+            // needs a review before the agent replaces its page.
+            return tab?.bench == true ? [] : [.destructive]
+        case "page.files": return [.sharing]
+        case "page.dialog": return args["accept"] as? Bool == false ? [] : [.unverified]
+        case "page.dialogs": return []
+        case "page.eval", "page.code", "inspector.send": return [.unverified]
+        case "inspector.attach", "inspector.detach", "inspector.events", "inspector.read": return []
+        default:
+            return classify(op, args: args, tab: tab).rawValue > OpClass.write.rawValue ? [.unverified] : []
+        }
     }
 }
 
+/// Persisted locally; never accepted from tool arguments or page content.
+enum GuardCategory: String, CaseIterable, Codable {
+    case signingIn, destructive, messages, sharing, payments, account, unverified
+
+    var label: String {
+        switch self {
+        case .signingIn: return "Signing in"
+        case .destructive: return "Destructive actions"
+        case .messages: return "Sending messages"
+        case .sharing: return "Publishing and sharing"
+        case .payments: return "Purchases and payments"
+        case .account: return "Account and security changes"
+        case .unverified: return "Unverified actions"
+        }
+    }
+    var defaultEnabled: Bool { self != .signingIn }
+    var settingsKey: String { "ask.guard." + rawValue }
+    var enabled: Bool { (Store.settings.object(forKey: settingsKey) as? Bool) ?? defaultEnabled }
+}

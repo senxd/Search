@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Search guard fixture</title>
+<h1>Local guard fixture</h1>
+
+<form id="login">
+  <label>Email <input name="email" autocomplete="username" value="person@example.test"></label>
+  <label>Password <input name="password" type="password" autocomplete="current-password" value="fake-only"></label>
+  <button type="submit">Sign in</button>
+</form>
+
+<form id="message">
+  <label>Recipient <input id="recipient" name="recipient" value="alice@example.test"></label>
+  <label>Message <input name="body" value="Hello from the local fixture"></label>
+  <button type="submit">Send</button>
+</form>
+
+<button id="delete" type="button">Delete draft</button>
+<button id="delete-account" type="button">Delete account</button>
+<button id="purchase" type="button">Buy item</button>
+<button id="next" type="button">Next</button>
+<button id="confirm" type="button">Confirm selection</button>
+<button id="harmless" type="button">Show details</button>
+<output id="effects" aria-live="polite"></output>
+
+<script>
+  window.effects = [];
+  function record(action, extra = {}) {
+    window.effects.push({action, ...extra});
+    document.querySelector('#effects').textContent = JSON.stringify(window.effects);
+  }
+  document.querySelector('#login').addEventListener('submit', event => {
+    event.preventDefault();
+    record('login');
+  });
+  document.querySelector('#message').addEventListener('submit', event => {
+    event.preventDefault();
+    record('send', {recipient: document.querySelector('#recipient').value});
+  });
+  document.querySelector('#delete').addEventListener('click', () => record('delete'));
+  document.querySelector('#delete-account').addEventListener('click', () => record('delete-account'));
+  document.querySelector('#purchase').addEventListener('click', () => record('purchase'));
+  document.querySelector('#next').addEventListener('click', () => record('next'));
+  document.querySelector('#confirm').addEventListener('click', () => record('confirm'));
+  document.querySelector('#harmless').addEventListener('click', () => record('details'));
+</script>

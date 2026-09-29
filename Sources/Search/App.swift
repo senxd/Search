@@ -4,6 +4,13 @@ import AppKit
 // A window, a row of titles, and a field. Typing an address gets you a page;
 // there is nothing else to learn and nothing else to press.
 
+/// Gallery mode: FLUID_GALLERY=1, or the bundled test app — `open -a`
+/// can't pass env vars, so /tmp/FluidGallery.app's bundle id flags it.
+private var galleryMode: Bool {
+    Bundle.main.bundleIdentifier == "dev.fluid.gallery"
+        || ProcessInfo.processInfo.environment["FLUID_GALLERY"] == "1"
+}
+
 @main
 struct SearchApp: App {
     @StateObject private var browser = Browser()
@@ -11,6 +18,13 @@ struct SearchApp: App {
     @NSApplicationDelegateAdaptor(Links.self) private var links
     /// Opens the Fluid Functionalism gallery (View › Fluid Gallery).
     @Environment(\.openWindow) private var openWindow
+
+    /// True while the tab in front is a page of the web — the gate the
+    /// web-only commands (reload, print, inspect…) stand behind. One of our
+    /// own pages has no page behind it for them to act on.
+    private var onWeb: Bool {
+        browser.active != nil && browser.active?.isBlank == false && browser.active?.native == nil
+    }
 
     var body: some Scene {
         Window("Search", id: "browser") {
@@ -33,21 +47,27 @@ struct SearchApp: App {
                 Button("Open Address…") { browser.edit() }
                     .keyboardShortcut("l")
                 Divider()
-                Button("Close Tab") { if let tab = browser.active { browser.close(tab) } }
+                Button("Close Tab") {
+                    // The keystroke path is gated in take() — this guards
+                    // the menu *click* while the Ask window is key: ⌘W
+                    // closes what is in front, not a tab nobody is seeing.
+                    if AskWindow.owns(NSApp.keyWindow) { AskWindow.window?.performClose(nil) }
+                    else if let tab = browser.active { browser.close(tab) }
+                }
                     .keyboardShortcut("w")
             }
             CommandGroup(replacing: .printItem) {
                 Button("Share…") { browser.share() }
-                    .disabled(browser.active?.isBlank ?? true)
+                    .disabled(!onWeb)
                 Button("Print…") { browser.printPage() }
                     .keyboardShortcut("p")
-                    .disabled(browser.active?.isBlank ?? true)
+                    .disabled(!onWeb)
             }
             CommandGroup(after: .pasteboard) {
                 Divider()
                 Button("Find on Page…") { browser.openFind() }
                     .keyboardShortcut("f")
-                    .disabled(browser.active?.isBlank ?? true)
+                    .disabled(!onWeb)
                 Button("Find Next") { browser.look(forward: true) }
                     .keyboardShortcut("g")
                     .disabled(!browser.finding)
@@ -67,6 +87,12 @@ struct SearchApp: App {
                        ? (browser.folded ? "Show Sidebar" : "Hide Sidebar")
                        : (browser.folded ? "Show Tab Bar" : "Hide Tab Bar")) { browser.toggleFold() }
                     .keyboardShortcut("s")
+                // The Ask rail, on a key like the column's.
+                Button("Toggle Ask") { Mind.shared.toggle() }
+                    .keyboardShortcut("a", modifiers: [.command, .shift])
+                // And the same conversation as a window of its own.
+                Button("Ask Window") { openWindow(id: "ask") }
+                    .keyboardShortcut("a", modifiers: [.command, .option])
                 Picker("Tabs Wear", selection: Binding(
                     get: { browser.prefs.glyph },
                     set: { browser.prefs.glyph = $0 }
@@ -78,30 +104,41 @@ struct SearchApp: App {
                 Divider()
                 Button("Reload Page") { browser.reload() }
                     .keyboardShortcut("r")
+                    .disabled(!onWeb)
                 Button("Reading Mode") { browser.toggleReader() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!onWeb)
                 Button("Float Video") { browser.toggleFloat() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(!onWeb)
                 Divider()
                 Button("Hide Elements…") { browser.toggleHiding() }
                     .keyboardShortcut("h", modifiers: [.command, .shift])
-                Button("Hidden on This Site…") { browser.reviewing.toggle() }
+                    .disabled(!onWeb)
+                Button("Hidden on This Site…") { browser.toggleReviewing() }
                     .keyboardShortcut("u", modifiers: [.command, .shift])
+                    .disabled(!onWeb)
                 Divider()
                 Button("Zoom In") { browser.zoom(by: 1.1) }
                     .keyboardShortcut("+")
+                    .disabled(!onWeb)
                 Button("Zoom Out") { browser.zoom(by: 1 / 1.1) }
                     .keyboardShortcut("-")
+                    .disabled(!onWeb)
                 Button("Actual Size") { browser.resetZoom() }
                     .keyboardShortcut("0")
+                    .disabled(!onWeb)
                 Divider()
                 // The Web Inspector, on the keys Chrome and Arc use (see Inspector.swift).
                 Button("Web Inspector") { browser.toggleInspector() }
                     .keyboardShortcut("i", modifiers: [.command, .option])
+                    .disabled(!onWeb)
                 Button("JavaScript Console") { browser.showConsole() }
                     .keyboardShortcut("j", modifiers: [.command, .option])
+                    .disabled(!onWeb)
                 Button("Inspect Element") { browser.inspectElement() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
+                    .disabled(!onWeb)
                 Divider()
                 Button("Fluid Gallery") { openWindow(id: "fluid") }
             }
@@ -133,7 +170,7 @@ struct SearchApp: App {
                     .disabled(browser.active == nil)
                 Button("Duplicate Tab") { browser.duplicate() }
                     .keyboardShortcut("d")
-                    .disabled(browser.active?.isBlank ?? true)
+                    .disabled(!onWeb)
                 Button("Copy Address") { browser.copyAddress() }
                     .keyboardShortcut("c", modifiers: [.command, .shift])
                     .disabled(browser.active?.isBlank ?? true)
@@ -146,12 +183,13 @@ struct SearchApp: App {
                     .disabled(browser.tabs.count < 2)
                 Button("Stop Sound in Tab") { browser.pauseMedia() }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
+                    .disabled(!onWeb)
             }
             CommandMenu("Bookmarks") {
                 Button("Add This Page") { browser.bookmarkCurrent() }
                     .keyboardShortcut("b", modifiers: [.command, .shift])
-                    .disabled(browser.active?.isBlank ?? true)
-                Button("Show Bookmarks…") { browser.bookmarking = true }
+                    .disabled(!onWeb)
+                Button("Show Bookmarks…") { browser.openInternal(.bookmarks) }
                 Toggle("Show Bookmarks Bar", isOn: Binding(
                     get: { browser.prefs.bookmarksBar },
                     set: { on in withAnimation(Motion.glide) { browser.prefs.bookmarksBar = on } }
@@ -181,18 +219,18 @@ struct SearchApp: App {
                     }
                 }
                 Divider()
-                Button("Show History…") { browser.recalling = true }
+                Button("Show History…") { browser.openInternal(.history) }
                     .keyboardShortcut("y")
-                Button("Downloads…") { browser.hoarding = true }
+                Button("Downloads…") { browser.openInternal(.downloads) }
                     .keyboardShortcut("j", modifiers: [.command, .shift])
                 Divider()
                 Button("Clear History") { browser.clearHistory() }
             }
             CommandGroup(after: .appSettings) {
-                Button("Settings…") { browser.tuning = true }
+                Button("Settings…") { browser.openInternal(.settings) }
                     .keyboardShortcut(",")
                 Button("Welcome…") { browser.welcoming = true }
-                Button("Passwords…") { browser.managing = true }
+                Button("Passwords…") { browser.openInternal(.passwords) }
                     .keyboardShortcut("l", modifiers: [.command, .option])
             }
             CommandGroup(replacing: .help) {
@@ -201,11 +239,28 @@ struct SearchApp: App {
         }
 
         // The Fluid Functionalism component port, live inside the app —
-        // View › Fluid Gallery opens it.
+        // View › Fluid Gallery opens it. FLUID_DARK/FLUID_LIGHT pin the
+        // scheme inside the view tree — NSApp.appearance never reaches the
+        // off-screen doc render FLUID_SHOT uses for captures.
         Window("Fluid Gallery", id: "fluid") {
             FluidGallery()
+                .preferredColorScheme(
+                    ProcessInfo.processInfo.environment["FLUID_DARK"] == "1" ? .dark
+                        : ProcessInfo.processInfo.environment["FLUID_LIGHT"] == "1" ? .light
+                        : nil
+                )
         }
         .defaultSize(width: 1120, height: 600)
+
+        // Ask, full-size: the rail's conversation as a window of its own
+        // (design/fullscreen-ux.md) — the rail's pop-out door and View ›
+        // Ask Window open it; its keys route through AskWindow.take.
+        Window("Ask", id: "ask") {
+            AskPage(browser: browser)
+                .frame(minWidth: 720, minHeight: 480)
+        }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 980, height: 700)
     }
 }
 
@@ -281,6 +336,12 @@ struct ContentView: View {
     /// animation (see `make(room:after:)`); nil only before the window is up.
     @State private var room: CGSize?
     @State private var roomTicket = 0
+    /// The page's right-edge room for the Ask rail — the same bargain the
+    /// column gets on the left: the rail slides in over a page still at
+    /// its old width, which gives up the room once the slide is over;
+    /// leaving hands the room back at once.
+    @State private var railRoom: CGFloat = 0
+    @State private var railTicket = 0
 
 
     /// The window: room at the top, one stage for the page, and the row when
@@ -302,6 +363,7 @@ struct ContentView: View {
             stage
                 .padding(.leading, roomed.width)
                 .padding(.top, roomed.height)
+                .padding(.trailing, railRoom)
                 .offset(x: chrome.width - roomed.width, y: chrome.height - roomed.height)
 
             // The column of tabs, in the way that has one. It takes the full
@@ -344,30 +406,40 @@ struct ContentView: View {
         .animation(Motion.glide, value: browser.prefs.sidebar)
         .animation(Motion.glide, value: rail)
         .animation(.easeOut(duration: 0.12), value: browser.active?.immersed)
-        .onAppear { if room == nil { room = chrome } }
+        .onAppear {
+            if room == nil { room = chrome }
+            railRoom = rail ? 380 : 0
+        }
         .onChange(of: chrome) { old, new in make(room: new, after: old) }
+        .onChange(of: rail) { _, open in make(railRoom: open ? 380 : 0, arriving: open) }
     }
 
     @ViewBuilder
     private var stage: some View {
         if let tab = browser.active {
-            Page(tab: tab)
-                .overlay {
-                    if browser.prefs.showsLinks { LinkBubble(status: browser.linkStatus) }
-                }
-                .overlay(alignment: .topTrailing) {
-                    if browser.finding {
-                        FindBar(browser: browser)
-                            .transition(.move(edge: .top).combined(with: .opacity))
+            if let page = tab.native {
+                // One of ours — drawn where the page would be, no web view
+                // behind it, none of the page chrome meant for the web.
+                NativePageView(page: page, browser: browser)
+            } else {
+                Page(tab: tab)
+                    .overlay {
+                        if browser.prefs.showsLinks { LinkBubble(status: browser.linkStatus) }
                     }
-                }
-                .overlay(alignment: .topLeading) {
-                    if let asked = browser.suggesting, asked.tab == tab.id {
-                        AccountList(browser: browser, asked: asked)
-                            .transition(.opacity)
+                    .overlay(alignment: .topTrailing) {
+                        if browser.finding {
+                            FindBar(browser: browser)
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                        }
                     }
-                }
-                .animation(Motion.quick, value: browser.suggesting)
+                    .overlay(alignment: .topLeading) {
+                        if let asked = browser.suggesting, asked.tab == tab.id {
+                            AccountList(browser: browser, asked: asked)
+                                .transition(.opacity)
+                        }
+                    }
+                    .animation(Motion.quick, value: browser.suggesting)
+            }
         } else {
             Palette.ground
         }
@@ -411,6 +483,26 @@ struct ContentView: View {
         }
     }
 
+    /// The rail's version of `make(room:after:)`: leaving hands the page
+    /// its width back at once so it slides out from under the rail at its
+    /// new size; arriving lets the rail slide over the page still at its
+    /// old width, which gives up the room once the slide is done — one
+    /// layout, not thirty a second.
+    private func make(railRoom new: CGFloat, arriving: Bool) {
+        railTicket += 1
+        var still = Transaction()
+        still.disablesAnimations = true
+        guard arriving else {
+            withTransaction(still) { railRoom = new }
+            return
+        }
+        let ticket = railTicket
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
+            guard ticket == railTicket else { return }
+            withTransaction(still) { railRoom = new }
+        }
+    }
+
     /// Everything that rises from the bottom edge to say one thing.
     private var bars: some View {
         VStack(spacing: 8) {
@@ -450,35 +542,24 @@ struct ContentView: View {
         }
     }
 
-    /// The panels. All the same kind of thing, so they are built the same way.
+    /// The overlays. Only the ones that are genuinely of the moment are left:
+    /// the walk-through nobody should leave open, and the list of things a
+    /// page has been asked to hide. Settings, History and the rest are pages
+    /// now — places a tab holds, not sheets over one (see NativePages.swift).
     @ViewBuilder
     private var panels: some View {
-        if browser.recalling {
-            sheet { HistoryPanel(browser: browser) } close: { browser.recalling = false }
-        }
-        if browser.hoarding {
-            sheet { DownloadsPanel(browser: browser, loot: browser.loot) }
-                close: { browser.hoarding = false }
-        }
-        if browser.tuning {
-            sheet { SettingsPanel(browser: browser, prefs: browser.prefs) }
-                close: { browser.tuning = false }
-        }
-        if browser.bookmarking {
-            sheet { BookmarksPanel(browser: browser, bookmarks: browser.bookmarks) }
-                close: { browser.bookmarking = false }
-        }
         if browser.welcoming {
             WelcomePanel(browser: browser, prefs: browser.prefs)
                 .ignoresSafeArea()
-        }
-        if browser.managing {
-            sheet { PasswordsPanel(browser: browser) } close: { browser.managing = false }
         }
         if browser.reviewing {
             // No dimming for this one: the whole point is to keep looking at
             // the page while the list offers to put things back on it.
             ZStack(alignment: .topTrailing) {
+                // The floor owns the cursor; see CursorGround.
+                CursorGround()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .ignoresSafeArea()
                 Color.clear
                     .contentShape(Rectangle())
                     .onTapGesture { browser.reviewing = false }
@@ -541,12 +622,7 @@ struct ContentView: View {
                 }
             }
             .onChange(of: browser.activeID) { _, _ in handBack() }
-            .animation(Motion.settle, value: browser.recalling)
-            .animation(Motion.settle, value: browser.hoarding)
-            .animation(Motion.settle, value: browser.tuning)
             .animation(Motion.settle, value: browser.welcoming)
-            .animation(Motion.settle, value: browser.bookmarking)
-            .animation(Motion.settle, value: browser.managing)
             .animation(Motion.settle, value: browser.reviewing)
         .onAppear {
             watchKeys()
@@ -555,9 +631,30 @@ struct ContentView: View {
             Links.hand(to: browser)
             BookmarkMenu.shared.start(for: browser)
             // FLUID_GALLERY=1 opens the component gallery straight into a
-            // window — how the port is verified headlessly.
-            if ProcessInfo.processInfo.environment["FLUID_GALLERY"] == "1" {
+            // window — how the port is verified headlessly. FLUID_DARK is
+            // applied here (before the window exists) so the SwiftUI tree
+            // renders dark from the start — flipping NSApp.appearance after
+            // the fact leaves baked light colors in off-screen captures.
+            if galleryMode {
+                // A bare binary (no bundle identity) runs at .prohibited
+                // activation policy — its windows can't become key, so no
+                // field takes keyboard input. Claim .regular + activate so
+                // the gallery is a real, focusable window.
+                NSApp.setActivationPolicy(.regular)
+                NSApp.activate(ignoringOtherApps: true)
+                if ProcessInfo.processInfo.environment["FLUID_DARK"] == "1" {
+                    NSApp.appearance = NSAppearance(named: .darkAqua)
+                } else if ProcessInfo.processInfo.environment["FLUID_LIGHT"] == "1" {
+                    NSApp.appearance = NSAppearance(named: .aqua)
+                }
                 openWindow(id: "fluid")
+                // The browser scene auto-opens its window on launch — in
+                // gallery mode nothing but the gallery should be on screen.
+                DispatchQueue.main.async {
+                    for w in NSApp.windows where w.title != "Fluid Gallery" {
+                        w.close()
+                    }
+                }
             }
         }
     }
@@ -572,7 +669,7 @@ struct ContentView: View {
     private func handBack() {
         guard !browser.fieldShowing, browser.editingTab == nil else { return }
         DispatchQueue.main.async {
-            guard let web = browser.active?.web, let window = web.window else { return }
+            guard let web = browser.active?.built, let window = web.window else { return }
             window.makeFirstResponder(web)
         }
     }
@@ -682,27 +779,6 @@ struct ContentView: View {
             .shadow(color: .black.opacity(0.18), radius: 18, y: 6)
     }
 
-    /// The same dimmed ground and spring for every panel that floats over a
-    /// page, so they read as one kind of thing.
-    @ViewBuilder
-    private func sheet<Panel: View>(
-        @ViewBuilder _ panel: () -> Panel,
-        close: @escaping () -> Void
-    ) -> some View {
-        ZStack {
-            // The floor owns the cursor; see CursorGround.
-            CursorGround()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea()
-            Color.black.opacity(0.10)
-                .ignoresSafeArea()
-                .onTapGesture(perform: close)
-            panel()
-                .transition(.scale(scale: 0.97).combined(with: .opacity))
-        }
-        .transition(.opacity)
-    }
-
     /// True while the tabs are down the left, and not folded away (see Fold.swift).
     private var sidebar: Bool {
         browser.prefs.sidebar && !browser.folded && browser.active?.immersed != true
@@ -713,6 +789,7 @@ struct ContentView: View {
     private var rail: Bool {
         mind.open && browser.prefs.ask
     }
+
 
     /// The column has its own corner for the lights, so the page beside it
     /// starts at the very top; the strip needs a band.
@@ -841,6 +918,10 @@ struct ContentView: View {
     private func take(_ event: NSEvent) -> Bool {
         // A small window's keys are its own (see Little.swift).
         if let little = LittleWindow.owning(event.window) { return little.take(event) }
+        // The Ask window's too — its ⌘W is the window's, not the tab's
+        // (fullscreen-features §6.1). A synthetic event carries no window;
+        // the bench's keyHook still gets through.
+        if AskWindow.owns(event.window) { return AskWindow.take(event) }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
 
@@ -857,26 +938,6 @@ struct ContentView: View {
             }
             if browser.makingSpace {
                 withAnimation(Motion.glide) { browser.makingSpace = false }
-                return true
-            }
-            if browser.tuning {
-                browser.tuning = false
-                return true
-            }
-            if browser.bookmarking {
-                browser.bookmarking = false
-                return true
-            }
-            if browser.managing {
-                browser.managing = false
-                return true
-            }
-            if browser.recalling {
-                browser.recalling = false
-                return true
-            }
-            if browser.hoarding {
-                browser.hoarding = false
                 return true
             }
             if browser.suggesting != nil {
@@ -977,9 +1038,9 @@ struct ContentView: View {
         case "n" where shifted:
             browser.newShyTab()
         case "y" where !shifted:
-            browser.recalling.toggle()
+            browser.openInternal(.history)
         case "j" where shifted:
-            browser.hoarding.toggle()
+            browser.openInternal(.downloads)
         case "v" where shifted:
             // In a text field this key is paste without formatting — a Google
             // Doc, a form, the address field. It only means Paste and Go when
@@ -1021,11 +1082,11 @@ struct ContentView: View {
         case "b" where shifted:
             browser.bookmarkCurrent()
         case "," where !shifted:
-            browser.tuning.toggle()
+            browser.openInternal(.settings)
         case "h" where shifted:
             browser.toggleHiding()
         case "u" where shifted:
-            browser.reviewing.toggle()
+            browser.toggleReviewing()
         case "z" where !shifted:
             // Only while pointing. Everywhere else undo belongs to the page.
             guard browser.veiling else { return false }

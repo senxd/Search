@@ -1,7 +1,7 @@
 {
   "name": "iframe-count",
   "tags": ["frames"],
-  "prompt": "There's a counter inside the frame on this page — click its button once and tell me the count it shows.",
+  "prompt": "On the open tab titled Framed Counter, click the counter button inside its frame once and tell me the count it shows.",
   "setup": {"tabs": [
     {"url": "fixture:frames", "as": "fr", "via": "bench"}
   ]},

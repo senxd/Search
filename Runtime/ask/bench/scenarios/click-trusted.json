@@ -1,7 +1,7 @@
 {
   "name": "click-trusted",
   "tags": ["click"],
-  "prompt": "Click the Vote button on the page I have open.",
+  "prompt": "Click the Vote button on the open tab titled Trusted Vote.",
   "setup": {"tabs": [
     {"url": "fixture:trusted", "as": "t", "via": "bench"}
   ]},

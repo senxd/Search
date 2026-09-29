@@ -163,7 +163,7 @@ final class Bench {
         AgentSocket.shared.stop()
         // The tabs a script left open go with it.
         if let browser {
-            for tab in browser.tabs where tab.bench { browser.close(tab) }
+            for tab in browser.allTabs where tab.bench { browser.close(tab) }
         }
     }
 
@@ -285,6 +285,10 @@ final class Bench {
         let verb = request["do"] as? String ?? ""
 
         switch verb {
+        case "guard-test":
+            guard Store.testing else { answer(["error": "guard-test only works on a --test run"]); return }
+            GuardTesting.handle(request, answer)
+
         case "tabs":
             answer(["tabs": browser.tabs.map(describe)])
 
@@ -346,7 +350,10 @@ final class Bench {
         case "text":
             guard let tab = find(request, in: browser) else { answer(missing(request)); return }
             house(tab)
-            tab.web.evaluateJavaScript("document.body ? document.body.innerText : ''") { value, error in
+            // Asking a page that isn't there would only build one to ask —
+            // one of ours, or one put to sleep.
+            guard let web = tab.built else { answer(["error": "that tab holds no web page"]); return }
+            web.evaluateJavaScript("document.body ? document.body.innerText : ''") { value, error in
                 MainActor.assumeIsolated {
                     if let error { answer(["error": error.localizedDescription]); return }
                     var text = (value as? String) ?? ""
@@ -361,8 +368,9 @@ final class Bench {
             guard let js = request["js"] as? String else { answer(["error": "eval needs js"]); return }
             house(tab)
             // Search's own world is where its page scripts live (see Web.world).
+            guard let web = tab.built else { answer(["error": "that tab holds no web page"]); return }
             if request["world"] as? String == "search" {
-                tab.web.evaluateJavaScript(js, in: nil, in: Web.world) { result in
+                web.evaluateJavaScript(js, in: nil, in: Web.world) { result in
                     switch result {
                     case .success(let value): answer(["value": Bench.plain(value)])
                     case .failure(let error): answer(["error": error.localizedDescription])
@@ -370,7 +378,7 @@ final class Bench {
                 }
                 return
             }
-            tab.web.evaluateJavaScript(js) { value, error in
+            web.evaluateJavaScript(js) { value, error in
                 MainActor.assumeIsolated {
                     if let error { answer(["error": error.localizedDescription]); return }
                     answer(["value": Bench.plain(value)])
@@ -386,7 +394,7 @@ final class Bench {
             guard Store.testing else { answer(["error": "tap only works on a --test run — it would click in your page"]); return }
             guard let tab = find(request, in: browser), let selector = request["selector"] as? String else { answer(missing(request)); return }
             house(tab)
-            let view = tab.web
+            guard let view = tab.built else { answer(["error": "that tab holds no web page"]); return }
             view.evaluateJavaScript(Bench.locate(selector)) { value, error in
                 MainActor.assumeIsolated {
                     guard let point = value as? [Double], point.count == 2, let window = view.window else {
@@ -423,7 +431,8 @@ final class Bench {
             }
             house(tab)
             let text = request["text"] as? String ?? ""
-            tab.web.evaluateJavaScript(Bench.act(verb, selector: selector, text: text)) { value, error in
+            guard let web = tab.built else { answer(["error": "that tab holds no web page"]); return }
+            web.evaluateJavaScript(Bench.act(verb, selector: selector, text: text)) { value, error in
                 MainActor.assumeIsolated {
                     if let error { answer(["error": error.localizedDescription]); return }
                     let said = (value as? String) ?? "?"
@@ -482,7 +491,7 @@ final class Bench {
             guard Store.testing else { answer(["error": "key only works on a --test run — it would type into your page"]); return }
             guard let tab = find(request, in: browser), let text = request["text"] as? String else { answer(missing(request)); return }
             house(tab)
-            let view = tab.web
+            guard let view = tab.built else { answer(["error": "that tab holds no web page"]); return }
             view.window?.makeFirstResponder(view)
             let before = PageView.quieted
             // What WebKit sends back through the app because the page didn't
@@ -551,6 +560,26 @@ final class Bench {
             else { answer(["error": "hit needs an x and a y"]); return }
             let point = NSPoint(x: x, y: Double(window.frame.height) - y)
             let hit = frame.hitTest(frame.convert(point, from: nil))
+            if request["press"] as? Bool == true {
+                // A plain left press at the point, carried through the
+                // window's own dispatch — the route a real click takes,
+                // SwiftUI's gestures included. Only on a probe run.
+                guard Store.testing else { answer(["error": "hit … press only works on a --test run"]); return }
+                for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                    guard let event = NSEvent.mouseEvent(
+                        with: type, location: point, modifierFlags: [],
+                        timestamp: ProcessInfo.processInfo.systemUptime,
+                        windowNumber: window.windowNumber, context: nil,
+                        eventNumber: 0, clickCount: 1,
+                        pressure: type == .leftMouseDown ? 1 : 0
+                    ) else { continue }
+                    window.sendEvent(event)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    answer(["view": hit.map { String("\(type(of: $0))".prefix(60)) } ?? ""])
+                }
+                return
+            }
             if request["middle"] as? Bool == true {
                 // The middle button pressed and let go there. A probe's window
                 // is hidden and takes no events through the app, so they are
@@ -701,6 +730,36 @@ final class Bench {
                             "viewWasBuilt": built, "listStillOpen": browser.bookmarksOpen, "sameTab": browser.active?.id == tab.id])
                 }
             }
+
+        case "askkey":
+            // A key press as the Ask window sees it — the event carries its
+            // window number so take()'s AskWindow.owns gate is what decides.
+            // Only on a SEARCH_PROBE run.
+            guard Store.testing else { answer(["error": "askkey only works on a --test run"]); return }
+            guard let window = AskWindow.window else { answer(["error": "no ask window — open it with ui askwindow on"]); return }
+            guard let chars = request["chars"] as? String, let code = request["code"] as? Int
+            else { answer(["error": "askkey needs the characters and the key code"]); return }
+            var flags: NSEvent.ModifierFlags = []
+            for mod in request["mods"] as? [String] ?? [] {
+                if mod == "command" { flags.insert(.command) }
+                if mod == "shift" { flags.insert(.shift) }
+                if mod == "option" { flags.insert(.option) }
+            }
+            window.makeKey()
+            guard let event = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: flags,
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: UInt16(code)
+            ) else { answer(["error": "no event"]); return }
+            // `send` in the mod list dispatches through the real pipeline —
+            // every local monitor and the responder chain — for keys a view's
+            // own monitor owns (a command menu's arrows) and keyHook can't reach.
+            if (request["mods"] as? [String] ?? []).contains("send") {
+                NSApp.sendEvent(event)
+                answer(["sent": true])
+                return
+            }
+            answer(["took": ContentView.keyHook?(event) == nil])
 
         case "menu":
             // The Bookmarks menu as it is about to open: the menu bar
@@ -1186,8 +1245,10 @@ final class Bench {
             // The whole window — chrome, lights, tabs and the page on stage —
             // drawn into one PNG, the same offscreen bitmap the strip and
             // column shots are made with. For an auditor who wants what a
-            // person would see, not another slice of it.
-            guard let window = Links.window,
+            // person would see, not another slice of it. `"window": "ask"`
+            // takes the Ask window instead of the browser's.
+            let which = (request["window"] as? String) == "ask" ? AskWindow.window : Links.window
+            guard let window = which,
                   let frame = window.contentView?.superview,
                   let path = request["path"] as? String, !path.isEmpty
             else { answer(["error": "winshot needs a path"]); return }
@@ -1399,12 +1460,20 @@ final class Bench {
         case "ui":
             // Open or close the app's own panels, to reproduce what a person
             // did without a person.
-            if let on = request["settings"] as? Bool { browser.tuning = on }
-            if let on = request["passwords"] as? Bool { browser.managing = on }
+            // The pages the app keeps — Settings, History and the rest — are
+            // tabs now, so on opens and off closes rather than toggling a flag.
+            for (key, page) in [("settings", NativePage.settings), ("passwords", .passwords),
+                                ("history", .history), ("downloads", .downloads),
+                                ("bookmarks", .bookmarks)] {
+                if let on = request[key] as? Bool {
+                    if on { browser.openInternal(page) } else { browser.closeInternal(page) }
+                }
+            }
+            // "Settings › Ask" — the deep link Ask's own rows take.
+            if let section = request["settingssection"] as? String {
+                browser.openInternal(.settings, section: section)
+            }
             if let on = request["welcome"] as? Bool { browser.welcoming = on }
-            if let on = request["history"] as? Bool { browser.recalling = on }
-            if let on = request["downloads"] as? Bool { browser.hoarding = on }
-            if let on = request["bookmarks"] as? Bool { browser.bookmarking = on }
             if let on = request["hidden"] as? Bool { browser.reviewing = on }
             if let look = (request["look"] as? String).flatMap(Look.init) { browser.prefs.look = look }
             if let on = request["pages120"] as? Bool { browser.prefs.fastPages = on }
@@ -1413,6 +1482,23 @@ final class Bench {
             if let on = request["hides"] as? Bool { browser.prefs.sideHides = on }
             if let on = request["folded"] as? Bool { browser.folded = on }
             if let on = request["peek"] as? Bool { browser.peeking = on }
+            // The Ask rail: its own toggle, and the ask pref it rides on.
+            if let on = request["ask"] as? Bool { Mind.shared.open = on }
+            // The Ask window: openWindow isn't reachable outside the view
+            // tree, so the View menu's own item is performed — a click is.
+            if let on = request["askwindow"] as? Bool {
+                if on {
+                    if let view = NSApp.mainMenu?.items.first(where: { $0.title == "View" })?.submenu {
+                        view.delegate?.menuNeedsUpdate?(view)
+                        if let at = view.items.firstIndex(where: { $0.title == "Ask Window" }) {
+                            view.performActionForItem(at: at)
+                        }
+                    }
+                    AskWindow.window?.makeKey()
+                } else {
+                    AskWindow.window?.performClose(nil)
+                }
+            }
             // A peek at a link (Peek.swift): its two buttons.
             if let what = request["peeklink"] as? String {
                 if what == "keep" { browser.keepPeek() } else { browser.closePeek() }
@@ -1427,6 +1513,127 @@ final class Bench {
             if #available(macOS 15.4, *), let on = request["extensions"] as? Bool { Extensions.shared.menuOpen = on }
             answer(["ok": true])
 
+        case "routine":
+            // The automations board, from the shell: list routines and
+            // their runs, add one, run one now, stop or answer a live
+            // run. These drive the same Routines the page does — a
+            // script can't reach a path a person can't.
+            let act = request["act"] as? String ?? "list"
+            switch act {
+            case "list":
+                let day = ISO8601DateFormatter()
+                answer(["routines": Routines.shared.routines.map { routine -> [String: Any] in
+                    [
+                        "id": routine.id.uuidString,
+                        "name": routine.name,
+                        "enabled": routine.enabled,
+                        "prompt": routine.prompt,
+                        "frequency": routine.schedule.frequency.rawValue,
+                        "next": routine.nextRunAt.map { day.string(from: $0) } ?? "",
+                        "mode": routine.mode.rawValue,
+                        "model": routine.model ?? "",
+                        "runs": Routines.shared.runs(of: routine).map { run -> [String: Any] in
+                            [
+                                "id": run.id.uuidString,
+                                "state": run.state.rawValue,
+                                "trigger": run.trigger.rawValue,
+                                "queued": day.string(from: run.queuedAt),
+                                "finished": run.finishedAt.map { day.string(from: $0) } ?? "",
+                                "error": run.error ?? "",
+                                "waiting": run.waiting,
+                                "question": run.waitingQuestion?.text ?? "",
+                                "approvals": run.waitingApprovals.count,
+                                "messages": run.chat.messages.count,
+                                "chat": run.chat.id.uuidString,
+                            ]
+                        },
+                    ]
+                }])
+            case "add":
+                guard let name = request["name"] as? String,
+                      let prompt = request["prompt"] as? String
+                else { answer(["error": "routine add needs a name and a prompt"]); return }
+                var routine = Routine(name: name, prompt: prompt)
+                if let frequency = (request["frequency"] as? String)
+                    .flatMap({ RoutineSchedule.Frequency(rawValue: $0) }) {
+                    routine.schedule.frequency = frequency
+                }
+                if let at = request["at"] as? String {
+                    let pieces = at.split(separator: ":").compactMap { Int($0) }
+                    if pieces.count == 2 {
+                        routine.schedule.hour = pieces[0]
+                        routine.schedule.minute = pieces[1]
+                    }
+                }
+                if let cron = request["cron"] as? String {
+                    routine.schedule.frequency = .custom
+                    routine.schedule.cron = cron
+                }
+                if let every = request["every"] as? Int { routine.schedule.interval = every }
+                if let model = request["model"] as? String { routine.model = model }
+                if let mode = (request["mode"] as? String).flatMap(AskMode.init) { routine.mode = mode }
+                if let timeout = request["timeout"] as? Int { routine.timeoutSeconds = timeout }
+                if request["disabled"] as? Bool == true { routine.enabled = false }
+                let added = Routines.shared.add(routine)
+                answer(["ok": true, "id": added.id.uuidString])
+            case "run":
+                guard let name = request["name"] as? String,
+                      let routine = Routines.shared.routines.first(where: {
+                          $0.id.uuidString.hasPrefix(name) || $0.name == name })
+                else { answer(["error": "no such routine"]); return }
+                let run = Routines.shared.runNow(routine)
+                answer(["ok": true, "run": run.id.uuidString])
+            case "stop":
+                guard let name = request["name"] as? String,
+                      let run = Routines.shared.runs.values.joined().first(where: {
+                          $0.id.uuidString.hasPrefix(name)
+                              || (!$0.state.isTerminal
+                                  && (Routines.shared.routine($0.routine)?.name == name
+                                      || $0.routine.uuidString.hasPrefix(name))) })
+                else { answer(["error": "no such run"]); return }
+                Routines.shared.stop(run)
+                answer(["ok": true])
+            case "answer", "pass":
+                guard let name = request["name"] as? String,
+                      let run = Routines.shared.runs.values.joined().first(where: {
+                          $0.id.uuidString.hasPrefix(name) && $0.waitingQuestion != nil })
+                else { answer(["error": "no waiting run by that id"]); return }
+                if act == "answer", let text = request["text"] as? String {
+                    Routines.shared.answer(run, text)
+                } else if act == "pass" {
+                    Routines.shared.pass(run)
+                } else {
+                    answer(["error": "routine answer needs the text"]); return
+                }
+                answer(["ok": true])
+            case "approve", "deny":
+                guard let name = request["name"] as? String,
+                      let run = Routines.shared.runs.values.joined().first(where: {
+                          $0.id.uuidString.hasPrefix(name) && !$0.waitingApprovals.isEmpty }),
+                      let card = run.waitingApprovals.first
+                else { answer(["error": "no run with a parked card by that id"]); return }
+                let always = request["always"] as? Bool ?? false
+                Routines.shared.resolve(run, card, act == "approve" ? (always ? .always : .allow) : .deny)
+                answer(["ok": true])
+            case "enable":
+                guard let name = request["name"] as? String,
+                      var routine = Routines.shared.routines.first(where: {
+                          $0.id.uuidString.hasPrefix(name) || $0.name == name })
+                else { answer(["error": "no such routine"]); return }
+                routine.enabled = request["on"] as? Bool ?? true
+                Routines.shared.save(routine)
+                answer(["ok": true])
+            case "demo":
+                #if DEBUG
+                Routines.shared.demoRoutine()
+                answer(["ok": true])
+                #else
+                answer(["error": "demo only exists on a debug build"])
+                #endif
+            default:
+                answer(["error": "unknown routine act “\(act)”"])
+            }
+
         case "extensions", "ext-add", "ext-folder", "ext-press", "ext-remove", "ext-reload", "ext-page", "ext-popup", "ext-menu", "ext-pin", "ext-shot", "ext-answer", "ext-enable":
             guard #available(macOS 15.4, *) else {
                 answer(["error": "extensions need macOS 15.4"])
@@ -1436,7 +1643,7 @@ final class Bench {
 
         default:
             answer(["error": "unknown command “\(verb)”", "commands": [
-                "tabs", "open", "go", "close", "wait", "sleep", "select", "text", "eval", "click", "type", "submit", "shot", "probe", "key", "resize", "hit", "film", "window", "pages", "picture", "place", "pin", "field", "bookmark", "menu", "keyeq", "pull", "space", "group", "strip", "column", "winshot", "fold", "consent", "site", "little", "ui",
+                "tabs", "open", "go", "close", "wait", "sleep", "select", "text", "eval", "click", "type", "submit", "shot", "probe", "key", "resize", "hit", "film", "window", "pages", "picture", "place", "pin", "field", "bookmark", "menu", "keyeq", "pull", "space", "group", "strip", "column", "winshot", "fold", "consent", "site", "little", "ui", "askkey", "routine",
             ]])
         }
     }
@@ -1552,12 +1759,13 @@ final class Bench {
     /// same report rather than a copy of it.
     func probeReport(_ browser: Browser) -> [String: Any] {
         var out: [String: Any] = [
-            "settings": browser.tuning,
+            // The pages are places now: "open" means a tab is holding one.
+            "settings": browser.tabs.contains { $0.native == .settings },
             "welcome": browser.welcoming,
-            "passwords": browser.managing,
-            "history": browser.recalling,
-            "downloads": browser.hoarding,
-            "bookmarks": browser.bookmarking,
+            "passwords": browser.tabs.contains { $0.native == .passwords },
+            "history": browser.tabs.contains { $0.native == .history },
+            "downloads": browser.tabs.contains { $0.native == .downloads },
+            "bookmarks": browser.tabs.contains { $0.native == .bookmarks },
             "field": browser.editing,
             "suggesting": browser.suggesting != nil,
             "offering": browser.offering != nil,
@@ -1631,13 +1839,13 @@ final class Bench {
     /// `window.open` carries no flask and would be out of reach otherwise.
     private func find(_ request: [String: Any], in browser: Browser) -> Tab? {
         guard let ref = (request["id"] as? String)?.lowercased(), !ref.isEmpty else { return nil }
-        return browser.tabs.first { (Store.testing || $0.bench) && $0.id.uuidString.lowercased().hasPrefix(ref) }
+        return browser.allTabs.first { (Store.testing || $0.bench) && $0.id.uuidString.lowercased().hasPrefix(ref) }
     }
 
     /// The first characters of a tab's id, the way `./bench tabs` prints them.
     /// Any tab answers — the agent drives the window it is in, popups and all.
     func find(_ ref: String, in browser: Browser) -> Tab? {
-        browser.tabs.first { $0.id.uuidString.lowercased().hasPrefix(ref) }
+        browser.allTabs.first { $0.id.uuidString.lowercased().hasPrefix(ref) }
     }
 
     private func missing(_ request: [String: Any]) -> [String: Any] {
@@ -1650,7 +1858,11 @@ final class Bench {
     /// `tabs.list` alike. The browser is a parameter so the ops layer can
     /// describe tabs even when the bench itself isn't running.
     func describe(_ tab: Tab, in browser: Browser?) -> [String: Any] {
-        [
+        let space = browser.flatMap { browser in
+            browser.tabs.contains { $0 === tab } ? browser.spaceID
+                : browser.parked.first { $0.value.tabs.contains { $0 === tab } }?.key
+        }
+        return [
             "id": Bench.short(tab),
             "url": tab.address?.absoluteString ?? "",
             "title": tab.title,
@@ -1662,6 +1874,11 @@ final class Bench {
             "hollow": tab.hollow,
             "view": tab.built?.url?.absoluteString ?? "",
             "bench": tab.bench,
+            "surfaced": tab.surfaced,
+            "agentName": tab.agentName ?? "",
+            "agentGroup": tab.agentGroup ?? "",
+            "space": space?.uuidString.lowercased() ?? "",
+            "spaceName": space.flatMap { id in browser?.spaces.first { $0.id == id }?.name } ?? "",
             "active": tab.id == browser?.activeID,
             "asleep": tab.asleep,
             "shy": tab.shy,
@@ -1849,7 +2066,9 @@ final class Bench {
     }
 
     func shoot(_ tab: Tab, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {
-        shoot(tab.web, to: file, width: width, answer)
+        // One of ours draws no page a snapshot could hold.
+        guard let web = tab.built else { answer(["error": "that tab holds no web page"]); return }
+        shoot(web, to: file, width: width, answer)
     }
 
     func shoot(_ web: WKWebView, to file: URL, width: Double?, _ answer: @escaping ([String: Any]) -> Void) {

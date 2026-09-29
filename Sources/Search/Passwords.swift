@@ -3,7 +3,7 @@ import SwiftUI
 /// Every password kept, by site. The same white-and-hairline panel as the
 /// rest, and the same rule: a password is never shown until you have proved
 /// you are you, and never for longer than it takes to read it.
-struct PasswordsPanel: View {
+struct PasswordsPage: View {
     @ObservedObject var browser: Browser
 
     @FocusState private var hunting: Bool
@@ -12,7 +12,7 @@ struct PasswordsPanel: View {
     @State private var importing: String?
 
     var body: some View {
-        Plate("Passwords", width: 620, close: { browser.managing = false }) {
+        PageSheet("Passwords") {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 10) {
                     Hunt(text: $browser.hunting, prompt: "Search sites and accounts", focus: $hunting)
@@ -47,7 +47,7 @@ struct PasswordsPanel: View {
                         }
                         .padding(.bottom, 2)
                     }
-                    .frame(maxHeight: 400)
+                    .frame(maxHeight: .infinity)
                 }
             }
         } foot: {
@@ -94,7 +94,10 @@ struct PasswordsPanel: View {
         }
         .animation(Motion.settle, value: adding)
         .animation(Motion.settle, value: open)
-        .onAppear { hunting = true }
+        .onAppear {
+            hunting = true
+            browser.relist()
+        }
     }
 
     /// A site, and under it its accounts once opened.

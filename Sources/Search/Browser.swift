@@ -37,22 +37,20 @@ final class Browser: NSObject, ObservableObject {
     /// one of them changes.
     let prefs = Preferences()
     let linkStatus = LinkStatus()
-    /// The settings panel.
-    @Published var tuning = false
     /// The first-launch walk-through, over everything. Also from the menu.
     @Published var welcoming = false
 
     // MARK: - bookmarks
 
     let bookmarks = Bookmarks()
-    /// The full list, for taking things out.
-    @Published var bookmarking = false
     /// The dropdown off the button.
     @Published var bookmarksOpen = false
 
     /// ⇧⌘B. The page you are on, at the end of the list.
     func bookmarkCurrent() {
-        guard let tab = active, let url = tab.address else { return }
+        // The app's own pages are places the menus already know the way to —
+        // a bookmark to search://settings would only be clutter there.
+        guard let tab = active, let url = tab.address, tab.native == nil else { return }
         guard !bookmarks.contains(url) else {
             announce("Already a bookmark")
             return
@@ -144,7 +142,9 @@ final class Browser: NSObject, ObservableObject {
     @Published private(set) var findFocus = 0
 
     func openFind() {
-        guard active?.isBlank == false else { return }
+        // Our own pages keep their own searching (History's field, Settings'
+        // rail) — the in-page bar has nothing to look through there.
+        guard let active, !active.isBlank, active.native == nil else { return }
         finding = true
         findFocus += 1
     }
@@ -156,11 +156,11 @@ final class Browser: NSObject, ObservableObject {
         missed = false
         // There is no public way to call off a find, but letting go of the
         // selection is what taking the highlight away amounts to.
-        active?.web.evaluateJavaScript("window.getSelection().removeAllRanges()")
+        active?.built?.evaluateJavaScript("window.getSelection().removeAllRanges()")
     }
 
     func look(forward: Bool) {
-        guard let web = active?.web, !needle.isEmpty else {
+        guard let web = active?.built, !needle.isEmpty else {
             missed = false
             return
         }
@@ -176,7 +176,7 @@ final class Browser: NSObject, ObservableObject {
     /// ⌘⇧M. Whatever is making noise in this tab stops making noise.
     func pauseMedia() {
         guard let tab = active else { return }
-        tab.web.pauseAllMediaPlayback()
+        tab.built?.pauseAllMediaPlayback()
         announce("Paused")
     }
 
@@ -196,8 +196,15 @@ final class Browser: NSObject, ObservableObject {
     var hereVeils: [Veil] { curtain.veils(on: hereHost) }
 
     /// ⌘⇧H. Point at anything on the page and it goes, for good, on this site.
+    /// Nothing on one of our own pages is a site's to hide — the review
+    /// panel has no "here" to show there.
+    func toggleReviewing() {
+        guard active?.native == nil else { return }
+        reviewing.toggle()
+    }
+
     func toggleHiding() {
-        guard let tab = active, !tab.isBlank else { return }
+        guard let tab = active, !tab.isBlank, tab.native == nil else { return }
         if veiling {
             veiling = false
             tab.stopPicking()
@@ -327,7 +334,6 @@ final class Browser: NSObject, ObservableObject {
 
     // The list of what is kept.
 
-    @Published var managing = false { didSet { if managing { relist() } } }
     @Published private(set) var saved: [Login] = []
     @Published var hunting = ""
 
@@ -445,8 +451,6 @@ final class Browser: NSObject, ObservableObject {
 
     // MARK: - what is kept, and getting rid of it
 
-    @Published var recalling = false
-    @Published var hoarding = false
     @Published var recallHunt = ""
 
     /// Cookies, caches, local storage — everything a site left on this Mac,
@@ -528,9 +532,10 @@ final class Browser: NSObject, ObservableObject {
     /// and that letter arrives selected so the next keystroke replaces it.
     @Published var editingPin: Tab.ID?
 
-    var pinnedCount: Int { tabs.filter { $0.pin != nil }.count }
+    var pinnedCount: Int { tabs.filter { $0.pin != nil && !$0.bench }.count }
 
     func pin(_ tab: Tab) {
+        if tab.bench { surfaceAgentTab(tab, select: false) }
         if tab.pin == nil {
             // Out of any group first: a pin is a place kept of its own, and
             // the row needs telling since clearing that alone moves nothing.
@@ -776,6 +781,9 @@ final class Browser: NSObject, ObservableObject {
         } else if prefs.benchRefused {
             announce("“Let a script drive Search” was turned on outside Settings, and stays off")
         }
+        // Routines need the Drive up first — its approval sink and mode
+        // lookups land on it — so the hop defers to after init returns.
+        Task { @MainActor in Routines.shared.start() }
         welcoming = !prefs.welcomed
         // Asked to stay out of the way: it starts that way (see Fold.swift).
         folded = prefs.sidebar && prefs.sideHides
@@ -818,13 +826,13 @@ final class Browser: NSObject, ObservableObject {
             guard let self, let id = self.floating,
                   let tab = self.tabs.first(where: { $0.id == id })
             else { return }
-            tab.web.evaluateInSearch(Isolate.skip(seconds))
+            tab.built?.evaluateInSearch(Isolate.skip(seconds))
         }
         floater.onProgress = { [weak self] answer in
             guard let self, let id = self.floating,
                   let tab = self.tabs.first(where: { $0.id == id })
             else { return }
-            tab.web.evaluateInSearch(Isolate.where_) { found in
+            tab.built?.evaluateInSearch(Isolate.where_) { found in
                 MainActor.assumeIsolated {
                     guard let pair = found as? [Any], pair.count == 2,
                           let through = pair[0] as? Double,
@@ -838,7 +846,7 @@ final class Browser: NSObject, ObservableObject {
             guard let self, let id = self.floating,
                   let tab = self.tabs.first(where: { $0.id == id })
             else { return }
-            tab.web.evaluateInSearch(Isolate.toggle) { playing in
+            tab.built?.evaluateInSearch(Isolate.toggle) { playing in
                 MainActor.assumeIsolated { answer((playing as? Bool) ?? true) }
             }
         }
@@ -862,8 +870,15 @@ final class Browser: NSObject, ObservableObject {
             spaceID = last
             Spaces.current = last
         }
-        restoreSession()
-        if prefs.usesSpaces { preloadSpaces() }
+        // Gallery mode (FLUID_GALLERY / dev.fluid.gallery) never shows the
+        // browser — restoring real tabs would load live pages whose WebViews
+        // publish through every frame, burning CPU under the gallery window.
+        let galleryOnly = ProcessInfo.processInfo.environment["FLUID_GALLERY"] == "1"
+            || Bundle.main.bundleIdentifier == "dev.fluid.gallery"
+        if !galleryOnly {
+            restoreSession()
+            if prefs.usesSpaces { preloadSpaces() }
+        }
     }
 
     /// The row of tabs the space on screen had last time, or one empty tab.
@@ -878,7 +893,7 @@ final class Browser: NSObject, ObservableObject {
             let tab = Tab()
             adopt(tab)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak tab] in
-                guard let tab, tab.isBlank else { return }
+                guard let tab, tab.isBlank, tab.native == nil else { return }
                 _ = tab.web
             }
             return
@@ -888,6 +903,7 @@ final class Browser: NSObject, ObservableObject {
             let tab = Tab()
             prepare(tab)
             tab.restore(url: url, title: entry.title, name: entry.name)
+            tab.surfaced = entry.surfaced ?? false
             tab.pin = entry.pin
             if entry.pin == nil { tab.groupID = entry.groupID }
             tabs.append(tab)
@@ -1004,7 +1020,7 @@ final class Browser: NSObject, ObservableObject {
         prefs.$autocorrect
             .dropFirst()
             .sink { [weak self] on in
-                guard let self, let web = active?.web else { return }
+                guard let self, let web = active?.built else { return }
                 let selector = NSSelectorFromString("toggleAutomaticSpellingCorrection:")
                 guard web.responds(to: selector) else { return }
                 // Toggling is all there is, so it is only sent when the two
@@ -1023,17 +1039,26 @@ final class Browser: NSObject, ObservableObject {
     }
 
     func writeSession(now: Bool = false) {
-        let entries = tabs.compactMap { tab -> Session.Entry? in
-            guard !tab.shy, !tab.bench else { return nil }
+        writeSession(tabs: tabs, groups: orderedGroups, active: activeID, space: spaceID, now: now)
+    }
+
+    private func writeSession(tabs: [Tab], groups: [TabGroup], active: Tab.ID?, space: UUID, now: Bool) {
+        let keptTabs = tabs.filter {
+            // The app's own pages persist like any page — a session comes
+            // back with its Settings tab still open.
+            guard !$0.shy, !$0.bench, let url = $0.pending ?? $0.address else { return false }
+            return url.scheme?.hasPrefix("http") == true || NativePage(url: url) != nil
+        }
+        let entries = keptTabs.compactMap { tab -> Session.Entry? in
             // A sleeping tab holds its address in `pending`; asking for
             // it there too means a pin can never be written out of
             // existence by whatever its web view happens to be showing.
             guard let url = tab.pending ?? tab.address,
-                  url.scheme?.hasPrefix("http") == true
+                  url.scheme?.hasPrefix("http") == true || NativePage(url: url) != nil
             else { return nil }
             return Session.Entry(
                 url: url.absoluteString, title: tab.title, pin: tab.pin,
-                name: tab.name, groupID: tab.groupID
+                name: tab.name, groupID: tab.groupID, surfaced: tab.surfaced ? true : nil
             )
         }
         // A group whose members are all shy or bench leaves nothing behind:
@@ -1041,11 +1066,11 @@ final class Browser: NSObject, ObservableObject {
         let kept = Set(entries.compactMap(\.groupID))
         Session.write(
             now: now,
-            space: spaceID,
+            space: space,
             .init(
                 tabs: entries,
-                active: tabs.firstIndex { $0.id == activeID } ?? 0,
-                groups: orderedGroups.filter { kept.contains($0.id) }
+                active: keptTabs.firstIndex { $0.id == active } ?? 0,
+                groups: groups.filter { kept.contains($0.id) }
             )
         )
     }
@@ -1120,15 +1145,25 @@ final class Browser: NSObject, ObservableObject {
     func replaceBlank(_ tab: Tab, with url: URL) {
         guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
         let url = Browser.page(url)
-        let page = Tab(configuration: Browser.extensionConfiguration(for: url))
+        let page = Tab(shy: tab.shy, bench: tab.bench, configuration: Browser.extensionConfiguration(for: url))
         prepare(page)
         page.groupID = tab.groupID
+        page.surfaced = tab.surfaced
+        page.agentName = tab.agentName
+        page.agentGroup = tab.agentGroup
+        (AskRuntime.drive as? Drive)?.replaceTab(tab, with: page)
         tabs[index] = page
         page.go(to: url)
         if activeID == tab.id { activeID = page.id; editing = false }
     }
 
     func select(_ tab: Tab) {
+        if !tabs.contains(where: { $0 === tab }),
+           let space = parked.first(where: { $0.value.tabs.contains { $0 === tab } })?.key {
+            guard prefs.usesSpaces else { return }
+            switchSpace(to: space)
+        }
+        guard tabs.contains(where: { $0 === tab }) else { return }
         // A peek is over the tab it was opened from; another tab puts it away.
         if peekTab != nil, tab.id != activeID { closePeek() }
         cancelTabEdit()
@@ -1157,7 +1192,20 @@ final class Browser: NSObject, ObservableObject {
     /// ⌘W, or the cross on the tab. Closing the last one leaves a blank tab
     /// behind; closing that blank tab closes the window.
     func close(_ tab: Tab) {
+        if !tabs.contains(where: { $0 === tab }), tab.bench,
+           let space = parked.first(where: { $0.value.tabs.contains { $0 === tab } })?.key,
+           var row = parked[space] {
+            if let web = tab.built { AgentInteractions.shared.clear(web) }
+            tab.close()
+            row.tabs.removeAll { $0 === tab }
+            row.groups.removeAll { group in !row.tabs.contains { $0.groupID == group.id } }
+            if row.active == tab.id { row.active = row.tabs.first { !$0.bench }?.id ?? row.tabs.first?.id }
+            parked[space] = row
+            objectWillChange.send()
+            return
+        }
         guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
+        if let web = tab.built { AgentInteractions.shared.clear(web) }
 
         // A tab whose page is out in the little window takes the window with
         // it. Left alone, the window would go on holding a page belonging to a
@@ -1173,7 +1221,7 @@ final class Browser: NSObject, ObservableObject {
             // kind meant closing one pin landed you on another pin, and ⌘W
             // bounced between the two instead of getting you out of them.
             let others = tabs.filter { $0.id != tab.id && !$0.asleep }
-            let loose = others.filter { $0.pin == nil }
+            let loose = others.filter { $0.pin == nil && !$0.bench }
             if let back = (loose.isEmpty ? others : loose).max(by: { $0.touched < $1.touched }) {
                 select(back)
             } else {
@@ -1211,7 +1259,8 @@ final class Browser: NSObject, ObservableObject {
             // right — through select(), same as everywhere else you land on
             // a tab, so one that was never built yet actually wakes up
             // instead of sitting there blank until a manual reload.
-            select(tabs[min(index, tabs.count - 1)])
+            let next = tabs.dropFirst(index).first { !$0.bench } ?? tabs.last { !$0.bench }
+            select(next ?? tabs[min(index, tabs.count - 1)])
         }
         rememberSession()
     }
@@ -1291,6 +1340,13 @@ final class Browser: NSObject, ObservableObject {
             if !group.expanded { toggleGroup(group.id) }
             return
         }
+        // One of ours closed with the tab holding it — reopening is selecting
+        // the one that is already open, not standing a second beside it.
+        if let page = NativePage(url: ghost.url),
+           let existing = tabs.first(where: { $0.native == page }) {
+            select(existing)
+            return
+        }
         let tab = Tab()
         prepare(tab)
         leaving()
@@ -1321,7 +1377,7 @@ final class Browser: NSObject, ObservableObject {
     }
 
     private func remember(_ tab: Tab, at index: Int) {
-        guard !burying, !tab.shy, let url = tab.address else { return }
+        guard !burying, !tab.shy, !tab.bench, let url = tab.address else { return }
         ghosts.append(Ghost(url: url, title: tab.title, index: index, groupID: tab.groupID))
         if ghosts.count > 12 { ghosts.removeFirst() }
     }
@@ -1359,14 +1415,44 @@ final class Browser: NSObject, ObservableObject {
     }
 
     func step(_ direction: Int) {
-        guard tabs.count > 1, let here = tabs.firstIndex(where: { $0.id == activeID }) else { return }
-        let next = (here + direction + tabs.count) % tabs.count
-        select(tabs[next])
+        let normal = tabs.filter { !$0.bench }
+        guard !normal.isEmpty else { return }
+        let here = normal.firstIndex { $0.id == activeID } ?? (direction > 0 ? -1 : 0)
+        select(normal[(here + direction + normal.count) % normal.count])
     }
 
     func select(index: Int) {
-        guard tabs.indices.contains(index) else { return }
-        select(tabs[index])
+        let normal = tabs.filter { !$0.bench }
+        let index = index == tabs.count - 1 ? normal.count - 1 : index
+        guard normal.indices.contains(index) else { return }
+        select(normal[index])
+    }
+
+    /// One of the app's own pages — Settings, History and the rest — as a
+    /// tab. There is only ever one of each: asked for while open, it comes
+    /// to the front, possibly with a different section showing, rather than
+    /// the tab row filling with Settings.
+    func openInternal(_ page: NativePage, section: String? = nil) {
+        if let section {
+            Store.settings.set(section, forKey: "settings.page")
+            NotificationCenter.default.post(
+                name: .nativePageSection, object: nil,
+                userInfo: ["page": page.rawValue, "section": section])
+        }
+        if let tab = tabs.first(where: { $0.native == page }) {
+            select(tab)
+        } else {
+            open(page.url, foreground: true)
+        }
+        // From the Ask window or a menu the browser's own window should be
+        // the one the page lands in front of.
+        Links.window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Every tab holding one of the app's pages, closed — a bench lever's
+    /// "off" for a thing that is a place rather than a state now.
+    func closeInternal(_ page: NativePage) {
+        for tab in tabs where tab.native == page { close(tab) }
     }
 
     /// A link opened from a page lands next to the page it came from, not at
@@ -1381,19 +1467,24 @@ final class Browser: NSObject, ObservableObject {
         // extension's configuration.
         let url = Browser.page(url)
         let page = Browser.extensionConfiguration(for: url)
-        let tab = if let source, source.shy, page == nil {
-            Tab(shy: true, configuration: Web.configuration(shy: true, store: source.store))
+        let tab = if let source, page == nil {
+            Tab(shy: source.shy, bench: source.bench, configuration: Web.configuration(shy: source.shy, store: source.store))
         } else {
-            Tab(configuration: page)
+            Tab(bench: source?.bench ?? false, configuration: page)
         }
+        tab.agentName = source?.agentName
+        tab.agentGroup = source?.agentGroup
         prepare(tab)
         let here = atEnd ? nil : tabs.firstIndex { $0.id == activeID }
-        tabs.insert(tab, at: atEnd ? tabs.count : placeForNew())
+        if !parkAgentChild(tab, from: source) {
+            tabs.insert(tab, at: atEnd ? tabs.count : placeForNew())
+        }
+        if let source, source.bench { (AskRuntime.drive as? Drive)?.adoptAgentTab(tab, from: source) }
         // Opened beside a grouped tab, it belongs to the group it came from.
         // At the end of the row it belongs to nothing, whatever is there.
-        if !atEnd, let here { tab.groupID = tabs[here].groupID }
+        if !tab.bench, !atEnd, let here { tab.groupID = tabs[here].groupID }
         tab.go(to: url)
-        if foreground {
+        if foreground && (!tab.bench || source?.id == activeID) {
             leaving()
             activeID = tab.id
             editing = false
@@ -1423,7 +1514,11 @@ final class Browser: NSObject, ObservableObject {
         }
         prepare(fresh)
         fresh.groupID = tab.groupID
+        fresh.surfaced = tab.surfaced
+        fresh.agentName = tab.agentName
+        fresh.agentGroup = tab.agentGroup
         let wasActive = activeID == tab.id
+        (AskRuntime.drive as? Drive)?.replaceTab(tab, with: fresh)
         tabs[index] = fresh
         fresh.go(to: url)
         if wasActive { activeID = fresh.id }
@@ -1468,6 +1563,53 @@ final class Browser: NSObject, ObservableObject {
         return tab
     }
 
+    /// Keep the exact page the agent prepared. No navigation or view rebuild.
+    @discardableResult
+    func surfaceAgentTab(_ tab: Tab, select foreground: Bool = true) -> Bool {
+        let parkedSpace = parked.first { $0.value.tabs.contains { $0 === tab } }?.key
+        guard tabs.contains(where: { $0 === tab }) || parkedSpace != nil else { return false }
+        if foreground, let parkedSpace {
+            guard prefs.usesSpaces else { return false }
+            switchSpace(to: parkedSpace)
+        }
+        objectWillChange.send()
+        if tab.bench {
+            tab.bench = false
+            tab.surfaced = true
+            // Agent tabs are never pinned, but clear stale metadata before keeping one.
+            tab.pin = nil
+            tab.groupID = nil
+        }
+        (AskRuntime.drive as? Drive)?.surfaceTab(tab)
+        if foreground, tabs.contains(where: { $0 === tab }) {
+            select(tab)
+            DispatchQueue.main.async { [weak self, weak tab] in
+                guard let self, let tab, self.activeID == tab.id, let web = tab.built else { return }
+                Links.window?.makeKeyAndOrderFront(nil)
+                if web.superview is StageView { web.window?.makeFirstResponder(web) }
+            }
+        }
+        if let parkedSpace, let row = parked[parkedSpace] {
+            writeSession(tabs: row.tabs, groups: row.groups, active: row.active, space: parkedSpace, now: true)
+        } else {
+            writeSession(now: true)
+        }
+        return true
+    }
+
+    var agentTabs: [Tab] { tabs.filter(\.bench) }
+    var allTabs: [Tab] { tabs + parkedTabs }
+
+    private func parkAgentChild(_ tab: Tab, from source: Tab?) -> Bool {
+        guard let source, source.bench,
+              let space = parked.first(where: { $0.value.tabs.contains { $0 === source } })?.key,
+              var row = parked[space] else { return false }
+        row.tabs.append(tab)
+        parked[space] = row
+        objectWillChange.send()
+        return true
+    }
+
     /// A link from another app. A blank tab with nothing typed in it takes
     /// the page rather than staying behind as an empty one; otherwise the
     /// page gets a tab of its own, in front.
@@ -1498,7 +1640,6 @@ final class Browser: NSObject, ObservableObject {
     /// goes as the page starts: the list off the button used to stay open
     /// over the page it had just sent you to.
     func pickBookmark(_ url: URL) {
-        bookmarking = false
         bookmarksOpen = false
         visit(url)
     }
@@ -1533,7 +1674,9 @@ final class Browser: NSObject, ObservableObject {
 
     /// ⌘D. The same page, beside itself.
     func duplicate() {
-        guard let url = active?.address else { return }
+        // One of our own pages is only ever one tab — there is no second
+        // Settings to stand beside the first.
+        guard let url = active?.address, active?.native == nil else { return }
         open(url, foreground: true, from: active)
     }
 
@@ -1553,12 +1696,13 @@ final class Browser: NSObject, ObservableObject {
 
     /// ⌘P. The system's own sheet, which is also where "save as PDF" lives.
     func printPage() {
-        guard let tab = active, !tab.isBlank, let window = NSApp.keyWindow else { return }
+        guard let tab = active, !tab.isBlank, let web = tab.built,
+              let window = NSApp.keyWindow else { return }
         let info = NSPrintInfo.shared
         info.horizontalPagination = .fit
         info.isHorizontallyCentered = false
-        let job = tab.web.printOperation(with: info)
-        job.view?.frame = tab.web.bounds
+        let job = web.printOperation(with: info)
+        job.view?.frame = web.bounds
         job.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
     }
 
@@ -1573,6 +1717,7 @@ final class Browser: NSObject, ObservableObject {
             let tab = Tab(configuration: Web.configuration(space: space))
             prepare(tab)
             tab.restore(url: url, title: entry.title, name: entry.name)
+            tab.surfaced = entry.surfaced ?? false
             tab.pin = entry.pin
             if entry.pin == nil { tab.groupID = entry.groupID }
             row.append(tab)
@@ -1660,11 +1805,12 @@ final class Browser: NSObject, ObservableObject {
         // A tab just put down with ⌘W has no page to lift a video out of, and
         // asking it would only build an empty view to ask.
         guard let tab, !tab.isBlank, !tab.asleep, !floater.showing else { return }
+        guard tab.built != nil else { return }
         // On its own, only from a site whose video is the point of the site.
         // A hero background on a studio's home page is a video too, and it
         // followed people around the desktop. ⌘⇧P still lifts from anywhere.
         if quietly, !Players.knows(tab.address) { return }
-        tab.web.evaluateInSearch(Isolate.on) { [weak self] answer in
+        tab.built?.evaluateInSearch(Isolate.on) { [weak self] answer in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 guard (answer as? String) == "floating" else {
@@ -1687,7 +1833,7 @@ final class Browser: NSObject, ObservableObject {
         guard let id = floating, let tab = tabs.first(where: { $0.id == id }) else { return }
         floating = nil
         tab.floating = false
-        tab.web.evaluateInSearch(Isolate.off)
+        tab.built?.evaluateInSearch(Isolate.off)
     }
 
     func prepare(_ tab: Tab) {
@@ -1713,6 +1859,16 @@ final class Browser: NSObject, ObservableObject {
             self.open(url, foreground: true, from: tab)
         }
         tab.onStoreAdd = { [weak self] tab in self?.addFromStore(tab) }
+        // One of ours asked for from inside a tab — typed, pasted, ghosted —
+        // comes to the front of the tab that already holds it, as it does
+        // coming from a menu. "Only ever one" is a browser's promise, not
+        // the address bar's.
+        tab.onNative = { [weak self] tab, page in
+            guard let self, let existing = tabs.first(where: { $0 !== tab && $0.native == page })
+            else { return false }
+            select(existing)
+            return true
+        }
         // The middle button on a link opens it beside the tab you are on, as
         // it does in every other browser (see MiddleRelay).
         // From a private tab, the new one is private too, as for ⌘-click.
@@ -2026,7 +2182,7 @@ extension Browser {
     var orderedGroups: [TabGroup] {
         var seen: Set<UUID> = []
         var found: [TabGroup] = []
-        for tab in tabs {
+        for tab in tabs where !tab.bench {
             guard let id = tab.groupID, seen.insert(id).inserted,
                   let group = groups.first(where: { $0.id == id })
             else { continue }
@@ -2041,7 +2197,7 @@ extension Browser {
     var visibleItems: [TabItem] {
         var out: [TabItem] = []
         var headed: Set<UUID> = []
-        for tab in tabs {
+        for tab in tabs where !tab.bench {
             guard let group = group(for: tab) else {
                 out.append(.tab(tab))
                 continue
@@ -2067,7 +2223,7 @@ extension Browser {
     }
 
     func groupCount(_ group: TabGroup) -> Int {
-        tabs.reduce(0) { $0 + ($1.groupID == group.id ? 1 : 0) }
+        tabs.reduce(0) { $0 + ($1.groupID == group.id && !$1.bench ? 1 : 0) }
     }
 
     /// Whether the tab on screen is in this group — for the mark a chip
@@ -2228,7 +2384,7 @@ extension Browser {
         // tabs leave nothing, as they never do.
         let entries = members.compactMap { tab -> Session.Entry? in
             guard !tab.shy, let url = tab.pending ?? tab.address,
-                  url.scheme?.hasPrefix("http") == true
+                  url.scheme?.hasPrefix("http") == true || NativePage(url: url) != nil
             else { return nil }
             return Session.Entry(
                 url: url.absoluteString, title: tab.title, pin: nil, name: tab.name
@@ -2487,7 +2643,8 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         for action: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        let from = tab(for: webView)?.id ?? activeID
+        let source = tab(for: webView)
+        let from = source?.id ?? activeID
         // WebKit's copy of the opener's configuration still holds the
         // opener's user content controller — its scripts and its message
         // handlers. Shared, the new tab claimed the opener's handlers as its
@@ -2495,19 +2652,24 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         // right-click on a picture on X, after following a link out of it,
         // did nothing at all. Each tab gets a controller of its own.
         configuration.userContentController = WKUserContentController()
-        let tab = Tab(shy: tab(for: webView)?.shy ?? false, configuration: configuration)
+        let tab = Tab(shy: source?.shy ?? false, bench: source?.bench ?? false, configuration: configuration)
+        tab.agentName = source?.agentName
+        tab.agentGroup = source?.agentGroup
         tab.popup = windowFeatures.width != nil || windowFeatures.height != nil
             || windowFeatures.toolbarsVisibility?.boolValue == false
-        adopt(tab)
+        if parkAgentChild(tab, from: source) { prepare(tab) } else { adopt(tab) }
+        if let source, source.bench { (AskRuntime.drive as? Drive)?.adoptAgentTab(tab, from: source) }
         tab.opener = from
         // It landed at the row's end; if the page that opened it was the
         // last thing in its group's run, the new tab grew out of the group.
-        if let from, let at = tabs.firstIndex(where: { $0.id == from }),
+        if !tab.bench, let from, let at = tabs.firstIndex(where: { $0.id == from }),
            at + 2 == tabs.count {
             tab.groupID = tabs[at].groupID
         }
-        activeID = tab.id
-        editing = false
+        if !tab.bench || source?.id == activeID {
+            activeID = tab.id
+            editing = false
+        }
         // Returning the view is what makes it the target. WebKit loads the
         // request into it itself when the action carries one.
         if let url = action.request.url { tab.setAddressOptimistically(url) }
@@ -2729,7 +2891,7 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
     }
 
     func tab(for webView: WKWebView) -> Tab? {
-        tabs.first { $0.built === webView }
+        allTabs.first { $0.built === webView }
     }
 }
 

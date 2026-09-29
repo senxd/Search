@@ -1305,8 +1305,7 @@ private struct ExtensionMenu: View {
                 }
                 Foot("gearshape", "Manage Extensions…") {
                     extensions.menuOpen = false
-                    Store.settings.set("extensions", forKey: "settings.page")
-                    extensions.browser?.tuning = true
+                    extensions.browser?.openInternal(.settings, section: "extensions")
                 }
             }
             .padding(6)

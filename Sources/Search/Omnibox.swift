@@ -42,6 +42,15 @@ struct Omnibox: View {
                         list
                             .frame(width: Metrics.fieldWidth)
                             .offset(y: Self.fieldHeight + 8)
+                    } else if !over, browser.prefs.ask, browser.prefs.newTabCards,
+                              !(browser.active?.shy ?? false) {
+                        // The standing field's shelf — the same gate the
+                        // list keys on, so cards and list trade places on
+                        // one quick crossfade and never share the anchor.
+                        NewTabShelf(browser: browser)
+                            .frame(width: Metrics.fieldWidth)
+                            .offset(y: Self.fieldHeight + 28)
+                            .transition(.opacity)
                     }
                 }
                 // Lifted a little above centre: dead centre reads as low,

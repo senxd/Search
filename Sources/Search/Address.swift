@@ -7,8 +7,9 @@ import Foundation
 enum Address {
     /// Schemes the window can show itself. Anything else typed with a scheme —
     /// mailto:, a custom app link — is somebody else's job and gets refused
-    /// here rather than opening a blank tab.
-    private static let ours: Set<String> = ["http", "https", "file", "about", "data"]
+    /// here rather than opening a blank tab. "search" is ours too — the
+    /// app's own pages, typed the way chrome://settings is.
+    private static let ours: Set<String> = ["http", "https", "file", "about", "data", "search"]
 
     static func url(from typed: String) -> URL? {
         let text = typed.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -67,6 +68,9 @@ enum Address {
     /// What the tab says before the page has told us its title: the address,
     /// with the parts nobody reads taken off.
     static func pretty(_ url: URL) -> String {
+        // Ours stay whole — "settings" alone is a word to search for, not
+        // the place the tab holds; the scheme is what keeps it honest.
+        if NativePage(url: url) != nil { return url.absoluteString }
         guard let host = url.host() else { return url.absoluteString }
         let bare = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
         let path = url.path()

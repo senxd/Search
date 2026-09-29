@@ -32,6 +32,8 @@ stages `ask.keys.json` (real world or `--keys`, chmod 600, contents
 never read); launches the binary with `SEARCH_PROBE`; waits for
 `agent.sock` + ping; serves fixtures; opens the Ask rail; runs a
 preflight turn (openrouter 400/404 → codex fallback, one relaunch);
+authentication, credit, timeout, or invalid preflight replies stop the run
+before any scenario is scored;
 then per scenario: `ui.ask{new:true}` → setup tabs → `ui.ask{send}` →
 drive steps → chat-file wait (newest role ∈ {agent,note} + 1.5 s mtime
 quiet) → verify over `./bench` → `winshot` → `close all`. Results land
@@ -51,3 +53,8 @@ follows a real-site probe at run start.
 Requires the sibling `ui.ask{new}` in Drive.swift for per-scenario chat
 isolation; without it the runner reports `isolation:"shared"` and keeps
 going.
+
+`python3 Runtime/ask/bench/check.py` checks preflight and rate-limit
+classification without a provider. `python3 Tests/Agent/input_check.py WORLD`
+checks native input, scroll-end, and idle steering against a running isolated
+world configured with `ask.model` echo/echo.

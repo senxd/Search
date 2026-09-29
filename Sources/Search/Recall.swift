@@ -39,18 +39,18 @@ enum When {
     }
 }
 
-struct HistoryPanel: View {
+struct HistoryPage: View {
     @ObservedObject var browser: Browser
 
     @FocusState private var hunting: Bool
     @State private var traces: [History.Trace] = []
     /// The list as drawn: each day's name, then its pages. Worked out when
-    /// the history or the search changes, not each time the panel is drawn.
+    /// the history or the search changes, not each time the page is drawn.
     @State private var lines: [Listed] = []
     @State private var clearing = false
 
     var body: some View {
-        Plate("History", width: 600, close: { browser.recalling = false }) {
+        PageSheet("History") {
             VStack(alignment: .leading, spacing: 14) {
                 Hunt(text: $browser.recallHunt, prompt: "Search everywhere you have been", focus: $hunting)
 
@@ -73,10 +73,7 @@ struct HistoryPanel: View {
                                         if !first { Rule() }
                                         Row(
                                             trace: trace,
-                                            go: {
-                                                browser.recalling = false
-                                                browser.active?.go(to: trace.url)
-                                            },
+                                            go: { browser.visit(trace.url) },
                                             forget: {
                                                 browser.history.forget(trace.key)
                                                 refresh()
@@ -101,7 +98,7 @@ struct HistoryPanel: View {
                         }
                         .padding(.bottom, 2)
                     }
-                    .frame(maxHeight: 420)
+                    .frame(maxHeight: .infinity)
                 }
             }
         } foot: {
@@ -245,12 +242,12 @@ struct HistoryPanel: View {
     }
 }
 
-struct DownloadsPanel: View {
+struct DownloadsPage: View {
     @ObservedObject var browser: Browser
     @ObservedObject var loot: Loot
 
     var body: some View {
-        Plate("Downloads", width: 560, close: { browser.hoarding = false }) {
+        PageSheet("Downloads") {
             if loot.kept.isEmpty {
                 Card { Nothing("Nothing downloaded yet.") }
             } else {
@@ -268,7 +265,7 @@ struct DownloadsPanel: View {
                     }
                     .padding(.bottom, 2)
                 }
-                .frame(maxHeight: 420)
+                .frame(maxHeight: .infinity)
             }
         } foot: {
             HStack {

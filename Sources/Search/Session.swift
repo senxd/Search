@@ -13,6 +13,7 @@ enum Session {
         var name: String?
         /// The group it sat in, when it sat in one.
         var groupID: UUID?
+        var surfaced: Bool?
     }
 
     struct Shape: Codable {

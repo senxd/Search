@@ -37,8 +37,7 @@ extension Browser {
     /// The inspector of the tab in front — none for a blank tab, which has
     /// no page to look at.
     private func inspector() -> NSObject? {
-        guard let tab = active, !tab.isBlank else { return nil }
-        let web = tab.web
+        guard let tab = active, let web = tab.built else { return nil }
         let get = NSSelectorFromString("_inspector")
         guard web.responds(to: get) else { return nil }
         return web.perform(get)?.takeUnretainedValue() as? NSObject

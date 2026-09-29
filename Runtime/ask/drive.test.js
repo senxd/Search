@@ -355,31 +355,33 @@ console.log('fix 2 — frame-space coordinates');
   eq(JSON.stringify(res.at), JSON.stringify([58, 430]), 'at is top-viewport coords: ' + JSON.stringify(res.at));
 }
 
-console.log('fix 3 — auto-tier escalation signals');
+console.log('single-dispatch clicks');
 {
-  // A dead button: gesture lands, nothing answers — escalate via ignored.
+  // A side effect with no DOM change must not trigger a retry.
   const dead = w.document.createElement('button');
   dead.textContent = 'Dead';
   dead.setAttribute('data-rect', '8,340,80,28');
   w.document.querySelector('main').appendChild(dead);
   drive.snapshot({});
   const deadRef = dead.__driveRef.ref;
+  let requests = 0;
+  dead.addEventListener('click', () => { requests++; });
   const d1 = await drive.act('click', { ref: deadRef }, {});
+  eq(requests, 1, 'side effect without DOM mutation runs once');
   eq(d1.ok, true, 'auto click on dead button still reports the JS tier ran');
-  eq(d1.ignored, true, 'auto click that drew no response flags ignored:true');
+  eq(d1.ignored, undefined, 'a dispatched click is never retried for lack of DOM changes');
   eq(d1.tier, 'js', 'tier reported js');
-  ok(Array.isArray(d1.at), 'ignored result still carries at for escalation');
+  ok(Array.isArray(d1.at), 'click result carries its coordinates');
 
-  // An occluded button: elementFromPoint keeps answering the overlay —
-  // JS semantics visibly failed, so auto hands the point to real events.
+  // An occluded button must never dispatch to the overlay.
   const veil = w.document.createElement('div');
   veil.id = 'veil';
   veil.setAttribute('data-rect', '0,180,300,60'); // covers #save's 8,200,80,28 centre
   w.document.body.appendChild(veil);
   const cv = await drive.act('click', { ref: saveRef }, {});
-  eq(cv.escalate, true, 'covered element under auto escalates');
-  eq(cv.code, 'COVERED', 'escalation carries the reason code');
-  eq(JSON.stringify(cv.at), JSON.stringify([48, 214]), 'escalation at is the element centre');
+  eq(cv.escalate, undefined, 'covered element is refused without clicking the overlay');
+  eq(cv.code, 'COVERED', 'covered failure carries its reason code');
+  eq(JSON.stringify(cv.at), JSON.stringify([48, 214]), 'covered failure carries element coordinates');
   veil.remove();
 }
 
@@ -413,6 +415,21 @@ console.log('fix 5 — ARIA checkbox state + content names');
   ok(!!line && /\[checked\]/.test(line), 'aria-checked=true shows [checked]');
   ok(!!line && /loc=role:checkbox/.test(line), 'aria checkbox gets a role loc');
   ok(drive.resolve({ loc: 'role:checkbox[name="Pretend checkbox"]' }) === acb, 'role loc resolves the aria checkbox');
+}
+
+console.log('open shadow roots and scoped snapshots');
+{
+  const host = w.document.createElement('div');
+  host.attachShadow({mode: 'open'}).innerHTML = '<button id="shadow-button" data-rect="8,380,80,28">Shadow action</button>';
+  w.document.body.appendChild(host);
+  const tree = drive.snapshot({ interactive: true });
+  ok(tree.snapshot.includes('Shadow action'), 'snapshot enters open shadow root');
+  const button = drive.resolve({css: '#shadow-button'});
+  ok(button === host.shadowRoot.querySelector('button'), 'CSS resolves in open shadow root');
+  ok(drive.resolve({ref: button.__driveRef.ref}) === button, 'shadow refs resolve');
+  const scoped = drive.snapshot({ref: button.__driveRef.ref});
+  ok(scoped.snapshot.includes('Shadow action') && !scoped.snapshot.includes('Below the fold'), 'ref limits snapshot scope');
+  host.remove();
 }
 
 console.log('fix 6 — refs pruned per snapshot');

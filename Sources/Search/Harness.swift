@@ -33,6 +33,19 @@ import WebKit
 final class Harness: NSObject, AskEngine {
     static let shared = Harness()
 
+    /// Which Drive session this seat's turns belong to — the app's chat
+    /// for the interactive harness, a routine's for the automation seat
+    /// (Routines.swift). Set at dispatch, once per seat.
+    var origin: DriveOrigin = .app
+    /// Where turn events land — `Mind.hear` for the interactive seat, the
+    /// controller's per-run fold for a routine. The seat never decides
+    /// which chat an event is for: the harness echoes the run's stamp.
+    var sink: (AskEvent) -> Void = { Mind.shared.hear($0) }
+    /// Where a parked ask.user lands — nil leaves Mind.pose in place; a
+    /// routine seat routes it to the run's waitingQuestion instead, so a
+    /// scheduled job never pops the rail (design/automation-backend §4).
+    var onAsk: ((String, [String]) -> Void)?
+
     private var web: WKWebView?
     private var loaded = false
     private var pendingJS: [(js: String, onError: (@MainActor (Error) -> Void)?)] = []
@@ -49,9 +62,11 @@ final class Harness: NSObject, AskEngine {
 
     private(set) var running = false
 
-    override init() {
+    /// `registering: false` for the routine seat — its engine never claims
+    /// `Mind.engine`; the webview still boots lazily on the first run.
+    init(registering: Bool = true) {
         super.init()
-        attach()
+        if registering { attach() }
     }
 
     /// Registers this engine with the panel's state. Touching
@@ -99,14 +114,23 @@ final class Harness: NSObject, AskEngine {
 
     // MARK: - AskEngine
 
+    private var toolCancellations: [Int: AgentCancellation] = [:]
+
+    private func cancelTools() {
+        let outstanding = Array(toolCancellations.values)
+        toolCancellations.removeAll()
+        outstanding.forEach { $0.cancel() }
+    }
+
     func run(_ job: AskJob) {
+        cancelTools()
         running = true
         activeChat = job.chat.id
         // A new turn replaces the old one's open seats: a question the last
         // turn was holding goes, and its parked approval cards settle —
         // the consent was that turn's.
         pendingAsk = nil
-        (AskRuntime.drive as? Drive)?.denyPending(for: .app, reason: "a new turn took over")
+        (AskRuntime.drive as? Drive)?.denyPending(for: origin, reason: "a new turn took over")
         _ = boot()
         struct JobJSON: Encodable {
             var chat: AskChat
@@ -123,7 +147,7 @@ final class Harness: NSObject, AskEngine {
               var chatObject = object["chat"] as? [String: Any]
         else {
             running = false
-            Mind.shared.hear(.done(chat: job.chat.id, error: "could not encode the job"))
+            sink(.done(chat: job.chat.id, error: "could not encode the job"))
             return
         }
         // The turn stamp (design/interaction.md §2): the harness echoes
@@ -138,7 +162,7 @@ final class Harness: NSObject, AskEngine {
               let json = String(data: stamped, encoding: .utf8)
         else {
             running = false
-            Mind.shared.hear(.done(chat: job.chat.id, error: "could not encode the job"))
+            sink(.done(chat: job.chat.id, error: "could not encode the job"))
             return
         }
         tell("__h.run(\(json));") { [weak self] error in
@@ -149,7 +173,7 @@ final class Harness: NSObject, AskEngine {
             NSLog("[harness] __h.run never landed: %@", error.localizedDescription)
             self.running = false
             if self.activeChat == job.chat.id { self.activeChat = nil }
-            Mind.shared.hear(.done(chat: job.chat.id, error: "harness page didn't answer"))
+            self.sink(.done(chat: job.chat.id, error: "harness page didn't answer"))
         }
     }
 
@@ -158,13 +182,14 @@ final class Harness: NSObject, AskEngine {
     }
 
     func stop() {
+        cancelTools()
         tell("__h.stop();")
         running = false
         // The JS side flushes its parked tool promises on kill; the seats
         // on this side have to empty too — a question card's seat, and any
-        // approval cards Drive still holds for the app's session.
+        // approval cards Drive still holds for this seat's session.
         pendingAsk = nil
-        (AskRuntime.drive as? Drive)?.denyPending(for: .app, reason: "the turn was stopped")
+        (AskRuntime.drive as? Drive)?.denyPending(for: origin, reason: "the turn was stopped")
     }
 
     /// Mind's answer to a parked ask_user — the question card resolved. A
@@ -299,11 +324,16 @@ final class Harness: NSObject, AskEngine {
         // ask.user never reaches Drive — it's the model asking the human,
         // parked here until the question card answers (resolveAsk).
         if name == "ask.user" { poseAsk(id, args); return }
-        guard let drive = AskRuntime.drive else {
+        guard let drive = AskRuntime.drive as? Drive else {
             toolReply(id, ["error": "driver not up"])
             return
         }
-        drive.perform(name, args) { [weak self] result in
+        // The seat's own session — a routine's ops gate under its leash
+        // (.routine's mode), not the app's.
+        let cancellation = AgentCancellation()
+        toolCancellations[id] = cancellation
+        drive.perform(name, args, from: origin, cancellation: cancellation) { [weak self] result in
+            self?.toolCancellations[id] = nil
             var result = result
             // A screenshot the model can see: the file Drive wrote, inlined
             // as a data URL alongside its path.
@@ -331,8 +361,13 @@ final class Harness: NSObject, AskEngine {
             return
         }
         pendingAsk = id
-        Mind.shared.pose(args["question"] as? String ?? "",
-                         options: args["options"] as? [String] ?? [], in: chat)
+        if let onAsk {
+            onAsk(args["question"] as? String ?? "",
+                  args["options"] as? [String] ?? [])
+        } else {
+            Mind.shared.pose(args["question"] as? String ?? "",
+                             options: args["options"] as? [String] ?? [], in: chat)
+        }
     }
 
     /// The grant door. Only attachTabs in harness.js sends this kind — one
@@ -343,6 +378,13 @@ final class Harness: NSObject, AskEngine {
     private func grant(_ body: [String: Any]) {
         guard let id = (body["id"] as? NSNumber)?.intValue,
               let tab = body["tab"] as? String else { return }
+        // Consent is the app's door — a routine seat's chips are always
+        // empty so nothing should arrive here, but a stray grant on a
+        // non-app origin must never write the registry anyway.
+        guard origin == .app else {
+            toolReply(id, ["error": "tabs.grant is the app's door"])
+            return
+        }
         guard let drive = AskRuntime.drive else {
             toolReply(id, ["error": "driver not up"])
             return
@@ -375,22 +417,22 @@ final class Harness: NSObject, AskEngine {
         switch name {
         case "delta":
             guard !stale(data), let text = data["text"] as? String else { return }
-            Mind.shared.hear(.delta(chat: chat, text: text))
+            sink(.delta(chat: chat, text: text))
         case "message":
             guard !stale(data),
                   let raw = data["message"],
                   let json = try? JSONSerialization.data(withJSONObject: raw),
                   let message = try? JSONDecoder().decode(AskMessage.self, from: json) else { return }
-            Mind.shared.hear(.message(chat: chat, message))
+            sink(.message(chat: chat, message))
         case "tool":
             guard !stale(data),
                   let raw = data["tool"],
                   let json = try? JSONSerialization.data(withJSONObject: raw),
                   let tool = try? JSONDecoder().decode(AskMessage.Tool.self, from: json) else { return }
-            Mind.shared.hear(.tool(chat: chat, tool))
+            sink(.tool(chat: chat, tool))
         case "activity":
             guard !stale(data) else { return }
-            Mind.shared.hear(.activity(chat: chat, (data["text"] as? String) ?? ""))
+            sink(.activity(chat: chat, (data["text"] as? String) ?? ""))
         case "done":
             // A killed turn's trailing done is dropped whole, not just
             // barred from the flags: Mind.hear(.done) clears the chat's
@@ -407,7 +449,7 @@ final class Harness: NSObject, AskEngine {
                 activeChat = nil
                 pendingAsk = nil
             }
-            Mind.shared.hear(.done(chat: chat, error: data["error"] as? String))
+            sink(.done(chat: chat, error: data["error"] as? String))
         default:
             break
         }
@@ -470,7 +512,7 @@ extension Harness: WKNavigationDelegate {
                     if let chat = self.activeChat, self.running {
                         self.running = false
                         self.activeChat = nil
-                        Mind.shared.hear(.done(chat: chat, error: "the agent script is missing"))
+                        self.sink(.done(chat: chat, error: "the agent script is missing"))
                     }
                 }
             }
@@ -489,12 +531,12 @@ extension Harness: WKNavigationDelegate {
             fetches = [:]
             // The seats die with the page that was holding them.
             pendingAsk = nil
-            (AskRuntime.drive as? Drive)?.denyPending(for: .app, reason: "the turn's host died")
+            (AskRuntime.drive as? Drive)?.denyPending(for: origin, reason: "the turn's host died")
             if running {
                 running = false
                 if let chat = activeChat {
                     activeChat = nil
-                    Mind.shared.hear(.done(chat: chat, error: "the model host crashed — ask again"))
+                    sink(.done(chat: chat, error: "the model host crashed — ask again"))
                 }
             }
         }
