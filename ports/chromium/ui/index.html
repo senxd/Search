@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'">
+  <title>Search Chromium</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <button id="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar">☰</button>
+    <button id="back" title="Back" aria-label="Back">←</button>
+    <button id="forward" title="Forward" aria-label="Forward">→</button>
+    <button id="reload" title="Reload" aria-label="Reload">↻</button>
+    <form id="address-form"><input id="address" aria-label="Address or search" placeholder="An address, or a few words" autocomplete="off" spellcheck="false" list="address-suggestions"><datalist id="address-suggestions"></datalist></form>
+    <button id="bookmark" title="Bookmark page" aria-label="Bookmark page">☆</button>
+    <button id="more" title="Settings and library" aria-label="Settings and library">•••</button>
+  </header>
+  <nav id="top-tabs" aria-label="Tabs across the top"></nav>
+  <aside>
+    <div class="brand"><span>Search</span><span id="engine-badge">Chromium</span></div>
+    <select id="spaces" aria-label="Space"></select>
+    <nav id="tabs" aria-label="Tabs"></nav>
+    <div class="tab-actions"><button id="new-tab">＋ New tab</button><button id="private-tab" title="New private tab" aria-label="New private tab">◈</button></div>
+    <button id="new-space">＋ New space</button>
+    <div id="connection-status">Local. Quiet. Yours.</div>
+  </aside>
+  <main id="surface" tabindex="0" aria-label="Browser page">
+    <img id="page" alt="Rendered browser page" draggable="false">
+    <section id="empty"><h1>A little less browser.</h1><p>Type an address, or search for something.</p></section>
+    <div id="page-failure" role="alert" hidden></div>
+  </main>
+  <dialog id="library">
+    <div class="dialog-heading"><h2>Make yourself at home.</h2><button id="close-library" aria-label="Close settings">×</button></div>
+    <div class="settings-row"><label for="appearance">Appearance</label><select id="appearance"><option value="system">Follow system</option><option value="light">Light</option><option value="dark">Dark</option></select></div>
+    <div class="settings-row"><label for="search-engine">Search with</label><select id="search-engine"><option value="https://www.google.com/search?q=%s">Google</option><option value="https://duckduckgo.com/?q=%s">DuckDuckGo</option><option value="https://www.bing.com/search?q=%s">Bing</option><option value="https://www.ecosia.org/search?q=%s">Ecosia</option><option value="https://www.startpage.com/sp/search?query=%s">Startpage</option><option value="https://kagi.com/search?q=%s">Kagi</option></select></div>
+    <div class="settings-row"><label for="shield">Block known third-party trackers</label><input id="shield" type="checkbox"></div>
+    <div class="settings-row"><label for="custom-search">Custom search URL</label><input id="custom-search" placeholder="https://…?q=%s"></div>
+    <div class="settings-row"><label for="auto-sleep">Sleep idle tabs</label><input id="auto-sleep" type="checkbox"></div>
+    <div class="settings-row"><label for="sleep-minutes">After minutes</label><input id="sleep-minutes" type="number" min="1" max="1440"></div>
+    <div class="settings-row"><label for="shared-space">New spaces share sign-ins</label><input id="shared-space" type="checkbox" checked></div>
+    <div class="settings-row" id="renderer-control" hidden><label for="renderer-choice">Renderer for new tabs</label><select id="renderer-choice"></select></div>
+    <div class="settings-row" id="agent-control" hidden><label for="agent-enabled">Let a local agent drive this browser</label><input id="agent-enabled" type="checkbox"></div>
+    <button id="default-browser" hidden>Use as default browser</button>
+    <div class="library-actions"><button id="reader">Reading mode</button><button id="find">Find on page</button><button id="reopen">Reopen closed tab</button><button id="tab-search">Search tabs</button><button id="hide-picker">Hide an element</button><button id="hidden-review">Hidden here</button><button id="shield-site">Shield on this site</button><button id="pip">Float video</button></div>
+    <h3>Library</h3><input id="library-search" placeholder="Search bookmarks and history" aria-label="Search library">
+    <div class="library-actions"><button id="library-import">Import</button><button id="library-export">Export</button><input id="library-file" type="file" accept=".json,.html,.htm" hidden></div>
+    <h3>Bookmarks</h3><div id="bookmarks" class="entries"></div>
+    <h3>History <button id="clear-history">Clear</button></h3><div id="history" class="entries"></div>
+    <h3>Downloads</h3><div id="downloads" class="entries"></div>
+    <h3>Extensions</h3><div class="library-actions"><button id="extension-store">Add from Chrome Web Store</button><button id="extension-folder">Load folder</button></div><div id="extensions" class="entries"></div>
+    <h3>Passwords</h3><p id="vault-status"></p><div class="library-actions"><button id="password-list">Saved accounts for this page</button><button id="password-save">Save an account</button><button id="password-import">Import CSV</button><input id="password-file" type="file" accept=".csv" hidden></div>
+    <div class="library-actions"><button id="devtools">Web inspector</button><button id="print">Print page</button><button id="update-check">Check for updates</button></div>
+  </dialog>
+  <dialog id="connect"><h2>Connect to your browser</h2><p>Enter the local token from your profile’s connection.json file.</p><form id="connect-form"><input id="token" type="password" aria-label="Local connection token" required><button>Connect</button></form></dialog>
+  <dialog id="prompt-dialog"><form id="prompt-form"><h2 id="prompt-label"></h2><input id="prompt-value" aria-labelledby="prompt-label"><div class="prompt-actions"><button id="prompt-cancel" type="button">Cancel</button><button>Continue</button></div></form></dialog>
+  <dialog id="choices"><div class="dialog-heading"><h2 id="choices-label"></h2><button id="close-choices" aria-label="Close">×</button></div><div id="choices-list" class="entries"></div></dialog>
+  <dialog id="account-dialog"><h2>Save an account</h2><form id="account-form"><label>Username<input id="account-user" autocomplete="username" required></label><label>Password<input id="account-password" type="password" autocomplete="new-password" required></label><div class="prompt-actions"><button id="account-cancel" type="button">Cancel</button><button>Save</button></div></form></dialog>
+  <input id="page-keyboard" aria-label="Type into browser page" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <button id="mobile-keyboard" title="Type into page" aria-label="Type into page">⌨</button>
+  <div id="notice" role="status" hidden></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

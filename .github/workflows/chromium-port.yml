@@ -1,0 +1,57 @@
+name: Chromium port checks
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['ports/chromium/**', '.github/workflows/chromium-port.yml']
+permissions:
+  contents: read
+jobs:
+  chromium:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ports/chromium
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ports/chromium/package-lock.json
+      - run: npm ci
+      - run: node node_modules/electron/install.js
+      - run: npx --no-install playwright-core install --with-deps chromium
+      - run: sudo apt-get update && sudo apt-get install -y xserver-xorg-core xserver-xorg-video-dummy
+      - name: Real Chromium integration
+        run: |
+          chromium_path=$(node --input-type=module -e "import {chromium} from 'playwright-core'; process.stdout.write(chromium.executablePath())")
+          SEARCH_CHROMIUM_PATH="$chromium_path" SEARCH_CHROMIUM_SANDBOX=off npm test
+      - run: npm run pack -- --linux --x64 -c.electronDist=node_modules/electron/dist
+      - name: Packaged desktop smoke on isolated virtual display
+        run: SEARCH_SMOKE_EXECUTABLE="$PWD/dist/linux-unpacked/browser-lab" npm run test:desktop:cloud
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: windows
+          - os: macos-15
+            target: mac
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ports/chromium
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ports/chromium/package-lock.json
+      - run: npm ci
+      - run: node node_modules/electron/install.js
+      - name: Build development installer (unsigned; no publishing)
+        run: npm run dist:${{ matrix.target }} -- --publish never

@@ -1,0 +1,35 @@
+{
+  "name": "search-chromium",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "author": "senxd",
+  "homepage": "https://github.com/senxd/Search",
+  "repository": { "type": "git", "url": "https://github.com/senxd/Search.git" },
+  "desktopName": "io.senxd.browserlab.desktop",
+  "type": "module",
+  "description": "Search's portable browser core, Chromium hosts, and agent API",
+  "main": "src/desktop.cjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "electron .",
+    "cloud": "node src/cloud.js",
+    "agent": "node src/agent.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "test:desktop": "electron . --smoke",
+    "test:desktop:cloud": "bash scripts/desktop-smoke.sh",
+    "pack": "electron-builder --dir --config electron-builder.json",
+    "dist:linux": "electron-builder --linux --config electron-builder.json",
+    "dist:mac": "electron-builder --mac --config electron-builder.json",
+    "dist:windows": "electron-builder --win --config electron-builder.json"
+  },
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3"
+  }
+}

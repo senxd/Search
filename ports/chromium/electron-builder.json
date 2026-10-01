@@ -1,0 +1,14 @@
+{
+  "appId": "io.senxd.browserlab",
+  "productName": "Browser Lab",
+  "asar": true,
+  "publish": null,
+  "files": ["src/**/*", "ui/**/*", "package.json", "!**/test/**", "!**/test-results/**"],
+  "extraResources": [{ "from": "../../LICENSE", "to": "LICENSE" }],
+  "artifactName": "Browser-Lab-${version}-${os}-${arch}.${ext}",
+  "linux": { "target": ["AppImage", "deb"], "category": "Network", "executableName": "browser-lab", "maintainer": "senxd", "syncDesktopName": true, "mimeTypes": ["x-scheme-handler/http", "x-scheme-handler/https"] },
+  "mac": { "target": ["dmg", "zip"], "category": "public.app-category.productivity", "hardenedRuntime": true, "extendInfo": { "CFBundleURLTypes": [{ "CFBundleURLSchemes": ["http", "https"], "CFBundleURLName": "Web links" }], "NSCameraUsageDescription": "Allow a site you approve to use your camera.", "NSMicrophoneUsageDescription": "Allow a site you approve to use your microphone." } },
+  "win": { "target": ["nsis"] },
+  "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "perMachine": false },
+  "protocols": [{ "name": "Web links", "schemes": ["http", "https"] }]
+}
