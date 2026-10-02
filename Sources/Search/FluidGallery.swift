@@ -692,7 +692,11 @@ private struct FlowLayoutBadges: View {
             return
         }
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate()
+        // Plain activate() doesn't key the window when the binary was
+        // launched from a shell — the app has to actually take focus.
+        NSApp.activate(ignoringOtherApps: true)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        window.makeKeyAndOrderFront(nil)
         func findAnchor(_ v: NSView) -> NSView? {
             if v is FluidAnchorResolver.AnchorView { return v }
             for s in v.subviews { if let f = findAnchor(s) { return f } }
@@ -735,6 +739,60 @@ private struct FlowLayoutBadges: View {
             }
         }
         Self.snapshotGallery(to: "/tmp/drop-open.png", windowOnly: true)
+
+        // FLUID_SUBPROBE=1 — keyboard-drive into the first submenu row:
+        // ↓ through the rows to "Export", then → opens the sub (Radix
+        // SUB_OPEN_KEYS). Dumps + captures the sub panel — the audit
+        // found subs pinned screen-tall; this verifies the fix.
+        if ProcessInfo.processInfo.environment["FLUID_SUBPROBE"] == "1" {
+            // Wait for the env-seeded popup to actually present (the
+            // modifier opens it ~1.5s in, post-layout).
+            var waited = 0
+            while waited < 40,
+                  !(window.childWindows ?? []).contains(where: {
+                      String(describing: type(of: $0)).contains("PopupPanel")
+                          && $0.frame.width > 0
+                  }) {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                waited += 1
+            }
+            dump("open")
+            // Keys must not be headed for a text field — navKey yields
+            // to NSTextView responders (field parity). Take it back.
+            window.makeFirstResponder(window.contentView)
+            func key(_ code: UInt16) {
+                if let e = NSEvent.keyEvent(with: .keyDown, location: .zero,
+                        modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                        windowNumber: window.windowNumber, context: nil,
+                        characters: "", charactersIgnoringModifiers: "",
+                        isARepeat: false, keyCode: code) {
+                    NSApp.sendEvent(e)
+                }
+            }
+            // Focus seeds at the checked row (index 1); navOrder is
+            // [0,1,2,3,7,4,6] (5 disabled) — ↓×3 lands on "Export" (7).
+            for _ in 0..<3 {
+                key(125) // ↓
+                try? await Task.sleep(nanoseconds: 60_000_000)
+            }
+            key(124) // → opens the submenu row
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            dump("sub")
+            if let sub = window.childWindows?.last,
+               let subPanel = sub.childWindows?.first ?? (sub != window.childWindows?.first ? sub : nil) {
+                Self.shotWindowContent(subPanel.contentView!, to: "/tmp/drop-sub.png")
+            }
+            // ↑ inside the sub must move within it, not the parent.
+            key(126)
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            dump("sub-up")
+            // Return on a sub row must run the row's own onSelect path —
+            // the menu dismiss env closes the panels (visible in dumps).
+            key(36)
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            dump("ret")
+            Self.snapshotGallery(to: "/tmp/drop-subopen.png", windowOnly: true)
+        }
         FileHandle.standardError.write("FLUID_DROPPROBE done\n".data(using: .utf8)!)
     }
 
@@ -904,10 +962,25 @@ private struct GallerySwitches: View {
 
 private struct GallerySliderSection: View {
     @State private var slider = 40.0
+    @State private var scrub = 35.0
+    @State private var rangePair = (20.0, 70.0)
+    @State private var stepped = 2.0
+    @State private var tipped = 55.0
+    @State private var dotted = 30.0
 
     var body: some View {
-        FluidSlider(value: $slider, label: "Volume")
-            .frame(width: 288)
+        VStack(alignment: .leading, spacing: 14) {
+            FluidSlider(value: $slider, label: "Volume")
+            FluidSlider(value: $scrub, label: "Scrub", variant: .scrubber)
+            FluidSlider(value: $rangePair, label: "Range", showValue: true)
+            FluidSlider(value: $stepped, steps: [0, 1, 2, 3, 4], label: "Steps",
+                        showValue: true, valuePosition: .right)
+            FluidSlider(value: $tipped, label: "Tooltip",
+                        showValue: true, valuePosition: .tooltip)
+            FluidSlider(value: $dotted, label: "Marked", showSteps: true,
+                        showValue: true, valuePosition: .bottom)
+        }
+        .frame(width: 288)
     }
 }
 
@@ -935,6 +1008,11 @@ private struct GalleryTabsSubtle: View {
 
 private struct GalleryDropdown: View {
     @State private var menuChecked = 1
+    /// FLUID_MENUOPEN=1 opens the popup shortly after launch so headless
+    /// probes can drive it with synthetic key events (the click path
+    /// can't toggle a binding, and the off-screen cell can't take
+    /// pointer events). Deferred — present-at-init lands before the
+    /// window has a screen and parks off-frame.
     @State private var menuOpen = false
 
     var body: some View {
@@ -942,6 +1020,12 @@ private struct GalleryDropdown: View {
             FluidButton("Actions", variant: .secondary) { menuOpen.toggle() }
                 .fluidMenuPopup(isPresented: $menuOpen, disabledIndices: [5]) {
                     menuRows
+                }
+                .task {
+                    guard ProcessInfo.processInfo.environment["FLUID_MENUOPEN"] == "1"
+                    else { return }
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    menuOpen = true
                 }
             FluidMenuPanel(
                 disabledIndices: [5],
@@ -966,6 +1050,11 @@ private struct GalleryDropdown: View {
             menuChecked = 3
         }
         FluidMenuSeparator()
+        FluidSubmenu(index: 7, icon: "square.and.arrow.up", label: "Export") {
+            FluidMenuItem(index: 0, icon: "doc", label: "PDF")
+            FluidMenuItem(index: 1, icon: "doc.plaintext", label: "Markdown")
+            FluidMenuItem(index: 2, icon: "photo", label: "PNG")
+        }
         FluidMenuItem(index: 4, icon: "gearshape", label: "Settings")
         FluidMenuItem(index: 5, icon: "trash", label: "Delete", disabled: true)
         FluidMenuItem(index: 6, icon: "rectangle.portrait.and.arrow.right", label: "Log out")
@@ -974,8 +1063,17 @@ private struct GalleryDropdown: View {
 }
 
 private struct GalleryComboboxSingle: View {
-    @State private var fruit = FluidComboboxModel(items: FluidGallery.fruits)
+    @State private var fruit: FluidComboboxModel
     @FocusState private var fruitFocus: Bool
+
+    init() {
+        let m = FluidComboboxModel(items: FluidGallery.fruits)
+        // FLUID_OPEN mounts the list for screenshots/probes.
+        if ProcessInfo.processInfo.environment["FLUID_OPEN"] != nil {
+            m.open = true
+        }
+        _fruit = State(initialValue: m)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -998,6 +1096,9 @@ private struct GalleryComboboxChips: View {
         let m = FluidComboboxModel(items: FluidGallery.fruits)
         m.hideSelected = true
         m.values = ["Apple", "Cherry"]
+        if ProcessInfo.processInfo.environment["FLUID_OPEN"] != nil {
+            m.open = true
+        }
         _picked = State(initialValue: m)
     }
 

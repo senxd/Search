@@ -26,6 +26,7 @@ const inflight = {};
 
 window.__native = {
   post(m) {
+    if (m.kind === 'permissions') return void setTimeout(() => window.__h._tool(m.id, { mode: 'full', confirmationCriteria: [] }), 0);
     if (m.kind === 'fetch') return void handleFetch(m);
     if (m.kind === 'abort') return void (inflight[m.id] && inflight[m.id].abort());
     if (m.kind === 'tool') return void setTimeout(() => window.__h._tool(m.id, mockTool(m.name, m.args)), 0);

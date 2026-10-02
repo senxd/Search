@@ -1,0 +1,12 @@
+{
+  "label": "after-auto",
+  "world": "turnstile-after-auto-1790808875",
+  "model": "codex/gpt-6-luna",
+  "effort": "auto",
+  "fixture_sha256": "d89cfeaacc6eb3098c1abb1f3737200e776024a2c3e33cbb956e54ffaddec463",
+  "started": "2026-09-30T22:54:35.852381+00:00",
+  "harness_sha256": "f46b78f9288f4d705d31e5c5d19def4bba219d735bb80289cf098ab77a81f0ba",
+  "skill_sha256": "d1e0945460af0c27e78a454ef22d45030aaf34a779c2f299399f1d536bee7b7c",
+  "error": "bench pages on failed: error: pages only works on a --test run",
+  "cleaned_up": true
+}

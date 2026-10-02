@@ -214,6 +214,10 @@ struct SettingsPage: View {
                 Segmented(options: Look.allCases.map { ($0, $0.title) }, selection: $prefs.look)
             }
             Rule()
+            Line("Opaque window", "The chrome's grey is solid, as it always was — off, it is glass and the windows behind it show through, blurred") {
+                Switch(on: $prefs.opaqueWindow)
+            }
+            Rule()
             Line("Correct spelling as you type", "macOS's autocorrect inside pages — the one that capitalises for you") {
                 Switch(on: $prefs.autocorrect)
             }
@@ -447,6 +451,28 @@ struct SettingsPage: View {
                     Switch(on: $prefs.newTabCards)
                 }
                 Rule()
+                Line("Let agents switch tabs", "Agents can bring a tab they own or have access to into view. Applies to Ask and connected agents.") {
+                    Switch(on: $prefs.agentFocus)
+                }
+                Rule()
+                Line("Let agents highlight page areas", "Temporary outlines point out things to review. Press Escape to dismiss. Applies to Ask and connected agents.") {
+                    Switch(on: $prefs.agentHighlights)
+                }
+                Rule()
+                Line("Show the agent's cursor", "A pointer glides to whatever an agent clicks, drags or types into, on the tab it's working in") {
+                    Switch(on: $prefs.agentCursor)
+                }
+                Rule()
+                Line("While an agent works on a tab", "A quiet mark around the page — Aura glows, Comet circles the edge, Frame brackets the corners") {
+                    Segmented(
+                        options: AgentEdge.allCases.map { ($0, $0.title) },
+                        selection: $prefs.agentEdge
+                    )
+                }
+                AgentVeilPreview()
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 12)
+                Rule()
                 Line("Ask with", "Which brain answers — the default is openrouter z-ai/glm-5.3-flash") {
                     Segmented(
                         options: [("openrouter", "OpenRouter"), ("codex", "Codex"), ("devin", "Devin")],
@@ -475,9 +501,9 @@ struct SettingsPage: View {
                 .padding(.horizontal, 14)
                 .padding(.bottom, 11)
                 Rule()
-                Line("Default mode", "The leash a new chat starts on — Read is eyes only, Guard asks before the heavy things, Full asks nothing") {
+                Line("Default mode", "Confirm asks before guarded actions. Full acts without confirmation.") {
                     Segmented(
-                        options: [(AskMode.read, "Read"), (.guard, "Guard"), (.full, "Full")],
+                        options: [(AskMode.guard, "Confirm"), (.full, "Full")],
                         selection: Binding(
                             get: { AskMode(rawValue: Store.settings.string(forKey: "ask.mode") ?? "") ?? .guard },
                             set: {

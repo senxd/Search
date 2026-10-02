@@ -171,10 +171,12 @@ final class AskPin: ObservableObject {
         // A no-change report reads identical to a scroll-away — sizes still,
         // gap present — so it must never reach the intent check.
         guard old != new else { return }
-        atBottom = new.gap < 24
-        atTop = new.top < 8
+        let bottom = new.gap < 24
+        let top = new.top < 8
+        if atBottom != bottom { atBottom = bottom }
+        if atTop != top { atTop = top }
         if atBottom {
-            newSinceScroll = false
+            if newSinceScroll { newSinceScroll = false }
             pinned = true
             return
         }
@@ -428,28 +430,12 @@ struct AskStream: View {
             stream
             .overlay(alignment: .bottom) {
                 if pin.newSinceScroll, !pin.atBottom {
-                    Button {
-                        pin.toEnd(with: Motion.settle)
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "arrow.down")
-                                .font(.system(size: 9, weight: .bold))
-                            Text("New activity")
-                                .font(.system(size: 11, weight: .medium))
-                        }
-                        .foregroundStyle(FluidTone.foreground)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(FluidTone.surface(3), in: Capsule())
-                        .overlay(Capsule().strokeBorder(FluidTone.border, lineWidth: 1))
-                        .shadow(color: .black.opacity(0.10), radius: 6, y: 2)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.bottom, 16)
-                    .transition(.scale(scale: 0.9).combined(with: .opacity))
+                    AskActivityPill { pin.toEnd(with: Motion.settle) }
+                        .padding(.bottom, 16)
+                        .transition(.offset(y: 14).combined(with: .scale(scale: 0.85)).combined(with: .opacity))
                 }
             }
-            .animation(FluidSpring.fast, value: pin.newSinceScroll)
+            .animation(AskMotion.pop, value: pin.newSinceScroll && !pin.atBottom)
             .onAppear {
                 pin.proxy = proxy
                 pin.toEnd()
@@ -520,7 +506,8 @@ struct AskStream: View {
 
     /// The turns themselves — what both OS branches of `stream` draw.
     private var scrollBody: some View {
-        ScrollView(showsIndicators: false) {
+        let split = self.split
+        return ScrollView(showsIndicators: false) {
             LazyVStack(alignment: .leading, spacing: density.turnGap) {
                     // Short chats rest at the bottom — the composer they
                     // answer is down there, so the words are too.
@@ -546,19 +533,8 @@ struct AskStream: View {
                     if let retryable {
                         // A quiet way back (design/interaction.md §2) —
                         // hidden while a turn is in flight.
-                        Button { mind.retry(from: retryable) } label: {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 9, weight: .medium))
-                                .foregroundStyle(Palette.faint)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 4)
-                                .background(Palette.ground, in: Capsule())
-                                .overlay(Capsule().strokeBorder(Palette.hairline, lineWidth: 1))
-                                .contentShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .help("Retry from your last message")
-                        .transition(.opacity)
+                        AskRetryButton { mind.retry(from: retryable) }
+                            .transition(.scale(scale: 0.6).combined(with: .opacity))
                     }
                     Color.clear.frame(height: 0).id("end")
                 }
@@ -580,6 +556,68 @@ struct AskStream: View {
                     .init(color: .black, location: 1)
                 ], startPoint: .top, endPoint: .bottom)
             )
+    }
+}
+
+private struct AskActivityPill: View {
+    let action: () -> Void
+    @State private var hovering = false
+    @State private var nudge = 0
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Palette.ink)
+                    .symbolEffect(.bounce, value: nudge)
+                Text("New activity")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(FluidTone.foreground)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(hovering ? Palette.hover : Palette.ground, in: Capsule())
+            .overlay(Capsule().strokeBorder(Palette.rim, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
+        .onAppear { nudge += 1 }
+    }
+}
+
+private struct AskRetryButton: View {
+    let action: () -> Void
+    @State private var hovering = false
+    @State private var turns = 0.0
+
+    var body: some View {
+        Button {
+            withAnimation(AskMotion.pop) { turns += 1 }
+            action()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 9, weight: .semibold))
+                    .rotationEffect(.degrees(turns * 360 + (hovering ? 45 : 0)))
+                if hovering {
+                    Text("Retry")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .transition(.offset(x: -4).combined(with: .opacity))
+                }
+            }
+            .foregroundStyle(hovering ? Palette.ink : Palette.faint)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(hovering ? FluidTone.hover : Color.clear, in: Capsule())
+            .overlay(Capsule().strokeBorder(Palette.hairline, lineWidth: 1))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(AskMotion.pop, value: hovering)
+        .help("Retry from your last message")
     }
 }
 
@@ -642,36 +680,66 @@ struct AskComposer: View {
         return question
     }
 
+    @StateObject private var voice = AskVoice()
+
+    private var dim: CGFloat { density.composerSize == .compact ? 30 : 34 }
+
+    private var placeholder: String {
+        if voice.state == .live { return "Listening…" }
+        if voice.state == .processing { return "Transcribing…" }
+        return asked != nil ? "Answer the agent…" : "Ask anything, @ for tabs"
+    }
+
     var body: some View {
-        FluidInputMessage(
-            text: mind.draft,
-            placeholder: asked != nil ? "Answer the agent…" : "Reply, @ for context",
-            history: messages.filter { $0.role == .you }.map(\.text),
-            status: runningHere ? .streaming : .idle,
-            size: density.composerSize,
-            focus: Binding(get: { box.typing }, set: { box.typing = $0 }),
-            onSend: { words, _ in box.send(words, browser: browser, pin: pin) },
-            onStop: { mind.stop() },
-            header: { composerHead },
-            trailing: {
-                ModelChip(browser: browser)
-            },
-            leading: {
-                HStack(spacing: 4) {
-                    AttachMenu(browser: browser, siteDraft: $box.siteDraft)
-                    ModeMenu()
+        VStack(alignment: .leading, spacing: 6) {
+            composerHead
+            FluidInputMessage(
+                text: mind.draft,
+                placeholder: placeholder,
+                history: messages.filter { $0.role == .you }.map(\.text),
+                status: runningHere ? .streaming : .idle,
+                size: density.composerSize,
+                focus: Binding(get: { box.typing }, set: { box.typing = $0 }),
+                onSend: { words, _ in
+                    voice.cancel()
+                    box.send(words, browser: browser, pin: pin)
+                },
+                onStop: { mind.stop() },
+                pill: true,
+                accent: AnyView(VoiceBeam(voice: voice)),
+                header: { EmptyView() },
+                trailing: {
+                    AskMicButton(voice: voice, draft: mind.draft, dim: dim)
+                },
+                leading: {
+                    AttachMenu(browser: browser, siteDraft: $box.siteDraft, dim: dim)
                 }
-            }
-        )
+            )
+            AskComposerBar(browser: browser)
+                .padding(.leading, 2)
+        }
         .padding(.horizontal, density == .page ? 0 : 10)
-        .padding(.top, density == .page ? 12 : 8)
-        .padding(.bottom, density == .page ? 16 : 10)
+        .padding(.top, 6)
+        .padding(.bottom, density == .page ? 14 : Viewport.gap)
+        .animation(AskMotion.drop, value: box.siteDraft != nil)
+        .animation(AskMotion.drop, value: box.at != nil)
         .onKeyPress(.escape) {
+            if voice.state != .idle {
+                voice.cancel()
+                return .handled
+            }
             // Layers the surface's own Esc doesn't know about: an open
             // "@…" tail first, then the site row — the same rungs the
             // window's Esc gate consults through `escapeLayer`.
-            box.escapeLayer() ? .handled : .ignored
+            return box.escapeLayer() ? .handled : .ignored
         }
+    }
+
+    private func tray<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        content()
+            .background(Palette.ground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Palette.rim, lineWidth: 1))
+            .transition(.offset(y: 6).combined(with: .opacity))
     }
 
     /// The composer's header slot: the working-elsewhere warning while
@@ -684,7 +752,7 @@ struct AskComposer: View {
             // A quiet line, not a wall: the first send says it again more
             // plainly, and the second takes the turn.
             HStack(spacing: 6) {
-                Ring(size: 9)
+                AskSpinner(size: 9)
                 Text(box.takeoverArmed
                      ? "Send again — “\(other.title)” stops"
                      : "Working in “\(other.title)” — sending here stops it")
@@ -694,19 +762,21 @@ struct AskComposer: View {
                     .truncationMode(.tail)
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
+            .padding(.horizontal, 6)
+            .padding(.bottom, 2)
         }
         if !mind.context.isEmpty || !mind.attachments.isEmpty || box.suggested(browser) != nil {
             chips
         }
         if box.siteDraft != nil {
-            SiteRow(text: $box.siteDraft) { url in
-                mind.attachments.append(.site(url))
+            tray {
+                SiteRow(text: $box.siteDraft) { url in
+                    mind.attachments.append(.site(url))
+                }
             }
         }
         if box.at != nil {
-            attach
+            tray { attach }
         }
     }
 
@@ -719,20 +789,25 @@ struct AskComposer: View {
             HStack(spacing: 6) {
                 ForEach(mind.context) { tab in
                     Chip(tab: tab, icon: browser.tabs.first { $0.id == tab.id }?.icon) {
-                        mind.context.removeAll { $0.id == tab.id }
+                        withAnimation(AskMotion.pop) { mind.context.removeAll { $0.id == tab.id } }
                     }
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
                 }
                 ForEach(mind.attachments) { piece in
                     AttachChip(piece: piece) {
-                        mind.attachments.removeAll { $0.id == piece.id }
+                        withAnimation(AskMotion.pop) { mind.attachments.removeAll { $0.id == piece.id } }
                     }
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
                 }
                 if let tab = box.suggested(browser) {
                     suggestion(tab)
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 2)
+            .padding(.vertical, 2)
+            .animation(AskMotion.pop, value: mind.context.map(\.id))
+            .animation(AskMotion.pop, value: mind.attachments.map(\.id))
         }
     }
 
@@ -790,47 +865,96 @@ struct AskEmpty: View {
     @ObservedObject private var mind = Mind.shared
 
     var body: some View {
-        VStack(spacing: hero ? 14 : 12) {
+        VStack(spacing: 0) {
             Spacer(minLength: 0)
-            Image(systemName: "sparkles")
-                .font(.system(size: hero ? 24 : 20, weight: .medium))
-                .foregroundStyle(Palette.muted)
-                .frame(width: hero ? 64 : 54, height: hero ? 64 : 54)
-                .background(hero ? FluidTone.surface(2) : Palette.ground, in: Circle())
-                .overlay(Circle().strokeBorder(hero ? FluidTone.border : Palette.hairline, lineWidth: 1))
+            Logomark()
+                .fill(Palette.ink.opacity(0.22), style: FillStyle(eoFill: true))
+                .aspectRatio(Logomark.canvas.width / Logomark.canvas.height, contentMode: .fit)
+                .frame(height: hero ? 24 : 18)
+                .askStagger(0)
             Text("Ask Search")
-                .font(.system(size: hero ? 20 : 14, weight: .semibold))
+                .font(.system(size: hero ? 20 : 14.5, weight: .medium))
                 .foregroundStyle(Palette.ink)
+                .padding(.top, hero ? 18 : 14)
+                .askStagger(1)
             Text(hero
-                 ? "Ask about anything, or hand the agent a task.\n@ attaches a tab — it can read and drive what you give it."
-                 : "Ask about this page, or give it a task.\n@ attaches a tab.")
+                 ? "Ask about anything, or hand the agent a task."
+                 : "Ask about this page, or give it a task.")
                 .font(.system(size: hero ? 13 : 11.5))
                 .foregroundStyle(Palette.muted)
                 .multilineTextAlignment(.center)
-            ViewThatFits {
-                HStack(spacing: 6) { ways }
-                VStack(spacing: 6) { ways }
+                .padding(.top, 4)
+                .askStagger(2)
+            VStack(spacing: 1) {
+                ForEach(Array(ways.enumerated()), id: \.offset) { index, way in
+                    AskWayRow(icon: way.icon, title: way.title, action: way.act)
+                        .askStagger(index + 3)
+                }
             }
-            .padding(.top, 4)
+            .frame(maxWidth: hero ? 340 : 260)
+            .padding(.top, hero ? 22 : 18)
+            Text(hero ? "Type @ to hand it a tab — it can read and drive what you give it" : "Type @ to hand it a tab")
+                .font(.system(size: 10.5))
+                .foregroundStyle(Palette.faint)
+                .padding(.top, 14)
+                .askStagger(ways.count + 3)
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, hero ? 40 : 18)
     }
 
-    /// The three things an empty chat offers, once horizontally if they fit.
-    /// They send through the composer's `send` like typed words — the
-    /// cross-chat takeover warning applies to them the same.
-    @ViewBuilder
-    private var ways: some View {
-        Pill("Summarize this page") {
-            // Handing the tab over is the consent — the chip goes on before
-            // the words are sent so the turn starts with it attached.
-            mind.hand(browser.active)
-            box.send("Summarize this page", browser: browser, pin: pin)
+    /// The three things an empty chat offers. They send through the
+    /// composer's `send` like typed words — the cross-chat takeover
+    /// warning applies to them the same.
+    private var ways: [(icon: String, title: String, act: () -> Void)] {
+        [
+            ("doc.text.magnifyingglass", "Summarize this page", {
+                // Handing the tab over is the consent — the chip goes on before
+                // the words are sent so the turn starts with it attached.
+                mind.hand(browser.active)
+                box.send("Summarize this page", browser: browser, pin: pin)
+            }),
+            ("square.stack", "What's open?", { box.send("List my open tabs", browser: browser, pin: pin) }),
+            ("globe", "Open example.com", { box.send("Open example.com", browser: browser, pin: pin) }),
+        ]
+    }
+}
+
+private struct AskWayRow: View {
+    let icon: String
+    let title: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: icon)
+                    .font(.system(size: 10.5, weight: .regular))
+                    .foregroundStyle(hovering ? Palette.ink : Palette.muted)
+                    .frame(width: 16)
+                Text(title)
+                    .font(.system(size: 12))
+                    .foregroundStyle(hovering ? Palette.ink : Palette.ink.opacity(0.8))
+                Spacer(minLength: 0)
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Palette.muted)
+                    .opacity(hovering ? 1 : 0)
+                    .offset(x: hovering ? 0 : -4)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(hovering ? FluidTone.hover : .clear)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
         }
-        Pill("What's open?") { box.send("List my open tabs", browser: browser, pin: pin) }
-        Pill("Open example.com") { box.send("Open example.com", browser: browser, pin: pin) }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
     }
 }
 

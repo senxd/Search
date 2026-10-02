@@ -86,6 +86,9 @@ struct FluidSelect<Content: View>: View {
     @Binding var selection: String?
     var placeholder: String = "Select…"
     var variant: Variant = .bordered
+    /// Rotate the chevron 180° while open (the source's
+    /// `data-[popup-open]:rotate-180`; select.tsx:149).
+    var rotatesChevron = false
     var icon: String? = nil
     var error: String? = nil
     var disabled = false
@@ -135,6 +138,8 @@ struct FluidSelect<Content: View>: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     FluidIcon("chevron.down", size: resolvedSize.icon)
                         .foregroundStyle(hovered ? FluidTone.foreground : FluidTone.mutedForeground)
+                        .rotationEffect(rotatesChevron && open ? .degrees(180) : .zero)
+                        .animation(FluidSpring.fast, value: rotatesChevron && open)
                 }
                 .padding(.horizontal, resolvedSize.px)
                 .frame(height: resolvedSize.controlHeight)

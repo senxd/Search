@@ -129,8 +129,8 @@ func fluidHasModifier(_ p: FluidParsedShortcut) -> Bool {
 
 private let fluidCapLabels: [String: String] = [
     "mod": "⌘", "meta": "⌘", "ctrl": "⌃", "alt": "⌥", "shift": "⇧",
-    "enter": "↵", "escape": "esc", "backspace": "⌫", "delete": "⌦",
-    "tab": "⇥", " ": "space", "arrowup": "↑", "arrowdown": "↓",
+    "enter": "↵", "escape": "Esc", "backspace": "⌫", "delete": "⌦",
+    "tab": "⇥", " ": "Space", "arrowup": "↑", "arrowdown": "↓",
     "arrowleft": "←", "arrowright": "→",
 ]
 
@@ -251,7 +251,9 @@ private func commandSections(
     }
 
     if !suggested.isEmpty {
-        let pool = Dictionary(uniqueKeysWithValues: visible.map { ($0.value, $0) })
+        // new Map() semantics — a duplicate value keeps the last entry.
+        var pool: [String: FluidCommandItem] = [:]
+        for item in visible { pool[item.value] = item }
         for value in suggestions ?? [] {
             if let item = pool[value] { push(suggestionsLabel, item) }
         }
@@ -337,6 +339,12 @@ final class FluidCommandMenuModel {
     var onEscape: (() -> Void)? = nil
     /// The close() a containing FluidCommandMenuDialog supplies.
     var dialogClose: (() -> Void)? = nil
+    /// Uncontrolled-query storage — the `defaultQuery` init writes here;
+    /// `queryBinding` routes reads/writes through it.
+    var ownedQuery: String? = nil
+    /// onQueryChange — fires on every query write in uncontrolled mode
+    /// (the controlled path's Binding setter IS the notification).
+    var onQueryChange: ((String) -> Void)? = nil
 
     /// The fluid hover store — pointer and keyboard share activeIndex.
     let hover = FluidHover(axis: .y)
@@ -358,6 +366,22 @@ final class FluidCommandMenuModel {
     init(items: [FluidCommandItem], query: Binding<String>) {
         self.items = items
         self.queryBinding = query
+    }
+
+    /// Uncontrolled — the source's `defaultQuery`/`onQueryChange` pair.
+    /// The binding reads and writes the model's own `ownedQuery`.
+    convenience init(items: [FluidCommandItem], defaultQuery: String = "",
+                     onQueryChange: ((String) -> Void)? = nil) {
+        self.init(items: items, query: .constant(defaultQuery))
+        ownedQuery = defaultQuery
+        self.onQueryChange = onQueryChange
+        queryBinding = Binding(
+            get: { [weak self] in self?.ownedQuery ?? "" },
+            set: { [weak self] v in
+                self?.ownedQuery = v
+                self?.onQueryChange?(v)
+            }
+        )
     }
 
     var query: String {
@@ -415,12 +439,19 @@ final class FluidCommandMenuModel {
     /// no animation on a query reset).
     func scrollToRow(_ i: Int) {
         if i == 0 { scrollToTop(); return }
-        withAnimation(FluidSpring.fast) {
+        // Reduced motion jumps straight there — the source's scrollIntoView
+        // has no animation at all.
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             listProxy?.scrollTo("cmd-\(i)", anchor: .center)
+        } else {
+            withAnimation(FluidSpring.fast) {
+                listProxy?.scrollTo("cmd-\(i)", anchor: .center)
+            }
         }
     }
+    /// viewport.scrollTop = 0 — the content's own top, headings included.
     private func scrollToTop() {
-        listProxy?.scrollTo("cmd-0", anchor: .top)
+        listProxy?.scrollTo("cmd-top", anchor: .top)
     }
 
     /// Row's own onSelect first, then the root's — then the dialog close.
@@ -439,10 +470,20 @@ enum FluidCommandMove { case step(Int), first, last }
 private struct FluidCommandDialogCloseKey: EnvironmentKey {
     static let defaultValue: (() -> Void)? = nil
 }
+/// The column cap a containing command dialog publishes — the source's
+/// `max-h-[inherit]` chain: the panel's max-h bounds the menu's column,
+/// and the list scrolls past it (command-menu.tsx:690-692).
+private struct FluidCommandMenuMaxHeightKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
 extension EnvironmentValues {
     var fluidCommandDialogClose: (() -> Void)? {
         get { self[FluidCommandDialogCloseKey.self] }
         set { self[FluidCommandDialogCloseKey.self] = newValue }
+    }
+    var fluidCommandMenuMaxHeight: CGFloat? {
+        get { self[FluidCommandMenuMaxHeightKey.self] }
+        set { self[FluidCommandMenuMaxHeightKey.self] = newValue }
     }
 }
 
@@ -452,7 +493,18 @@ extension EnvironmentValues {
 /// Footer inside the measured-height shell. The compound pieces below are
 /// the same parts for custom arrangements.
 struct FluidCommandMenu: View {
-    let model: FluidCommandMenuModel
+    /// @State pins the instance: the key monitor and hover rects weakly
+    /// capture the model, so a parent re-render must not swap it for a
+    /// fresh one — the first keystroke would kill the palette. The props
+    /// below still flow through via the body's sync handlers.
+    @State private var model: FluidCommandMenuModel
+    let items: [FluidCommandItem]
+    var suggestions: [String]? = nil
+    var suggestionsLabel: String = "Suggestions"
+    var filter: ((FluidCommandItem, String) -> Bool)? = nil
+    var closeOnSelect = true
+    var onSelect: ((FluidCommandItem) -> Void)? = nil
+    var onEscape: (() -> Void)? = nil
     var placeholder = "Type a command or search…"
     /// Pins field and rows to one step of the size ladder — the source's
     /// `size` prop (compact: h-10 field, 28px rows, h-8 footer).
@@ -467,12 +519,20 @@ struct FluidCommandMenu: View {
     var emptyText = "No results."
     /// The list scrolls past this — the shell's max-h in the source.
     var listMaxHeight: CGFloat? = nil
+    /// Caps the WHOLE column — field, tabs, list and footer together —
+    /// the source's `max-h-[inherit]` on the root. The list is what
+    /// shrinks: the fixed parts hold their heights and the ScrollView
+    /// compresses. An explicit value beats a containing dialog's.
+    var maxHeight: CGFloat? = nil
 
     @State private var tabsHeight: CGFloat = 0
     @Environment(\.fluidSize) private var ambientSize
     /// Set by a containing FluidCommandMenuDialog — selecting a row then
     /// closes the shell (closeOnSelect) and the footer hints at Esc.
     @Environment(\.fluidCommandDialogClose) private var dialogClose
+    /// A containing command dialog's panel cap — bounds the column so a
+    /// tall list can't spill past the capped panel.
+    @Environment(\.fluidCommandMenuMaxHeight) private var shellMaxHeight
 
     private var tabsMountedHeight: CGFloat { (tabs != nil && tabSelection != nil) ? tabsHeight : 0 }
 
@@ -487,16 +547,69 @@ struct FluidCommandMenu: View {
          closeOnSelect: Bool = true,
          emptyText: String = "No results.",
          listMaxHeight: CGFloat? = nil,
+         maxHeight: CGFloat? = nil,
          onSelect: ((FluidCommandItem) -> Void)? = nil,
          onEscape: (() -> Void)? = nil) {
-        let m = FluidCommandMenuModel(items: items, query: query)
-        m.filter = filter
-        m.suggestions = suggestions
-        m.suggestionsLabel = suggestionsLabel
-        m.closeOnSelect = closeOnSelect
-        m.onSelect = onSelect
-        m.onEscape = onEscape
-        self.model = m
+        self.init(model: FluidCommandMenuModel(items: items, query: query),
+                  items: items, placeholder: placeholder,
+                  suggestions: suggestions, suggestionsLabel: suggestionsLabel,
+                  size: size, showFooter: showFooter, hints: hints,
+                  tabs: tabs, tabSelection: tabSelection, filter: filter,
+                  closeOnSelect: closeOnSelect, emptyText: emptyText,
+                  listMaxHeight: listMaxHeight, maxHeight: maxHeight,
+                  onSelect: onSelect, onEscape: onEscape)
+    }
+
+    /// Uncontrolled query — the source's `defaultQuery`/`onQueryChange`:
+    /// the palette owns the query and reports each write.
+    init(items: [FluidCommandItem], defaultQuery: String = "",
+         onQueryChange: ((String) -> Void)? = nil,
+         placeholder: String = "Type a command or search…",
+         suggestions: [String]? = nil, suggestionsLabel: String = "Suggestions",
+         size: FluidSize? = nil, showFooter: Bool = true,
+         hints: [FluidCommandHint]? = nil,
+         tabs: [FluidCommandMenuTab]? = nil,
+         tabSelection: Binding<String>? = nil,
+         filter: ((FluidCommandItem, String) -> Bool)? = nil,
+         closeOnSelect: Bool = true,
+         emptyText: String = "No results.",
+         listMaxHeight: CGFloat? = nil,
+         maxHeight: CGFloat? = nil,
+         onSelect: ((FluidCommandItem) -> Void)? = nil,
+         onEscape: (() -> Void)? = nil) {
+        self.init(model: FluidCommandMenuModel(
+                    items: items, defaultQuery: defaultQuery,
+                    onQueryChange: onQueryChange),
+                  items: items, placeholder: placeholder,
+                  suggestions: suggestions, suggestionsLabel: suggestionsLabel,
+                  size: size, showFooter: showFooter, hints: hints,
+                  tabs: tabs, tabSelection: tabSelection, filter: filter,
+                  closeOnSelect: closeOnSelect, emptyText: emptyText,
+                  listMaxHeight: listMaxHeight, maxHeight: maxHeight,
+                  onSelect: onSelect, onEscape: onEscape)
+    }
+
+    private init(model: FluidCommandMenuModel, items: [FluidCommandItem],
+         placeholder: String, suggestions: [String]?, suggestionsLabel: String,
+         size: FluidSize?, showFooter: Bool, hints: [FluidCommandHint]?,
+         tabs: [FluidCommandMenuTab]?, tabSelection: Binding<String>?,
+         filter: ((FluidCommandItem, String) -> Bool)?, closeOnSelect: Bool,
+         emptyText: String, listMaxHeight: CGFloat?, maxHeight: CGFloat?,
+         onSelect: ((FluidCommandItem) -> Void)?, onEscape: (() -> Void)?) {
+        model.filter = filter
+        model.suggestions = suggestions
+        model.suggestionsLabel = suggestionsLabel
+        model.closeOnSelect = closeOnSelect
+        model.onSelect = onSelect
+        model.onEscape = onEscape
+        self._model = State(initialValue: model)
+        self.items = items
+        self.suggestions = suggestions
+        self.suggestionsLabel = suggestionsLabel
+        self.filter = filter
+        self.closeOnSelect = closeOnSelect
+        self.onSelect = onSelect
+        self.onEscape = onEscape
         self.placeholder = placeholder
         self.size = size
         self.showFooter = showFooter
@@ -505,6 +618,7 @@ struct FluidCommandMenu: View {
         self.tabSelection = tabSelection
         self.emptyText = emptyText
         self.listMaxHeight = listMaxHeight
+        self.maxHeight = maxHeight
     }
 
     var body: some View {
@@ -515,10 +629,16 @@ struct FluidCommandMenu: View {
         // measured directly would pin the compressible ScrollView at the
         // clamp and the panel could never grow again.
         let compact = (size ?? ambientSize) == .compact
-        let columnH = (compact ? 40 : 48)
-            + tabsMountedHeight
-            + min(model.contentHeight, listMaxHeight ?? .infinity)
-            + (showFooter ? (compact ? 32 : 40) : 0)
+        // The cap bounds the WHOLE column — the listMaxHeight term still
+        // caps the list alone; under a column cap the fixed parts keep
+        // their heights and the ScrollView compresses (max-h-[inherit]).
+        let columnH = min(
+            (compact ? 40 : 48)
+                + tabsMountedHeight
+                + min(model.contentHeight, listMaxHeight ?? .infinity)
+                + (showFooter ? (compact ? 32 : 40) : 0),
+            maxHeight ?? shellMaxHeight ?? .infinity
+        )
         VStack(alignment: .leading, spacing: 0) {
             FluidCommandMenuInput(model: model, placeholder: placeholder)
             if let tabs, let tabSelection {
@@ -542,14 +662,54 @@ struct FluidCommandMenu: View {
                 let rs = model.rows
                 return i < 0 || i >= rs.count || rs[i].disabled
             }
-            model.dialogClose = dialogClose
+            syncCallbacks()
         }
+        // @State keeps the model's identity, but this render's props must
+        // still reach it — new items flow in, and the shell's close/env
+        // rebind whenever it changes. Closures ride the items sync — the
+        // re-render that changes behavior almost always re-filters too.
+        .onChange(of: itemsFingerprint) { _, _ in
+            model.items = items
+            syncCallbacks()
+        }
+        .onChange(of: suggestionsFingerprint) { _, _ in
+            model.suggestions = suggestions
+        }
+        // Any prop churn refreshes the closures too — a parent re-render
+        // can rebind onSelect/onEscape without touching the items.
+        .onChange(of: suggestionsLabel) { _, v in model.suggestionsLabel = v; syncCallbacks() }
+        .onChange(of: closeOnSelect) { _, v in model.closeOnSelect = v; syncCallbacks() }
+        .onChange(of: dialogClose == nil) { _, _ in syncCallbacks() }
         // The first enabled row is lit whenever the row set changes —
         // Enter always has a target and it follows the query as it
         // filters; the viewport snaps to the top with the reset.
         .onChange(of: model.rowsKey, initial: true) { _, _ in
             model.highlightFirstEnabled()
         }
+    }
+
+    /// What the rows ARE, for the items onChange — every value field,
+    /// not just identity: a rename/icon/keyword churn on the same value
+    /// (AskPage's switcherItems does exactly that) must reach the model.
+    private var itemsFingerprint: String {
+        items.map { i in
+            [i.value, i.label, i.action ?? "", i.description ?? "",
+             i.icon ?? "", i.shortcut ?? "", i.keywords.joined(separator: "\u{1}"),
+             i.disabled ? "1" : "0", i.group ?? ""]
+                .joined(separator: "\u{0}")
+        }.joined(separator: "\u{0}")
+    }
+    private var suggestionsFingerprint: String {
+        (suggestions ?? []).joined(separator: "\u{0}")
+    }
+
+    /// Non-observable-from-body props — safe to refresh from a sync path;
+    /// they are read by event handlers, never during evaluation.
+    private func syncCallbacks() {
+        model.filter = filter
+        model.onSelect = onSelect
+        model.onEscape = onEscape
+        model.dialogClose = dialogClose
     }
 }
 
@@ -580,6 +740,9 @@ struct FluidCommandMenuInput: View {
             }
             TextField(placeholder, text: model.queryBinding)
                 .textFieldStyle(.plain)
+                // autoComplete/autoCorrect/spellCheck off — a palette
+                // field must not squiggle or suggest (command-menu.tsx:849).
+                .disableAutocorrection(true)
                 // One notch above the rows' body size; the line box keeps
                 // the caret in proportion (text-[14px] leading-6).
                 .font(.system(size: compact ? 13 : 14))
@@ -603,6 +766,7 @@ struct FluidCommandMenuInput: View {
     /// to the shell, ←→ switch mounted tabs. Keys inside an IME
     /// composition belong to the composer (the source's isComposing/229).
     private func installKeyMonitor() {
+        monitorBox.clear()   // idempotent — a re-appear must not stack monitors
         let focus = $inputFocused
         monitorBox.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak model] event in
             guard let model, focus.wrappedValue else { return event }
@@ -641,13 +805,14 @@ struct FluidCommandMenuInput: View {
                 }
                 return nil
             case 53:                                      // escape
-                // In a dialog the shell closes on Escape. Inline, Escape
-                // clears what was typed.
+                // In a dialog (or on an empty query) the key isn't ours —
+                // the source's `if (dialog || query === "") return` lets it
+                // bubble so the shell's own Esc handling closes it.
                 if model.dialogClose != nil || model.query.isEmpty {
                     model.onEscape?()
-                } else {
-                    model.query = ""
+                    return event
                 }
+                model.query = ""
                 return nil
             default: return event
             }
@@ -769,6 +934,10 @@ struct FluidCommandMenuList: View {
     var emptyText = "No results."
     /// The list scrolls past this — the shell's max-h in the source.
     var maxHeight: CGFloat? = nil
+    /// Replaces a row's content (item, row index); the row keeps its
+    /// chrome — pick action, lit fill, disabled dim (command-menu.tsx's
+    /// `renderItem` on CommandMenuList).
+    var renderItem: ((FluidCommandItem, Int) -> AnyView)? = nil
 
     @Environment(\.fluidSize) private var size
     @State private var fade = FluidScrollFadeState()
@@ -778,19 +947,27 @@ struct FluidCommandMenuList: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                Color.clear.frame(height: 0).onAppear { model.listProxy = proxy }
+                // The scroll-reset anchor — scrollTop = 0, not row 0's top
+                // (a section heading sits above it and would clip).
+                Color.clear.frame(height: 0)
+                    .id("cmd-top")
+                    .onAppear { model.listProxy = proxy }
+                // gap-1 BETWEEN sections; rows inside a section are
+                // contiguous (flex flex-col, no gap).
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(Array(model.sections.enumerated()), id: \.offset) { _, section in
-                        if let heading = section.heading {
-                            // text-caption muted — h-7 px-2 (compact h-6 px-1.5).
-                            Text(heading)
-                                .font(.system(size: 12))
-                                .foregroundStyle(FluidTone.mutedForeground)
-                                .padding(.horizontal, compact ? 6 : 8)
-                                .frame(height: compact ? 24 : 28, alignment: .leading)
-                        }
-                        ForEach(Array(section.items.enumerated()), id: \.offset) { i, item in
-                            row(item, index: section.start + i)
+                        VStack(alignment: .leading, spacing: 0) {
+                            if let heading = section.heading {
+                                // text-caption muted — h-7 px-2 (compact h-6 px-1.5).
+                                Text(heading)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(FluidTone.mutedForeground)
+                                    .padding(.horizontal, compact ? 6 : 8)
+                                    .frame(height: compact ? 24 : 28, alignment: .leading)
+                            }
+                            ForEach(Array(section.items.enumerated()), id: \.offset) { i, item in
+                                row(item, index: section.start + i)
+                            }
                         }
                     }
                     // CommandMenuEmpty — role=status live region inside the
@@ -813,7 +990,7 @@ struct FluidCommandMenuList: View {
                 .coordinateSpace(name: model.hover.space)
                 .background(alignment: .topLeading) {
                     if let i = model.activeIndex, let r = model.hover.rects[i] {
-                        CommandFill(rect: r, radius: FluidShape.rounded.bg)
+                        CommandFill(rect: r, index: i, radius: FluidShape.rounded.bg)
                             .id(model.hover.session)
                             .transition(.opacity)
                     }
@@ -829,6 +1006,28 @@ struct FluidCommandMenuList: View {
                         model.hover.activeIndex = model.lastActive
                     }
                 }
+                // lastActiveRef — every non-nil highlight counts, pointer
+                // or keyboard (command-menu.tsx:1031-1033).
+                .onChange(of: model.hover.activeIndex) { _, i in
+                    if let i { model.lastActive = i }
+                }
+                // listHandlers.onClick — a click in the list's padding
+                // lands on the lit row (command-menu.tsx:1067). Taps on
+                // a row's own rect are left to the row's Button.
+                .contentShape(Rectangle())
+                .simultaneousGesture(
+                    SpatialTapGesture(coordinateSpace: .named(model.hover.space))
+                        .onEnded { value in
+                            guard let i = model.activeIndex,
+                                  model.rows.indices.contains(i),
+                                  !model.rows[i].disabled,
+                                  !model.hover.rects.values.contains(where: {
+                                      $0.contains(value.location)
+                                  })
+                            else { return }
+                            model.select(model.rows[i])
+                        }
+                )
                 .environment(\.fluidHover, model.hover)
                 .frame(maxWidth: .infinity)
                 // Scroll content reports its natural height even while the
@@ -857,6 +1056,14 @@ struct FluidCommandMenuList: View {
         return Button {
             model.select(item)
         } label: {
+            if let renderItem {
+                renderItem(item, index)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, size.itemPx)
+                    .frame(minHeight: size.controlHeight)
+                    .contentShape(Rectangle())
+                    .opacity(item.disabled ? 0.5 : 1)
+            } else {
             HStack(spacing: size.gap) {
                 if let icon = item.icon {
                     FluidIcon(icon, size: size.icon, bold: isActive)
@@ -885,6 +1092,7 @@ struct FluidCommandMenuList: View {
             .frame(height: size.controlHeight)
             .contentShape(Rectangle())
             .opacity(item.disabled ? 0.5 : 1)
+            }
         }
         .buttonStyle(.plain)
         .disabled(item.disabled)
@@ -910,7 +1118,8 @@ struct FluidCommandMenuShortcut: View {
 
     var body: some View {
         HStack(spacing: 2) {
-            ForEach(caps, id: \.self) { cap in
+            // Enumerated — a repeated cap ("⇧⇧") still gets unique ids.
+            ForEach(Array(caps.enumerated()), id: \.offset) { _, cap in
                 Text(cap)
                     .font(.system(size: compact ? 10 : 11))
                     .foregroundStyle(FluidTone.mutedForeground)
@@ -954,7 +1163,8 @@ struct FluidCommandMenuFooter: View {
             }
             Spacer(minLength: 0)
             // "Open Showcase ↵" — names what Enter does to the lit row.
-            if let i = model.activeIndex, i < model.rows.count {
+            // Custom `hints` replace it entirely (command-menu.tsx:1356).
+            if hints == nil, let i = model.activeIndex, i < model.rows.count {
                 let row = model.rows[i]
                 HStack(spacing: 6) {
                     Text(row.action ?? row.label)
@@ -1001,31 +1211,64 @@ private func fluidComboKey(_ p: FluidParsedShortcut) -> String {
 /// peers sharing a combo the most recently mounted in-scope one answers.
 /// The panel is the top-positioned lg dialog capped at min(440, 76dvh) so
 /// the field stays put while the rows under it filter down.
-struct FluidCommandMenuDialog<Content: View>: View {
+/// CommandMenuDialog — the palette in a dialog shell, bound to a global
+/// shortcut. Applied as a modifier on the host view (the dialog renders
+/// in-window, so it needs real geometry — a detached zero-size host
+/// would give the overlay a 0×0 stage: no scrim, no cap, no offset).
+extension View {
+    func fluidCommandMenuDialog<Menu: View>(
+        isPresented: Binding<Bool>,
+        /// The combo that toggles the dialog, in shortcut syntax.
+        /// nil binds nothing.
+        shortcut: String? = "mod+k",
+        /// Focus must be inside this view for the combo to open the
+        /// dialog — a scoped palette must not take an app-wide combo.
+        /// Closing works from anywhere.
+        shortcutScope: NSView? = nil,
+        /// The panel's accessibility name — the source's sr-only
+        /// DialogTitle.
+        title: String = "Command menu",
+        /// Read after the title — the source's sr-only DialogDescription.
+        description: String = "Search for a command to run.",
+        @ViewBuilder menu: @escaping () -> Menu
+    ) -> some View {
+        modifier(FluidCommandMenuDialogHost(
+            isPresented: isPresented, shortcut: shortcut,
+            shortcutScope: shortcutScope, title: title,
+            description: description, menu: menu
+        ))
+    }
+}
+
+private struct FluidCommandMenuDialogHost<Menu: View>: ViewModifier {
     @Binding var isPresented: Bool
-    /// The combo that toggles the dialog, in shortcut syntax. nil binds
-    /// nothing.
-    var shortcut: String? = "mod+k"
-    /// Focus must be inside this view for the combo to open the dialog —
-    /// a scoped palette must not take an app-wide combo. Closing works
-    /// from anywhere.
-    var shortcutScope: NSView? = nil
-    var content: () -> Content
+    var shortcut: String?
+    var shortcutScope: NSView?
+    var title: String
+    var description: String
+    @ViewBuilder var menu: () -> Menu
 
     @State private var probe = FluidCommandDialogProbe()
 
-    var body: some View {
-        Color.clear.frame(width: 0, height: 0)
+    func body(content: Content) -> some View {
+        content
             .onAppear { install() }
             .onDisappear { probe.uninstall() }
             .fluidDialog(isPresented: $isPresented, size: .lg,
-                         position: .top, showCloseButton: false) {
+                         position: .top, topStyle: .palette,
+                         showCloseButton: false,
+                         panelPadding: 0, maxHeight: 440) {
                 // Any FluidCommandMenu inside picks up the shell's close —
                 // closeOnSelect then dismisses and Esc hints appear.
-                content()
+                menu()
                     .environment(\.fluidCommandDialogClose, {
                         isPresented = false
                     })
+                    // The sr-only title + description — the panel announces
+                    // them without drawing.
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel(title)
+                    .accessibilityHint(description)
             }
     }
 
@@ -1097,15 +1340,19 @@ private final class FluidCommandDialogProbe {
 // MARK: - Fill
 
 /// The lit row's fill — the standard fluid hover highlight (bg-hover),
-/// sprung on the fast tier inside the scrolling list.
+/// sprung on the fast tier inside the scrolling list. A same-row reflow
+/// (a rect changing under a kept index) snaps like FluidHighlight; the
+/// spring only travels between rows. Reduced motion keeps the fade.
 private struct CommandFill: View {
     let rect: CGRect
+    let index: Int
     let radius: CGFloat
     @State private var current: CGRect
     @State private var opacity = 0.0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    init(rect: CGRect, radius: CGFloat) {
-        self.rect = rect; self.radius = radius
+    init(rect: CGRect, index: Int, radius: CGFloat) {
+        self.rect = rect; self.index = index; self.radius = radius
         _current = State(initialValue: rect)
     }
 
@@ -1119,10 +1366,20 @@ private struct CommandFill: View {
             .opacity(opacity)
             .onAppear {
                 withAnimation(.easeOut(duration: 0.08)) { opacity = 1 }
-                withAnimation(FluidSpring.fast) { current = rect }
             }
-            .onChange(of: rect) { _, new in
-                withAnimation(FluidSpring.fast) { current = new }
+            .onChange(of: FluidCommandFillKey(rect: rect, index: index)) { old, new in
+                // Same-row reflow (or reduced motion) snaps; the spring
+                // only travels between rows.
+                if reduceMotion || new.index == old.index {
+                    current = new.rect
+                } else {
+                    withAnimation(FluidSpring.fast) { current = new.rect }
+                }
             }
     }
+}
+
+private struct FluidCommandFillKey: Equatable {
+    var rect: CGRect
+    var index: Int
 }

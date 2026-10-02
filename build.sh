@@ -52,6 +52,7 @@ BINARY=".build/$CONFIG/Search"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/$NAME"
+cp -R Sources/Search/Resources/ProviderIcons "$APP/Contents/Resources/"
 
 # Symbols stay out of the app. The linker leaves every function's name and a
 # map back to the source in the binary — 15,000 entries, more than half of
@@ -75,10 +76,10 @@ rm -rf "$ICONSET"
 
 # The JavaScript AskJS.load() reads at runtime — Bundle.main looks in
 # Contents/Resources/ask first, and the repo fallback only works out of
-# .build. Just the two files the app loads ship: the test file, the docs
-# and the test/ folder stay in the repo.
+# .build. Ship the runtime and bundled skills; tests and docs stay in the repo.
 mkdir -p "$APP/Contents/Resources/ask"
 cp Runtime/ask/drive.js Runtime/ask/harness.js "$APP/Contents/Resources/ask/"
+cp -R Runtime/ask/skills "$APP/Contents/Resources/ask/"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

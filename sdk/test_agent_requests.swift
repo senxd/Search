@@ -37,7 +37,13 @@ struct RequestCheck {
         assert(requests.lookup(2)!.json["typedCount"] as? Int == 3)
         assert(requests.lookup(2)!.json["error"] == nil)
         assert(requests.lookup(2)!.json["errorMessage"] as? String == "stopped")
-        for id in 67...400 {
+        let guardCancelled = requests.begin(id: 67, op: "act.type").0!
+        requests.finish(guardCancelled, reply: ["error": "Action cancelled", "code": "GUARD_CANCELLED"])
+        assert(guardCancelled.outcome == "cancelled")
+        let failed = requests.begin(id: 68, op: "page.code").0!
+        requests.finish(failed, reply: ["error": "script failed", "code": "SCRIPT_ERROR"])
+        assert(failed.outcome == "failed")
+        for id in 69...400 {
             let next = requests.begin(id: id, op: "ping").0!
             requests.finish(next, reply: ["pong": true])
         }

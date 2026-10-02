@@ -505,6 +505,7 @@ final class Extensions: NSObject, ObservableObject {
     }
 
     func remove(_ id: String) {
+        declineUpdate(id)
         unload(id)
         errors[id] = nil
         Extensions.setSettings([:], for: id)
@@ -584,13 +585,13 @@ final class Extensions: NSObject, ObservableObject {
 
     /// Once a day, the store is asked whether anything installed from it has
     /// a newer version; if so it is fetched, checked and swapped in. One that
-    /// asks for more than it was installed with is asked about first.
+    /// asks for more than it was installed with waits in the extensions menu.
     func checkForUpdates() {
         let key = "extensions.checked"
         let last = Store.settings.object(forKey: key) as? Date ?? .distantPast
         guard Date().timeIntervalSince(last) > 60 * 60 * 20 else { return }
         Store.settings.set(Date(), forKey: key)
-        for item in installed where item.fromStore {
+        for item in installed where item.fromStore && !updates.contains(where: { $0.id == item.id }) {
             Task { await update(item) }
         }
     }
@@ -626,26 +627,61 @@ final class Extensions: NSObject, ObservableObject {
             let found = try await WKWebExtension(resourceBaseURL: staged)
             // Everything it could do, sites included, against what it was
             // allowed when it was added or last asked about.
-            let wants = Set(Extensions.grants(found, in: staged))
-            if !wants.isSubset(of: Set(item.permissions)) {
-                guard await ask(install: "An update to \(item.name)", wants: Extensions.describe(found, in: staged), icon: found.icon(for: CGSize(width: 64, height: 64))) else {
-                    try? FileManager.default.removeItem(at: staged)
+            let grants = Extensions.grants(found, in: staged)
+            let offer = UpdateOffer(
+                id: item.id, name: item.name, fromVersion: item.version, version: found.version ?? version,
+                lines: Extensions.freshLines(found, in: staged, granted: Set(item.permissions)),
+                icon: found.icon(for: CGSize(width: 32, height: 32)), staged: staged, grants: grants
+            )
+            if !Set(grants).isSubset(of: Set(item.permissions)) {
+                asked.append("Add “An update to \(item.name)” to Search?")
+                if Store.testing, let answer = answerForTests {
+                    if answer { await apply(offer) } else { try? FileManager.default.removeItem(at: staged) }
                     return
                 }
+                updates.removeAll { $0.id == item.id }
+                updates.append(offer)
+                if !Store.testing { menuOpen = true }
+                return
             }
-            unload(item.id)
-            let target = Extensions.folder(for: item.id)
-            try? FileManager.default.removeItem(at: target)
-            try FileManager.default.moveItem(at: staged, to: target)
-            if let index = installed.firstIndex(where: { $0.id == item.id }) {
-                installed[index].version = found.version ?? version
-                installed[index].permissions = wants.sorted()
-                save()
-                if installed[index].enabled { await load(installed[index]) }
-            }
+            await apply(offer)
         } catch {
             NSLog("Extensions: update of %@ failed: %@", item.id, error.localizedDescription)
         }
+    }
+
+    func acceptUpdate(_ id: String) {
+        guard let offer = updates.first(where: { $0.id == id }) else { return }
+        updates.removeAll { $0.id == id }
+        if updates.isEmpty { menuOpen = false }
+        Task { await apply(offer) }
+    }
+
+    func declineUpdate(_ id: String) {
+        guard let offer = updates.first(where: { $0.id == id }) else { return }
+        try? FileManager.default.removeItem(at: offer.staged)
+        updates.removeAll { $0.id == id }
+        if updates.isEmpty { menuOpen = false }
+    }
+
+    private func apply(_ offer: UpdateOffer) async {
+        unload(offer.id)
+        let target = Extensions.folder(for: offer.id)
+        do {
+            try? FileManager.default.removeItem(at: target)
+            try FileManager.default.moveItem(at: offer.staged, to: target)
+        } catch {
+            try? FileManager.default.removeItem(at: offer.staged)
+            NSLog("Extensions: update of %@ failed: %@", offer.id, error.localizedDescription)
+            browser?.announce("\(offer.name) wasn't updated")
+            return
+        }
+        guard let index = installed.firstIndex(where: { $0.id == offer.id }) else { return }
+        installed[index].version = offer.version
+        installed[index].permissions = offer.grants
+        save()
+        guard installed[index].enabled else { return }
+        await load(installed[index])
     }
 
     /// The copy an extension's popup page is loaded from, beside it.
@@ -720,32 +756,54 @@ final class Extensions: NSObject, ObservableObject {
 
     /// What an extension wants, in words.
     static func describe(_ found: WKWebExtension, in folder: URL) -> [String] {
+        accessLines(found, in: folder, only: nil)
+    }
+
+    static func freshLines(_ found: WKWebExtension, in folder: URL, granted: Set<String>) -> [String] {
+        accessLines(found, in: folder, only: Set(grants(found, in: folder)).subtracting(granted))
+    }
+
+    private static let permissionLines: [(WKWebExtension.Permission, String)] = [
+        (.tabs, "See your open tabs and their addresses"),
+        (.cookies, "Read and change cookies"),
+        (.webNavigation, "See where you go"),
+        (.webRequest, "See the requests pages make"),
+        (.declarativeNetRequest, "Block or change requests pages make"),
+        (.clipboardWrite, "Write to the clipboard"),
+        (.nativeMessaging, "Talk to apps on this Mac"),
+        (.scripting, "Run scripts in pages"),
+    ]
+
+    private static func accessLines(_ found: WKWebExtension, in folder: URL, only fresh: Set<String>?) -> [String] {
         var out: [String] = []
         // Leaving out what Search itself added to the manifest.
         let added = Set((try? JSONSerialization.jsonObject(with: Data(contentsOf: folder.appendingPathComponent(".search-added")))) as? [String] ?? [])
         let declared = Set(((try? JSONSerialization.jsonObject(with: Data(contentsOf: folder.appendingPathComponent("manifest.json")))) as? [String: Any])?["permissions"] as? [String] ?? [])
-        let patterns = found.allRequestedMatchPatterns
+        let patterns = found.allRequestedMatchPatterns.filter { pattern in
+            fresh.map { $0.contains("site:" + pattern.string) } ?? true
+        }
         if patterns.contains(where: { $0.matchesAllHosts || $0.matchesAllURLs }) {
             out.append("Read and change everything on every website")
         } else if !patterns.isEmpty {
             let hosts = patterns.compactMap(\.host).filter { !$0.isEmpty }
             out.append("Read and change what's on " + (hosts.prefix(4).joined(separator: ", ")) + (hosts.count > 4 ? " and \(hosts.count - 4) more" : ""))
         }
-        let words: [WKWebExtension.Permission: String] = [
-            .tabs: "See your open tabs and their addresses",
-            .cookies: "Read and change cookies",
-            .webNavigation: "See where you go",
-            .webRequest: "See the requests pages make",
-            .declarativeNetRequest: "Block or change requests pages make",
-            .clipboardWrite: "Write to the clipboard",
-            .nativeMessaging: "Talk to apps on this Mac",
-            .scripting: "Run scripts in pages",
-        ]
-        for (permission, sentence) in words where found.requestedPermissions.contains(permission) && !added.contains(permission.rawValue) {
-            out.append(sentence)
+        for (permission, sentence) in permissionLines {
+            let include = fresh.map { $0.contains(permission.rawValue) }
+                ?? (found.requestedPermissions.contains(permission) && !added.contains(permission.rawValue))
+            if include { out.append(sentence) }
         }
         // Chrome's own, which Search answers itself.
-        for (name, sentence) in Extensions.searchAnswered where declared.contains(name) { out.append(sentence) }
+        for (name, sentence) in Extensions.searchAnswered {
+            let include = fresh.map { $0.contains("search:" + name) } ?? declared.contains(name)
+            if include { out.append(sentence) }
+        }
+        if let fresh {
+            let spoken = Set(permissionLines.map(\.0.rawValue)).union(searchAnswered.map { "search:" + $0.0 })
+            for grant in fresh.sorted() where !grant.hasPrefix("site:") && !spoken.contains(grant) {
+                out.append(grant.hasPrefix("search:") ? String(grant.dropFirst(7)) : grant)
+            }
+        }
         return out
     }
 
@@ -820,8 +878,20 @@ final class Extensions: NSObject, ObservableObject {
 
     /// The list behind the puzzle button.
     @Published var menuOpen = false
+    @Published private(set) var updates: [UpdateOffer] = []
     /// Where a popup hangs when its extension isn't pinned: the puzzle button.
     static let menuAnchor = "__menu"
+
+    struct UpdateOffer: Identifiable {
+        let id: String
+        let name: String
+        let fromVersion: String
+        let version: String
+        let lines: [String]
+        let icon: NSImage?
+        let staged: URL
+        let grants: [String]
+    }
 
     /// One per loaded extension that has something to press, in install order.
     var buttons: [Button] {
@@ -1143,6 +1213,15 @@ private struct ExtensionButtons: View {
                 Door(icon: "puzzlepiece.extension", on: extensions.menuOpen, help: "Extensions") {
                     extensions.menuOpen.toggle()
                 }
+                .overlay(alignment: .topTrailing) {
+                    if !extensions.updates.isEmpty {
+                        Circle()
+                            .fill(Palette.ink)
+                            .frame(width: 5, height: 5)
+                            .padding(4)
+                            .allowsHitTesting(false)
+                    }
+                }
                 .background(Anchor(id: Extensions.menuAnchor))
                 .popover(isPresented: $extensions.menuOpen, arrowEdge: edge) {
                     ExtensionMenu(extensions: extensions)
@@ -1275,6 +1354,16 @@ private struct ExtensionMenu: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if !extensions.updates.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(extensions.updates.enumerated()), id: \.element.id) { index, offer in
+                        if index > 0 { Divider().overlay(Palette.hairline) }
+                        UpdateOfferRow(offer: offer, extensions: extensions)
+                    }
+                }
+                .padding(10)
+                Divider().overlay(Palette.hairline)
+            }
             let buttons = extensions.buttons
             if buttons.isEmpty {
                 Text("None of your extensions is on")
@@ -1351,6 +1440,74 @@ private struct ExtensionMenu: View {
             .onHover { hovering = $0 }
             .help(button.label)
             .contextMenu { ExtensionActions(id: button.id, name: button.name, extensions: extensions) }
+        }
+    }
+
+    private struct UpdateOfferRow: View {
+        let offer: Extensions.UpdateOffer
+        @ObservedObject var extensions: Extensions
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 9) {
+                    icon
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(offer.name)
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(Palette.ink)
+                            .lineLimit(1)
+                        Text("\(offer.fromVersion) → \(offer.version)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Palette.muted)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+                if shown.isEmpty {
+                    Text("It asks for more than it had.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Palette.ink)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("It will also be able to")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Palette.muted)
+                        ForEach(shown, id: \.self) { line in
+                            Text(line)
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(Palette.ink)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if offer.lines.count > shown.count {
+                            Text("and \(offer.lines.count - shown.count) more")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Palette.muted)
+                        }
+                    }
+                }
+                HStack(spacing: 6) {
+                    Spacer(minLength: 0)
+                    Pill("Not now") { extensions.declineUpdate(offer.id) }
+                    Pill("Update", filled: true) { extensions.acceptUpdate(offer.id) }
+                }
+            }
+        }
+
+        private var shown: [String] { Array(offer.lines.prefix(5)) }
+
+        @ViewBuilder private var icon: some View {
+            if let image = offer.icon {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 16, height: 16)
+            } else {
+                Image(systemName: "puzzlepiece.extension")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.muted)
+                    .frame(width: 16, height: 16)
+            }
         }
     }
 

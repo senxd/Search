@@ -26,7 +26,7 @@
 // `v` is the build of this file — the guard compares it so a newer drive.js
 // can replace an older one mid-session. It is not `version`, which is the
 // snapshot lineage the protocol speaks about.
-const BUILD = 4;
+const BUILD = 10;
 if (window.__drive && window.__drive.v >= BUILD) return;
 
 // ---------------------------------------------------------------- util
@@ -86,8 +86,13 @@ function bumpVersion() {
 
 // ---------------------------------------------------------------- state
 
-let refCounter = 0;                                  // mints e1, e2, … — never reused
-const refs = new Map();                              // ref -> WeakRef<Element>
+const priorDriver = window.__drive;
+const priorRefs = priorDriver && priorDriver.refs instanceof Map ? priorDriver.refs : null;
+// Legacy drivers did not expose their counter. Keep their handles and mint
+// new ones in a disjoint epoch; later upgrades preserve the exact counter.
+const refEpoch = priorRefs ? (typeof priorDriver._refEpoch === 'string' ? priorDriver._refEpoch : 'u' + BUILD + '-') : '';
+let refCounter = priorRefs && Number.isSafeInteger(priorDriver._refCounter) ? priorDriver._refCounter : 0;
+const refs = priorRefs || new Map();                              // ref -> WeakRef<Element>
 let prevRefs = new Set();                            // refs present at the end of the last snapshot — the `*` diff
 const consoleLines = [];                             // ring buffer, last 200
 
@@ -96,8 +101,11 @@ const consoleLines = [];                             // ring buffer, last 200
 // name" and hand back the same ref instead of churning.
 function ensureRef(el, role, name, prefix) {
   const cur = el.__driveRef;
-  if (cur && cur.role === role && cur.name === name && cur.prefix === (prefix || '')) return cur.ref;
-  const ref = (window.__driveRefNamespace || '') + (prefix || '') + 'e' + (++refCounter);
+  if (cur && cur.role === role && cur.name === name && cur.prefix === (prefix || '')) {
+    refs.set(cur.ref, new WeakRef(el));
+    return cur.ref;
+  }
+  const ref = (window.__driveRefNamespace || '') + refEpoch + (prefix || '') + 'e' + (++refCounter);
   el.__driveRef = { ref, role, name, prefix: prefix || '' };
   refs.set(ref, new WeakRef(el));
   return ref;
@@ -124,8 +132,10 @@ function docPrefix(doc) {
 // ---------------------------------------------------------------- roles
 
 // Tags that are never content. `input[type=hidden]` joins them via roleOf's
-// null; SVG subtrees are skipped on their namespace instead.
+// null; decorative SVG leaves are filtered by svgCandidate.
 const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'META', 'LINK', 'BASE', 'TITLE', 'HEAD']);
+const isSVG = (el) => !!(el.namespaceURI && el.namespaceURI.indexOf('svg') !== -1);
+const TEXT_VALUE_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email', 'number', 'date', 'datetime-local', 'month', 'week', 'time']);
 
 // Explicit role= beats the tag map; the first token is the one ARIA
 // believes. null means "skip this subtree entirely" — a hidden input is
@@ -133,6 +143,8 @@ const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'META', 'L
 function roleOf(el) {
   const explicit = (el.getAttribute('role') || '').trim().split(/\s+/)[0];
   if (explicit) return explicit.toLowerCase();
+  if (isSVG(el) && (el.localName || '').toLowerCase() === 'a' &&
+      (el.hasAttribute('href') || el.hasAttribute('xlink:href'))) return 'link';
   switch (el.tagName) {
     case 'A': case 'AREA': return el.hasAttribute('href') ? 'link' : 'generic';
     case 'BUTTON': return 'button';
@@ -245,6 +257,8 @@ const WIDGET_ROLES = new Set([
 function isInteractive(el, role, st) {
   if (WIDGET_ROLES.has(role)) return true;
   if (el.tagName === 'A' && el.hasAttribute('href')) return true;
+  if (isSVG(el) && (el.localName || '').toLowerCase() === 'a' &&
+      (el.hasAttribute('href') || el.hasAttribute('xlink:href'))) return true;
   if (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA' || el.tagName === 'SUMMARY') return true;
   if (el.hasAttribute('onclick')) return true;
   const ti = el.getAttribute('tabindex');
@@ -254,6 +268,16 @@ function isInteractive(el, role, st) {
   if (st && st.cursor === 'pointer') return true;
   try { if (el.scrollHeight > el.clientHeight + 8 && el.clientHeight > 0) return true; } catch (e) {}
   return false;
+}
+
+// Walk SVG containers and text, plus explicitly named or interactive
+// graphics. Paths and decorative shapes stay out of the agent's tree.
+function svgCandidate(el, st) {
+  if (!isSVG(el)) return true;
+  const tag = (el.localName || el.tagName || '').toLowerCase();
+  if (tag === 'svg' || tag === 'g' || tag === 'text' || tag === 'a' || tag === 'foreignobject') return true;
+  if (['role', 'aria-label', 'aria-labelledby', 'tabindex', 'onclick'].some((a) => el.hasAttribute(a))) return true;
+  return isInteractive(el, roleOf(el), st);
 }
 
 // ---------------------------------------------------------------- locs
@@ -325,13 +349,19 @@ function snapshotLines(opts) {
     if (ctx.visited++ > WALK_CAP) { ctx.capped = true; return; }
     const tag = el.tagName;
     if (!tag || SKIP_TAGS.has(tag)) return;
-    if (el.namespaceURI && el.namespaceURI.indexOf('svg') !== -1) return;
+    const svg = isSVG(el);
     if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true') return;
     const st = style(el);
+    const svgText = svg && (el.localName || '').toLowerCase() === 'text';
+    // SVG labels and paint servers may combine several colors.
+    const textColor = opts.textColors && st && (svgText ?
+      (el.children.length || parseFloat(st.fillOpacity) === 0 || /^(none|url\(|context-)/i.test(st.fill) || /^rgba\([^)]*,\s*0\)$/.test(st.fill) ? null : st.fill) : st.color);
+    const colorSuffix = textColor ? ' [color=' + esc(clip(textColor, 80)) + ']' : '';
     // display:none and opacity:0 take the whole subtree down with them;
     // visibility:hidden hides the element itself but a child may have
     // re-enabled it, so that one only mutes the line.
     if (st && (st.display === 'none' || +st.opacity === 0)) return;
+    if (!svgCandidate(el, st)) return;
     const hiddenVis = !!(st && (st.visibility === 'hidden' || st.visibility === 'collapse'));
 
     let role = roleOf(el);
@@ -351,15 +381,16 @@ function snapshotLines(opts) {
     if (interactive && r && (r.top + offY) >= ctx.vh) ctx.belowFold++;
 
     let emitted = false;
-    if (shown && (!opts.interactive || interactive) && (role !== 'generic' || interactive)) {
+    if (shown && (!opts.interactive || interactive) && (role !== 'generic' || interactive || (svg && name))) {
       let line = '  '.repeat(depth) + '- ' + role;
       if (name) line += ' "' + esc(name) + '"';
+      if (name && name === clip(ownText(el), 80)) line += colorSuffix;
       if (level != null) line += ' [level=' + level + ']';
       if (interactive) {
         const ref = ensureRef(el, role, name, prefix);
         ctx.seen.add(ref);
         line += (prevRefs.has(ref) ? ' [' : ' *[') + 'ref=' + ref + ']';
-        line += ' [loc=css:' + cssLoc(el) + ']';
+        if (opts.cssLocators !== false) line += ' [loc=css:' + cssLoc(el) + ']';
         if (name) line += ' [loc=' + roleLoc(role, name) + ']';
       }
       if (ctx.boxes && r) line += ' [box=' + Math.round(r.x + offX) + ',' + Math.round(r.y + offY) + ',' + Math.round(r.w) + ',' + Math.round(r.h) + ']';
@@ -367,6 +398,13 @@ function snapshotLines(opts) {
       const isChecked = el.checked === true || el.getAttribute('aria-checked') === 'true';
       if (isChecked && (role === 'checkbox' || role === 'radio' || role === 'switch' || role === 'option' || role === 'menuitemcheckbox' || role === 'menuitemradio' || role === 'treeitem')) line += ' [checked]';
       if (el.disabled || el.getAttribute('aria-disabled') === 'true') line += ' [disabled]';
+      if (el.readOnly || el.getAttribute('aria-readonly') === 'true') line += ' [readonly]';
+      if (tag === 'INPUT' && el.type !== 'text') line += ' [type=' + el.type + ']';
+      const textValue = tag === 'TEXTAREA' || (tag === 'INPUT' && TEXT_VALUE_INPUT_TYPES.has(el.type));
+      if (textValue) {
+        const value = String(el.value || '');
+        line += ' [value=' + JSON.stringify(value.length > 1000 ? value.slice(0, 1000) + '…' : value) + ']';
+      }
       lines.push(line);
       emitted = true;
     }
@@ -387,11 +425,16 @@ function snapshotLines(opts) {
     }
 
     // Text that was spent as the element's name doesn't get said twice.
-    const muted = !!name && CONTENT_NAME_ROLES.has(role);
+    const muted = (!!name && CONTENT_NAME_ROLES.has(role)) || svgText || tag === 'TEXTAREA';
     if (!muted && shown && !opts.interactive) {
       const t = ownText(el);
-      if (t) lines.push('  '.repeat(cd) + '- "' + esc(clip(t, 120)) + '"');
+      if (t) lines.push('  '.repeat(cd) + '- "' + esc(clip(t, 120)) + '"' + colorSuffix);
     }
+    if (svgText && shown && !opts.interactive && !name) {
+      const t = text(el);
+      if (t) lines.push('  '.repeat(cd) + '- "' + esc(clip(t, 120)) + '"' + colorSuffix);
+    }
+    if (svgText) return;
     // A closed <select> is a popup, not children — only an open one lists.
     if (tag === 'SELECT' && !(el.multiple || parseInt(el.getAttribute('size'), 10) > 1)) return;
     for (const c of children(el)) visit(c, cd, offX, offY);
@@ -450,8 +493,16 @@ function eachElement(fn) {
     for (const el of children(root)) {
       const tag = el.tagName;
       if (!tag || SKIP_TAGS.has(tag)) continue;
-      if (el.namespaceURI && el.namespaceURI.indexOf('svg') !== -1) continue;
-      if (fn(el) === false) return false;
+      const svg = isSVG(el);
+      let svgHidden = false;
+      if (svg) {
+        if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true') continue;
+        const st = style(el);
+        if (st && (st.display === 'none' || +st.opacity === 0)) continue;
+        if (!svgCandidate(el, st)) continue;
+        svgHidden = !!(st && (st.visibility === 'hidden' || st.visibility === 'collapse'));
+      }
+      if (!svgHidden && fn(el) === false) return false;
       if (tag === 'IFRAME' || tag === 'FRAME') {
         try { const d = el.contentDocument; if (d && d.documentElement && into(d.body || d.documentElement) === false) return false; } catch (e) {}
       }
@@ -559,7 +610,14 @@ function resolve(query) {
     let found = null;
     eachElement((el) => {
       const role = roleOf(el);
-      if (role === null || role === 'generic') return;
+      if (role === null) return;
+      if (role === 'generic') {
+        if (isSVG(el) && (el.localName || '').toLowerCase() === 'text' &&
+            isInteractive(el, role, style(el)) && text(el).toLowerCase() === want) {
+          found = el; return false;
+        }
+        return;
+      }
       if (nameOf(el, role).toLowerCase() !== want) return;
       found = el; return false;
     });
@@ -676,16 +734,16 @@ function fireMouse(el, type, x, y, opts) {
 function clickGesture(el, x, y, opts) {
   const b = opts.button === 'middle' ? 1 : opts.button === 'right' ? 2 : 0;
   const buttons = b === 0 ? 1 : b === 1 ? 4 : 2;
-  const send = (type, detail) => fireMouse(el, type, x, y, { button: b, buttons, detail, modifiers: opts.modifiers });
+  const send = (type, detail, pressed = false) => fireMouse(el, type, x, y, { button: b, buttons: pressed ? buttons : 0, detail, modifiers: opts.modifiers });
   send('pointerover'); send('mouseover'); send('mousemove');
-  send('pointerdown'); send('mousedown');
+  send('pointerdown', 0, true); send('mousedown', 0, true);
   if (b === 0) { try { el.focus && el.focus(); } catch (e) {} }
   send('pointerup'); send('mouseup');
   if (b === 2) { const e = send('contextmenu'); return { prevented: !!(e && e.defaultPrevented) }; }
   const ev = send(b === 1 ? 'auxclick' : 'click');
   if (opts.double) {
-    send('pointerdown'); send('mousedown'); send('pointerup'); send('mouseup');
-    fireMouse(el, b === 1 ? 'auxclick' : 'click', x, y, { button: b, buttons, detail: 2, modifiers: opts.modifiers });
+    send('pointerdown', 0, true); send('mousedown', 0, true); send('pointerup'); send('mouseup');
+    fireMouse(el, b === 1 ? 'auxclick' : 'click', x, y, { button: b, buttons: 0, detail: 2, modifiers: opts.modifiers });
     if (b === 0) send('dblclick');
   }
   return { prevented: !!(ev && ev.defaultPrevented) };
@@ -727,7 +785,12 @@ async function waitNav(el) {
 }
 
 function withSnap(out, args) {
-  if (args.withSnapshot) out.snapshot = takeSnapshot({}).snapshot;
+  if (args.withSnapshot) {
+    const snap = takeSnapshot({ maxChars: args.snapshotMaxChars, cssLocators: args.cssLocators });
+    out.snapshot = snap.snapshot;
+    out.snapshotTruncated = snap.truncated;
+    out.snapshotVersion = snap.version;
+  }
   return out;
 }
 
@@ -743,6 +806,50 @@ async function act(verb, query, args) {
     };
     checkGuard();
     switch (verb) {
+      case 'drag': {
+        const holdMs = args.holdMs === undefined ? 0 : args.holdMs;
+        if (!Number.isInteger(holdMs) || holdMs < 0 || holdMs > 2000)
+          return { error: 'drag holdMs must be an integer from 0 to 2000', code: 'INVALID_ARGUMENT', version };
+        const sourceAt = Array.isArray(args.source) ? pointArg(args.source) : null;
+        const path = args.path;
+        if (path !== undefined && (!Array.isArray(path) || path.length > 128 || path.some((p) =>
+            !Array.isArray(p) || p.length !== 2 || !p.every(Number.isFinite) || p[0] < 0 || p[1] < 0 ||
+            p[0] >= (window.innerWidth || 1024) || p[1] >= (window.innerHeight || 768))))
+          return { error: 'drag path must contain at most 128 in-viewport [x,y] points', code: 'INVALID_ARGUMENT', version };
+        const source = resolve(sourceAt ? { at: sourceAt } : query);
+        if (sourceAt && (!sourceAt.every(Number.isFinite) || sourceAt[0] < 0 || sourceAt[1] < 0 ||
+            sourceAt[0] >= (window.innerWidth || 1024) || sourceAt[1] >= (window.innerHeight || 768)))
+          return { error: 'drag source must be inside the viewport', code: 'NOT_FOUND', version };
+        const first = sourceAt ? { at: sourceAt } : await actionable(source);
+        if (first.error) return Object.assign({ version }, first);
+        let destination = null, to;
+        if (args.to && typeof args.to === 'object' && !Array.isArray(args.to) &&
+            ['ref', 'loc', 'css', 'text', 'at'].some((key) => args.to[key] != null)) {
+          destination = resolve(args.to);
+          const ready = await actionable(destination);
+          if (ready.error) return Object.assign({ version }, ready);
+          to = ready.at;
+        } else {
+          to = pointArg(args.to);
+          if (!to.every(Number.isFinite) || to[0] < 0 || to[1] < 0 ||
+              to[0] >= (window.innerWidth || 1024) || to[1] >= (window.innerHeight || 768))
+            return { error: 'drag destination must be inside the viewport', code: 'NOT_FOUND', version };
+        }
+        // Scrolling the destination into view may have moved the source.
+        // Recheck its current hit point without scrolling it back over the
+        // destination; simultaneous visibility is required for a real drag.
+        const r = rect(source), x = sourceAt ? sourceAt[0] : Math.round(r.left + r.w / 2), y = sourceAt ? sourceAt[1] : Math.round(r.top + r.h / 2);
+        const hit = source.ownerDocument.elementFromPoint ? source.ownerDocument.elementFromPoint(x, y) : source;
+        if (x < 0 || y < 0 || x >= (source.ownerDocument.defaultView.innerWidth || 1024) ||
+            y >= (source.ownerDocument.defaultView.innerHeight || 768))
+          return { error: 'drag source moved out of view', code: 'NOT_VISIBLE', version };
+        if (hit && hit !== source && !source.contains(hit) && !(hit.tagName === 'LABEL' && hit.contains(source)))
+          return { error: 'drag source is covered by ' + describeEl(hit), code: 'COVERED', version };
+        checkGuard();
+        return { ok: true, version, handoff: 'drag', from: sourceAt || topPoint(source, x, y), to,
+          source: describeEl(source), destination: destination ? describeEl(destination) : null,
+          path: path || [], steps: Math.max(1, Math.min(64, Number(args.steps) || 8)), holdMs };
+      }
       case 'click': {
         const el = resolve(query);
         const a = await actionable(el);
@@ -776,11 +883,22 @@ async function act(verb, query, args) {
           return { error: 'use check for ' + (el.getAttribute('type') || 'this') + ' inputs', code: 'WRONG_VERB', version };
         if (el.tagName === 'SELECT')
           return { error: 'use select for a <select>', code: 'WRONG_VERB', version };
+        if (el.readOnly || el.getAttribute('aria-readonly') === 'true')
+          return { error: 'element is read-only; use its page controls to change the value', code: 'READ_ONLY', version };
         const a = await actionable(el);
         if (a.error) return Object.assign({ version }, a);
         checkGuard();
-        try { el.focus && el.focus(); } catch (e) {}
         const value = args.text !== undefined ? String(args.text) : '';
+        if (el.tagName === 'INPUT') {
+          // Validate browser sanitization without changing the live field or focus.
+          const probe = el.cloneNode(false);
+          try { probe.value = value; } catch (e) {
+            return { error: 'fill cannot set input type ' + el.type + '; use its native value format or upload for files', code: 'INVALID_ARGUMENT', version };
+          }
+          if (probe.value !== value)
+            return { error: 'fill value rejected by input type ' + el.type + '; use its native value format', code: 'INVALID_ARGUMENT', version };
+        }
+        try { el.focus && el.focus(); } catch (e) {}
         if (el.isContentEditable || (el.hasAttribute('contenteditable') && el.getAttribute('contenteditable') !== 'false')) {
           // Prefer the editing path so beforeinput and friends see a real
           // insertion; where execCommand doesn't exist, set + input event.
@@ -806,7 +924,7 @@ async function act(verb, query, args) {
           emit(el, 'input', { bubbles: true, inputType: 'insertText', data: value });
           emit(el, 'change', { bubbles: true });
         }
-        return withSnap({ ok: true, version, navChanged: false }, args);
+        return withSnap({ ok: true, version, navChanged: false, at: a.at }, args);
       }
       case 'press': {
         const km = keymap(args.key);
@@ -852,8 +970,14 @@ async function act(verb, query, args) {
         return withSnap({ ok: true, version, navChanged: false, scroll: [el.scrollLeft, el.scrollTop] }, args);
       }
       case 'hover': {
-        const el = resolve(query);
-        const a = await actionable(el);
+        const coordinates = args.x !== undefined || args.y !== undefined;
+        if (coordinates && (![args.x, args.y].every(v => typeof v === 'number' && Number.isFinite(v)) ||
+            args.x < 0 || args.y < 0 || args.x >= window.innerWidth || args.y >= window.innerHeight))
+          return { error: 'hover x and y must be finite coordinates inside the viewport', code: 'INVALID_ARGUMENT', version };
+        if (coordinates && query && Object.keys(query).length)
+          return { error: 'hover takes either a locator or x,y coordinates', code: 'INVALID_ARGUMENT', version };
+        const el = resolve(coordinates ? { at: [args.x, args.y] } : query);
+        const a = coordinates ? { x: args.x, y: args.y, at: [args.x, args.y] } : await actionable(el);
         if (a.error) return Object.assign({ version }, a);
         checkGuard();
         const o = { button: 0, buttons: 0, detail: 0, modifiers: args.modifiers };
@@ -861,7 +985,7 @@ async function act(verb, query, args) {
         // enter/leave don't bubble — they're separate events, not phases.
         const no = Object.assign({ bubbles: false }, o);
         fireMouse(el, 'pointerenter', a.x, a.y, no); fireMouse(el, 'mouseenter', a.x, a.y, no);
-        return withSnap({ ok: true, version, navChanged: false, at: a.at }, args);
+        return withSnap({ ok: true, version, navChanged: false, at: a.at, element: describeEl(el) }, args);
       }
       case 'select': {
         const el = resolve(query);
@@ -889,7 +1013,7 @@ async function act(verb, query, args) {
         // build its own activation event.
         try { el.click(); }
         catch (e) { el.checked = on; emit(el, 'input', { bubbles: true }); emit(el, 'change', { bubbles: true }); }
-        return withSnap({ ok: true, version, navChanged: false, checked: el.checked }, args);
+        return withSnap({ ok: true, version, navChanged: false, checked: el.checked, at: a.at }, args);
       }
       case 'submit': {
         const el = resolve(query);
@@ -911,6 +1035,64 @@ async function act(verb, query, args) {
 }
 
 // ---------------------------------------------------------------- marks
+
+// One temporary outline per page. Its owner is an agent session, so a
+// disconnect or clear from another session cannot dismiss it.
+let attention = null;
+function clearHighlight(owner) {
+  if (!attention || (owner != null && attention.owner !== owner)) return { cleared: false };
+  const current = attention;
+  attention = null;
+  clearInterval(current.watch);
+  clearTimeout(current.expiry);
+  window.removeEventListener('pagehide', current.hide);
+  document.removeEventListener('keydown', current.escape, true);
+  current.doc.removeEventListener('keydown', current.escape, true);
+  current.overlay.remove();
+  return { cleared: true };
+}
+
+function highlight(query, opts, owner) {
+  opts = opts || {};
+  const keys = ['ref', 'loc', 'css', 'text'].filter(k => query && query[k] != null);
+  const duration = opts.duration == null ? 8 : opts.duration;
+  if (keys.length !== 1 || typeof query[keys[0]] !== 'string' || !query[keys[0]].trim() ||
+      typeof duration !== 'number' || !Number.isFinite(duration) || duration < 1 || duration > 30 ||
+      (opts.scroll != null && typeof opts.scroll !== 'boolean')) {
+    throw { code: 'INVALID_ARGUMENT', message: 'highlight needs one target, duration 1..30 seconds, and optional boolean scroll' };
+  }
+  if (attention && attention.owner !== owner) throw { code: 'BUSY', message: 'another session is highlighting this page' };
+  const el = resolve(query);
+  if (opts.scroll !== false && el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+  const bounds = rect(el);
+  if (bounds.w <= 0 || bounds.h <= 0 || style(el).visibility === 'hidden') throw notFound('visible highlight target');
+  clearHighlight(owner);
+  const doc = el.ownerDocument;
+  const overlay = doc.createElement('div');
+  overlay.setAttribute('data-search-highlight', '');
+  overlay.setAttribute('aria-hidden', 'true');
+  overlay.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;pointer-events:none!important;z-index:2147483647!important;';
+  const box = doc.createElement('div');
+  box.style.cssText = 'position:absolute;box-sizing:border-box;border:3px solid #ff9500;border-radius:5px;box-shadow:0 0 0 2px white;background:rgba(255,149,0,.12);pointer-events:none;';
+  overlay.attachShadow({ mode: 'closed' }).appendChild(box);
+  doc.documentElement.appendChild(overlay);
+  const escape = e => { if (e.key === 'Escape') clearHighlight(owner); };
+  const hide = () => clearHighlight(owner);
+  const update = () => {
+    if (!el.isConnected || !overlay.isConnected) { clearHighlight(owner); return; }
+    const r = rect(el);
+    box.style.left = r.x + 'px'; box.style.top = r.y + 'px';
+    box.style.width = r.w + 'px'; box.style.height = r.h + 'px';
+    box.style.display = style(el).visibility === 'hidden' ? 'none' : 'block';
+  };
+  // ponytail: follows layout at 10Hz for at most 30s; use rAF if moving targets need smoother tracking.
+  attention = { owner, overlay, doc, escape, hide, watch: setInterval(update, 100), expiry: setTimeout(() => clearHighlight(owner), duration * 1000) };
+  window.addEventListener('pagehide', hide);
+  document.addEventListener('keydown', escape, true);
+  doc.addEventListener('keydown', escape, true);
+  update();
+  return { highlighted: true, duration, target: describeEl(el) };
+}
 
 // Set-of-marks for screenshots: a fixed overlay at the top of the stack,
 // one outlined box per interactive element with its ref as a chip. Colours
@@ -1117,6 +1299,8 @@ function keymap(key) {
 
 const api = {
   v: BUILD,
+  get _refCounter() { return refCounter; },
+  _refEpoch: refEpoch,
   get version() { return version; },
   refs,
   snapshot: takeSnapshot,
@@ -1124,6 +1308,8 @@ const api = {
   act,
   mark,
   unmark,
+  highlight,
+  clearHighlight,
   run,
   console: consoleLines,
   frames,

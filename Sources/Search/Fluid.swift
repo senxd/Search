@@ -324,6 +324,28 @@ final class FluidHover {
     /// the DOM; rows that have a label report it here (Radix's typeahead
     /// data). Optional; rows without a label just don't match.
     var itemLabels: [Int: String] = [:]
+    /// Rows hosting a submenu — index → opener (the Bool asks for first-row
+    /// focus, i.e. a keyboard open). Enter/Space/→ and gap-picks route here
+    /// instead of activating (Radix SubTrigger's SUB_OPEN_KEYS).
+    var submenuActions: [Int: (Bool) -> Void] = [:]
+    /// Each row's own click path (onSelect + dismiss env) — keyboard
+    /// activation and gap-picks dispatch here before the panel-level
+    /// onPick fallback, so rows wired with only onSelect aren't
+    /// keyboard-dead (Radix: Enter synthesizes the item's click).
+    var rowActions: [Int: () -> Void] = [:]
+    /// Set when the keyboard writes the pick (navKey's setFocus), cleared
+    /// by pointer moves — submenu triggers auto-open on pointer hover
+    /// only, never on roving arrow-key focus (Radix opens a Sub on
+    /// →/Enter/hover, not on roving focus).
+    var navDrivenFocus = false
+    /// The row whose submenu is currently open — while set, this scope's
+    /// nav/typeahead keys yield to the sub's own monitor (Radix moves
+    /// keyboard nav into the sub rather than moving the parent's focus).
+    var openSubIndex: Int? = nil
+    /// Rows disabled by their own `disabled:` prop rather than the panel's
+    /// `disabledIndices` — isItemDisabled unions both sets so the pick,
+    /// gap-pick, and nav all skip them.
+    var rowDisabled: Set<Int> = []
     var activeIndex: Int? = nil
     var session = 0
     private var inside = false
@@ -337,6 +359,7 @@ final class FluidHover {
 
     func moved(to point: CGPoint) {
         guard !frozen else { return }
+        navDrivenFocus = false
         if deadRects.contains(where: { $0.contains(point) }) {
             if activeIndex != nil { activeIndex = nil }
             return
@@ -451,6 +474,12 @@ struct FluidContainer<Content: View>: View {
                     .onEnded { value in
                         guard hover.gapClick, let i = hover.activeIndex,
                               !hover.isItemDisabled(i) else { return }
+                        // simultaneousGesture still fires over row Buttons
+                        // — a tap inside a registered row rect is the row's
+                        // own activation, not a gap pick (double-select).
+                        if hover.rects.values.contains(where: {
+                            $0.contains(value.location)
+                        }) { return }
                         // gapClick:{maxDistance} — clicks beyond the cap
                         // from the lit rect are inert (use-fluid-hover).
                         if hover.gapClickMaxDistance != .infinity,

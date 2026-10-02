@@ -21,6 +21,9 @@ let fetchHandler = null;   // (m) => answers a fetch post, async
 window.__native = {
   post(m) {
     posts.push(m);
+    if (m.kind === 'permissions') {
+      return void setTimeout(() => window.__h._tool(m.id, { mode: 'guard', confirmationCriteria: [] }), 0);
+    }
     if (m.kind === 'fetch') {
       fetchIds.push(m.id);
       const h = fetchHandler;
@@ -123,7 +126,7 @@ async function waitFor(pred, ms) {
   const ended = await waitFor(() => events.some(e => e.name === 'done' && e.data.chat === chat));
   check('#7 turn ended', ended);
   check('#7 queued steer is marked on the chat',
-        events.some(e => e.name === 'delta' && e.data.chat === chat && /\(queued: while you were out\)/.test(e.data.text)));
+        events.some(e => e.name === 'activity' && e.data.chat === chat && e.data.text === '(queued: while you were out)'));
   check('#7 queued steer reaches the model as a user message',
         events.some(e => e.name === 'delta' && e.data.chat === chat && /Echo: while you were out/.test(e.data.text)));
 }
@@ -221,17 +224,30 @@ async function waitFor(pred, ms) {
   fetchHandler = null;
 }
 
-// ── #11 "off" maps to each wire's floor; auto sends nothing ───────
+// ── #11 each model is sent a level it accepts; auto sends nothing ─
 {
   const runs = [
     { model: 'openrouter/unit-model', effort: 'off', want: 'none' },
-    { model: 'codex/gpt-6-luna', effort: 'off', want: 'minimal' },
+    { model: 'openrouter/unit-model', effort: 'minimal', want: 'minimal' },
     { model: 'openrouter/unit-model', effort: 'low', want: 'low' },
     { model: 'openrouter/unit-model', effort: 'medium', want: 'medium' },
-    { model: 'codex/gpt-6-luna', effort: 'high', want: 'high' },
     { model: 'openrouter/unit-model', effort: 'xhigh', want: 'xhigh' },
+    { model: 'openrouter/unit-model', effort: 'max', want: 'max' },
+    { model: 'openrouter/unit-model', effort: undefined, want: null },
+    { model: 'openrouter/z-ai/glm-5.3-flash', effort: 'off', want: 'low' },
+    { model: 'openrouter/z-ai/glm-5.3-flash', effort: 'medium', want: 'high' },
+    { model: 'openrouter/z-ai/glm-5.3-flash', effort: 'high', want: 'high' },
+    { model: 'openrouter/z-ai/glm-5.3-flash', effort: 'xhigh', want: 'max' },
+    { model: 'openrouter/z-ai/glm-5.3-flash', effort: 'max', want: 'max' },
+    { model: 'codex/gpt-6-luna', effort: 'off', want: 'none' },
+    { model: 'codex/gpt-6-luna', effort: 'none', want: 'none' },
+    { model: 'codex/gpt-6-luna', effort: 'minimal', want: 'low' },
+    { model: 'codex/gpt-6-luna', effort: 'low', want: 'low' },
+    { model: 'codex/gpt-6-luna', effort: 'medium', want: 'medium' },
+    { model: 'codex/gpt-6-luna', effort: 'high', want: 'high' },
+    { model: 'codex/gpt-6-luna', effort: 'xhigh', want: 'xhigh' },
     { model: 'codex/gpt-6-luna', effort: 'max', want: 'max' },
-    { model: 'openrouter/unit-model', effort: undefined, want: null }
+    { model: 'codex/gpt-6-sol', effort: 'off', want: 'none' }
   ];
   for (const r of runs) {
     posts.length = 0; events.length = 0;
@@ -242,6 +258,8 @@ async function waitFor(pred, ms) {
       window.__h._fetchLine(m.id, r.model.indexOf('codex') === 0
         ? 'data: ' + JSON.stringify({ type: 'response.output_text.delta', delta: 'ok' })
         : 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'ok' } }] }));
+      if (r.model.indexOf('codex') === 0) window.__h._fetchLine(m.id,
+        'data: ' + JSON.stringify({ type: 'response.completed', response: { model: 'gpt-6-luna' } }));
       window.__h._fetchLine(m.id, 'data: [DONE]');
       window.__h._fetchEnd(m.id, 200, null, null);
     };
@@ -318,6 +336,54 @@ async function waitFor(pred, ms) {
         hist.length === 1 && hist[0].role === 'user' &&
         hist[0].text === '[attached tabs: Old Tab <https://old.example>]\nold',
         JSON.stringify(hist));
+}
+
+// Transient HTTP rejections retry the same inference request, with no tools replayed.
+for (const test of [
+  { model: 'codex/gpt-6-luna', statuses: [503, 200], calls: 2, retries: 1, ok: true },
+  { model: 'codex/gpt-6-luna', statuses: [520, 200], calls: 2, retries: 1, ok: true },
+  { model: 'openrouter/unit-model', statuses: [502, 200], calls: 2, retries: 1, ok: true },
+  { model: 'codex/gpt-6-luna', statuses: [503, 503, 503], calls: 3, retries: 2, ok: false },
+  { model: 'codex/gpt-6-luna', statuses: [401], calls: 1, retries: 0, ok: false },
+  { model: 'codex/gpt-6-luna', statuses: [429], calls: 1, retries: 0, ok: false },
+  { model: 'codex/gpt-6-luna', statuses: [200], calls: 1, retries: 0, ok: false, partial: true },
+  { model: 'openrouter/unit-model', statuses: [200], calls: 1, retries: 0, ok: false, partial: true }
+]) {
+  posts.length = 0; events.length = 0;
+  const wires = [];
+  fetchHandler = (m) => {
+    const status = test.statuses[wires.length]; wires.push(m);
+    window.__h._fetchMeta(m.id, status, '{}');
+    if (status === 200) {
+      if (test.model.startsWith('codex/')) {
+        window.__h._fetchLine(m.id, 'data: ' + JSON.stringify({ type: 'response.output_text.delta', delta: 'ok' }));
+        if (!test.partial) window.__h._fetchLine(m.id, 'data: ' + JSON.stringify({ type: 'response.completed', response: { model: 'gpt-6-luna' } }));
+      } else window.__h._fetchLine(m.id, 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'ok' } }] }));
+      if (!test.partial) window.__h._fetchLine(m.id, 'data: [DONE]');
+    }
+    window.__h._fetchEnd(m.id, status, status === 200 ? null : 'service error', null);
+  };
+  const chat = 'retry-' + crypto.randomUUID();
+  window.__h.run({ chat: { id: chat, model: test.model, effort: 'xhigh', messages: [{ role: 'you', text: 'hi' }] }, tabs: [], text: 'hi' });
+  const ended = await waitFor(() => events.some(e => e.name === 'done' && e.data.chat === chat), 6000);
+  const done = events.find(e => e.name === 'done' && e.data.chat === chat);
+  check('HTTP retry ' + test.model + ' ' + test.statuses + (test.partial ? ' partial stream' : ''),
+    ended && wires.length === test.calls && events.filter(e => e.name === 'provider_retry').length === test.retries &&
+    (!done.data.error) === test.ok && !posts.some(p => p.kind === 'tool') &&
+    wires.every((wire, index) => wire.body === wires[0].body && wire.auth === wires[0].auth && wire.retry === index));
+  fetchHandler = null;
+}
+{
+  posts.length = 0; events.length = 0;
+  let attempts = 0;
+  fetchHandler = (m) => { attempts++; window.__h._fetchMeta(m.id, 503, '{}'); window.__h._fetchEnd(m.id, 503, 'service error', null); };
+  const chat = 'cancel-retry-' + crypto.randomUUID();
+  window.__h.run({ chat: { id: chat, model: 'codex/gpt-6-luna', messages: [{ role: 'you', text: 'hi' }] }, tabs: [], text: 'hi' });
+  await waitFor(() => events.some(e => e.name === 'provider_retry'));
+  window.__h.stop();
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  check('stop during retry backoff prevents a new request', attempts === 1);
+  fetchHandler = null;
 }
 
 console.log('---');

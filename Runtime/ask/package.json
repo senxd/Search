@@ -1,0 +1,7 @@
+{
+  "name": "search-ask-test",
+  "private": true,
+  "devDependencies": {
+    "jsdom": "30.1.1"
+  }
+}

@@ -1,0 +1,7 @@
+<!doctype html><meta charset="utf-8"><title>Turnstile interaction check</title>
+<style>body{font:18px system-ui;margin:40px}#status{margin-top:24px}</style>
+<h1>Human verification</h1><p>Complete the verification checkbox to continue.</p>
+<div class="cf-turnstile" data-sitekey="3x00000000000000000000FF" data-callback="verified" data-error-callback="failed"></div>
+<p id="status" data-state="pending">Verification pending</p>
+<script>function verified(){const s=document.getElementById('status');s.textContent='Verification complete';s.dataset.state='passed'}function failed(code){const s=document.getElementById('status');s.textContent='Verification error: '+code;s.dataset.state='error'}</script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>

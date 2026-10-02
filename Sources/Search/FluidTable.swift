@@ -73,8 +73,9 @@ struct FluidTableRow<Content: View>: View {
 
     var body: some View {
         HStack(spacing: 0) { content() }
-            .padding(.horizontal, size == .compact ? 10 : 12)
-            .padding(.vertical, size == .compact ? 5 : 8)
+            // Padding is per-cell in the source (px-3 py-2 / compact
+            // px-2.5 py-[5px]), so adjacent cells make a 24pt gutter —
+            // nothing on the tr itself (table.tsx:244-246,296-299).
             .frame(maxWidth: .infinity, alignment: .leading)
             .font(.system(size: size.text, weight: index == nil ? .semibold : .regular))
             .foregroundStyle(index == nil || isActive ? FluidTone.foreground : FluidTone.mutedForeground)
@@ -102,9 +103,13 @@ private struct FluidTableItem: ViewModifier {
 /// nil flexes equally. Content is any view (the source's td takes
 /// children); the String init keeps text call sites one token long.
 struct FluidTableCell<Content: View>: View {
-    /// Width share — nil flexes equally, a value pins a fixed width.
+    /// Width share — nil flexes equally, a value pins a fixed width
+    /// (border-box: the padding sits inside a pinned column, like the
+    /// source's `width` style on the padded td).
     var width: CGFloat? = nil
     @ViewBuilder var content: () -> Content
+
+    @Environment(\.fluidSize) private var size
 
     init(width: CGFloat? = nil, @ViewBuilder content: @escaping () -> Content) {
         self.width = width
@@ -113,6 +118,9 @@ struct FluidTableCell<Content: View>: View {
 
     var body: some View {
         content()
+            // td's own padding — px-3 py-2, compact px-2.5 py-[5px].
+            .padding(.horizontal, size == .compact ? 10 : 12)
+            .padding(.vertical, size == .compact ? 5 : 8)
             .frame(width: width)
             .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
             .lineLimit(1)

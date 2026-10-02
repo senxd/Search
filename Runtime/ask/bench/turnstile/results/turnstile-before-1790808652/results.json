@@ -1,0 +1,12 @@
+{
+  "label": "before",
+  "world": "turnstile-before-1790808652",
+  "model": "codex/gpt-6-luna",
+  "effort": "high",
+  "fixture_sha256": "d89cfeaacc6eb3098c1abb1f3737200e776024a2c3e33cbb956e54ffaddec463",
+  "started": "2026-09-30T22:50:52.200372+00:00",
+  "harness_sha256": "caff6b913685bf7c539e65a0cef2b677a729ad55363e9f7af77237d608a5135d",
+  "pending_before": true,
+  "error": "tab 923349e3 is not this session's \u2014 attach it first (its chip in Ask)",
+  "cleaned_up": true
+}

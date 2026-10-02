@@ -86,7 +86,9 @@ struct FluidAskAnswer: Equatable {
 
 struct FluidAskUserQuestions: View {
     var questions: [FluidAskQuestion]
-    var size: FluidSize = .default
+    /// nil follows the ambient `\.fluidSize` — the source's `useSize(size)`
+    /// / `size ? <SizeProvider> : frag` (ask-user-questions.tsx:153,1576).
+    var size: FluidSize? = nil
     var skipLabel = "Skip"
     /// Embedded presentation: the question rows sit in a composer's
     /// attachment slot and the composer editor IS the Other/freeText field.
@@ -115,7 +117,7 @@ struct FluidAskUserQuestions: View {
     @FocusState private var cardFocused: Bool
     @FocusState private var focusedRow: Int?
 
-    init(questions: [FluidAskQuestion], size: FluidSize = .default,
+    init(questions: [FluidAskQuestion], size: FluidSize? = nil,
          skipLabel: String = "Skip",
          index: Binding<Int>? = nil,
          answers: Binding<[String: FluidAskAnswer]>? = nil,
@@ -128,7 +130,7 @@ struct FluidAskUserQuestions: View {
     }
 
     // Convenience for the embedded presentation.
-    init(questions: [FluidAskQuestion], size: FluidSize = .default,
+    init(questions: [FluidAskQuestion], size: FluidSize? = nil,
          skipLabel: String = "Skip", embedded: Bool,
          index: Binding<Int>? = nil,
          answers: Binding<[String: FluidAskAnswer]>? = nil,
@@ -140,7 +142,10 @@ struct FluidAskUserQuestions: View {
         self.embedded = embedded
     }
 
-    private var compact: Bool { size == .compact }
+    @Environment(\.fluidSize) private var ambientSize
+    @Environment(\.fluidShape) private var shape
+    private var resolvedSize: FluidSize { size ?? ambientSize }
+    private var compact: Bool { resolvedSize == .compact }
     private var cur: Int {
         get { index?.wrappedValue ?? fallbackIndex }
         nonmutating set { index?.wrappedValue = newValue; fallbackIndex = newValue }
@@ -251,7 +256,7 @@ struct FluidAskUserQuestions: View {
         FluidInputMessage(
             text: otherBinding(q),
             placeholder: q.otherPlaceholder ?? "Describe in your own words…",
-            size: size,
+            size: resolvedSize,
             focus: $fieldFocused,
             // freeTextMultiline: Enter newlines; ⌘↵ commits.
             enterSends: !(q.freeText && q.freeTextMultiline),
@@ -325,11 +330,11 @@ struct FluidAskUserQuestions: View {
         .padding(.bottom, 20 - 10)
         .frame(maxWidth: 520)
         .background(
-            RoundedRectangle(cornerRadius: FluidShape.rounded.container, style: .continuous)
+            RoundedRectangle(cornerRadius: shape.container, style: .continuous)
                 .fill(FluidTone.card)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: FluidShape.rounded.container, style: .continuous)
+            RoundedRectangle(cornerRadius: shape.container, style: .continuous)
                 .strokeBorder(FluidTone.border, lineWidth: 1)
         )
         .focused($cardFocused)
@@ -349,7 +354,7 @@ struct FluidAskUserQuestions: View {
 
     @ViewBuilder
     private func rows(_ q: FluidAskQuestion) -> some View {
-        FluidContainer(hover: hover, radius: FluidShape.rounded.bg) {
+        FluidContainer(hover: hover, radius: shape.bg) {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(q.options.enumerated()), id: \.offset) { i, opt in
                     optionRow(q, i, opt)
@@ -395,7 +400,7 @@ struct FluidAskUserQuestions: View {
                    alignment: .leading)
             .contentShape(Rectangle())
             .overlay(
-                RoundedRectangle(cornerRadius: FluidShape.rounded.focusRing, style: .continuous)
+                RoundedRectangle(cornerRadius: shape.focusRing, style: .continuous)
                     .strokeBorder(FluidTone.focusRing, lineWidth: 1)
                     .padding(-2)
                     .opacity(focusedRow == i ? 1 : 0)
@@ -414,7 +419,7 @@ struct FluidAskUserQuestions: View {
         if q.stacked {
             VStack(alignment: .leading, spacing: 2) {
                 FluidRowLabel(label: opt.title, selected: selected,
-                              lit: lit, size: size)
+                              lit: lit, size: resolvedSize)
                 if let d = opt.description {
                     Text(d)
                         .font(.system(size: compact ? 11 : 12))
@@ -424,10 +429,10 @@ struct FluidAskUserQuestions: View {
         } else {
             HStack(spacing: 0) {
                 FluidRowLabel(label: opt.title, selected: selected,
-                              lit: lit, size: size)
+                              lit: lit, size: resolvedSize)
                 if let d = opt.description {
                     Text(" \(d)")
-                        .font(.system(size: size.text))
+                        .font(.system(size: resolvedSize.text))
                         .foregroundStyle(FluidTone.mutedForeground)
                 }
             }
@@ -447,7 +452,7 @@ struct FluidAskUserQuestions: View {
     }
 
     private func arrowSlot(visible: Bool) -> some View {
-        RoundedRectangle(cornerRadius: FluidShape.rounded.bg, style: .continuous)
+        RoundedRectangle(cornerRadius: shape.bg, style: .continuous)
             .fill(FluidTone.foreground)
             .overlay(FluidIcon("arrow.right", size: compact ? 12 : 14)
                 .foregroundStyle(FluidTone.background))
@@ -468,10 +473,10 @@ struct FluidAskUserQuestions: View {
             .background(
                 Group {
                     if isMulti && filled {
-                        RoundedRectangle(cornerRadius: FluidShape.rounded.bg, style: .continuous)
+                        RoundedRectangle(cornerRadius: shape.bg, style: .continuous)
                             .fill(FluidTone.foreground)
                     } else if isMulti {
-                        RoundedRectangle(cornerRadius: FluidShape.rounded.bg, style: .continuous)
+                        RoundedRectangle(cornerRadius: shape.bg, style: .continuous)
                             .strokeBorder(FluidTone.border, lineWidth: 1)
                     }
                 }
@@ -493,17 +498,21 @@ struct FluidAskUserQuestions: View {
                 FluidComposerEditor(
                     text: otherBinding(q),
                     focused: $fieldFocused,
-                    fontSize: size.text + 1,
+                    fontSize: resolvedSize.text + 1,
                     lineHeight: 18,
                     minLines: 1, maxLines: 8,
-                    onSend: { if isMulti { } else { submitOther() } },
+                    // Multi-select "Other" is a plain textarea — Return
+                    // inserts a newline, only ⌘↵ commits (source's
+                    // single-mode-only Enter submit).
+                    enterSends: !isMulti,
+                    onSend: { if !isMulti { submitOther() } },
                     onTab: {}, onArrowDown: { }, onArrowUp: { }, onEscape: { },
                     onMultilineChange: { otherMultiline = $0 },
                     onCommandReturn: { commandReturn() }
                 )
                 if (answer.otherText ?? "").isEmpty {
                     Text(q.otherPlaceholder ?? "Describe in your own words…")
-                        .font(.system(size: size.text + 1))
+                        .font(.system(size: resolvedSize.text + 1))
                         .foregroundStyle(FluidTone.mutedForeground)
                         .padding(8)
                         .allowsHitTesting(false)
@@ -532,16 +541,19 @@ struct FluidAskUserQuestions: View {
             FluidComposerEditor(
                 text: otherBinding(q),
                 focused: $fieldFocused,
-                fontSize: size.text + 1,
+                fontSize: resolvedSize.text + 1,
                 lineHeight: 18,
                 minLines: q.freeTextMultiline ? 3 : 1, maxLines: 8,
+                // Multiline answers own plain Return — without this the
+                // key is swallowed: no newline AND no submit.
+                enterSends: !q.freeTextMultiline,
                 onSend: { if !q.freeTextMultiline { submitOther() } },
                 onTab: {}, onArrowDown: {}, onArrowUp: {}, onEscape: {},
                 onCommandReturn: { commandReturn() }
             )
             if (answer.otherText ?? "").isEmpty {
                 Text(q.freeTextPlaceholder ?? "Type your answer…")
-                    .font(.system(size: size.text + 1))
+                    .font(.system(size: resolvedSize.text + 1))
                     .foregroundStyle(FluidTone.mutedForeground)
                     .padding(8)
                     .allowsHitTesting(false)
@@ -552,11 +564,11 @@ struct FluidAskUserQuestions: View {
         .padding(.horizontal, compact ? -10 : -12)
         .padding(.vertical, compact ? 8 : 10)
         .background(
-            RoundedRectangle(cornerRadius: FluidShape.rounded.bg, style: .continuous)
+            RoundedRectangle(cornerRadius: shape.bg, style: .continuous)
                 .fill(filled ? FluidTone.active : .clear)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: FluidShape.rounded.bg, style: .continuous)
+            RoundedRectangle(cornerRadius: shape.bg, style: .continuous)
                 .strokeBorder(fieldFocused ? FluidTone.border : .clear, lineWidth: 1)
         )
         .contentShape(Rectangle())
@@ -625,7 +637,7 @@ struct FluidAskUserQuestions: View {
             .padding(.horizontal, 4)
             .frame(minWidth: 18, minHeight: 18)
             .background(
-                RoundedRectangle(cornerRadius: FluidShape.rounded.bg, style: .continuous)
+                RoundedRectangle(cornerRadius: shape.bg, style: .continuous)
                     .fill(inverted ? FluidTone.background.opacity(0.15)
                                    : FluidTone.foreground.opacity(0.1))
             )
@@ -651,7 +663,10 @@ struct FluidAskUserQuestions: View {
     /// the editor when it holds first responder.
     private func handleLocalKey(_ e: NSEvent) -> NSEvent? {
         let flags = e.modifierFlags.intersection([.shift, .command, .control, .option])
-        if e.keyCode == 36, flags == .command, armed || cardFocused || fieldFocused {
+        // ⌘↵ — the source's isMac-mod chord (metaKey, shift tolerated);
+        // keypad Enter (76) lands here too.
+        if (e.keyCode == 36 || e.keyCode == 76), flags.contains(.command),
+           armed || cardFocused || fieldFocused {
             commandReturn(); return nil
         }
         guard (armed || cardFocused), !fieldFocused, !completed else { return e }

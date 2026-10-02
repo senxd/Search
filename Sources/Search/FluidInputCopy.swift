@@ -24,8 +24,12 @@ struct FluidInputCopy: View {
     var disabled = false
     var variant: FluidInputCopyVariant = .icon
     var align: FluidInputCopyAlign = .right
+    /// `size` pins the field to one ladder step (input-copy.tsx:32);
+    /// omitted, it follows the surrounding fluidSize.
+    var size: FluidSize? = nil
 
-    @Environment(\.fluidSize) private var size
+    @Environment(\.fluidSize) private var ambientSize
+    @Environment(\.fluidShape) private var shape
     @State private var status: Status = .idle
     @State private var copyCount = 0
     /// Row hover — the button's `group-hover` (visuals only).
@@ -36,10 +40,14 @@ struct FluidInputCopy: View {
     /// source's tooltipVisibleRef.
     @State private var tipVisible = false
     @State private var resetTask: Task<Void, Never>?
+    /// :focus-visible latch — a pointer-originated focus paints no ring.
+    @State private var pointerFocus = false
 
     private enum Status { case idle, copied, failed }
     private enum TipState { case idle, copied, suppressed }
-    private var compact: Bool { size == .compact }
+    /// The ladder step — the prop pins it, else the ambient.
+    private var resolvedSize: FluidSize { size ?? ambientSize }
+    private var compact: Bool { resolvedSize == .compact }
 
     @FocusState private var focused: Bool
 
@@ -47,7 +55,7 @@ struct FluidInputCopy: View {
         VStack(alignment: .leading, spacing: 2) {
             if let label {
                 Text(label)
-                    .font(.system(size: size.text))
+                    .font(.system(size: resolvedSize.text))
                     .foregroundStyle(FluidTone.mutedForeground)
                     .padding(.leading, align == .left ? 4 : 0)
             }
@@ -61,26 +69,35 @@ struct FluidInputCopy: View {
             }
             .buttonStyle(.plain)
             .focused($focused)
+            .onChange(of: focused) { _, f in
+                // :focus-visible — the ring only paints when the focus
+                // arrived under a keyDown (Tab in); a click-focus doesn't
+                // (focus-visible:ring-1, input-copy.tsx:348).
+                if f { pointerFocus = NSApp.currentEvent?.type != .keyDown }
+            }
             // group-hover scope — the button alone, not the label above.
             .onHover { h in
                 withAnimation(.easeOut(duration: 0.08)) { hovered = h }
             }
             .overlay(
-                RoundedRectangle(cornerRadius: FluidShape.rounded.input, style: .continuous)
+                RoundedRectangle(cornerRadius: shape.input, style: .continuous)
                     .strokeBorder(FluidTone.focusRing, lineWidth: 1)
-                    .opacity(focused ? 1 : 0)
+                    .opacity(focused && !pointerFocus ? 1 : 0)
+            )
+            // The Tooltip wraps the button alone (input-copy.tsx:382-384)
+            // — hovering the label doesn't trigger it.
+            .fluidTooltipIf(
+                variant == .icon,
+                text: tipState == .idle ? "Copy to clipboard"
+                    : status == .failed ? "Copy failed" : "Copied",
+                sideOffset: 2,
+                delay: 0.5,
+                forceOpen: tipState == .copied ? true
+                    : tipState == .suppressed ? false : nil,
+                onOpenChange: { tipVisible = $0 }
             )
         }
-        .fluidTooltipIf(
-            variant == .icon,
-            text: tipState == .idle ? "Copy to clipboard"
-                : status == .failed ? "Copy failed" : "Copied",
-            sideOffset: 2,
-            delay: 0.5,
-            forceOpen: tipState == .copied ? true
-                : tipState == .suppressed ? false : nil,
-            onOpenChange: { tipVisible = $0 }
-        )
+        .environment(\.fluidSize, resolvedSize)
         .opacity(disabled ? 0.5 : 1)
         .allowsHitTesting(!disabled)
         // The OUTER box's hover drives the tooltip machine (the source's
@@ -95,21 +112,24 @@ struct FluidInputCopy: View {
         }
     }
 
-    /// The value — mono, truncated, and mark-highlighted on hover.
+    /// The value — mono, truncated, and mark-highlighted on hover. The
+    /// tint sits on the text run itself (the source's <mark>,
+    /// input-copy.tsx:317), not the full-width flex span — the tint ends
+    /// where the glyphs do.
     private var valueElement: some View {
         Text(value)
-            .font(.system(size: size.text, design: .monospaced))
+            .font(.system(size: resolvedSize.text, design: .monospaced))
             .foregroundStyle(FluidTone.foreground)
             .lineLimit(1)
             .truncationMode(.tail)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, compact ? 4 : 8)
-            .padding(.leading, align == .left ? 4 : 0)
             .background(
                 Rectangle().fill(
                     hovered ? FluidTone.focusRing.opacity(0.2) : .clear
                 )
             )
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, compact ? 4 : 8)
+            .padding(.leading, align == .left ? 4 : 0)
     }
 
     private var action: some View {
@@ -123,7 +143,7 @@ struct FluidInputCopy: View {
                         .id("\(status)-\(copyCount)")
                         .transition(.scale(scale: 0.6).combined(with: .opacity))
                 }
-                .font(.system(size: size.text))
+                .font(.system(size: resolvedSize.text))
             }
         }
         .foregroundStyle(status == .failed ? FluidTone.destructive
@@ -196,10 +216,12 @@ private struct DrawnGlyph: View {
     private struct GlyphPath: Shape {
         let check: Bool
         func path(in rect: CGRect) -> Path {
-            // Source viewBox="2 4 20 16" — 16×16 effective box.
-            let s = min(rect.width, rect.height) / 16
+            // Source viewBox="2 4 20 16" — x runs 2–22, y runs 4–20.
             func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
-                CGPoint(x: rect.minX + (x - 4) * s, y: rect.minY + (y - 4) * s)
+                CGPoint(
+                    x: rect.minX + (x - 2) / 20 * rect.width,
+                    y: rect.minY + (y - 4) / 16 * rect.height
+                )
             }
             var p = Path()
             if check {

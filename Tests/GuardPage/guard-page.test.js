@@ -50,6 +50,10 @@ assert.ok(inspect(personal, 'act.click', { css: '#next' }).categories.includes('
 const unknown = page(`<button id="custom">Reconcile workspace</button>`);
 assert.deepEqual(inspect(unknown, 'act.click', { css: '#custom' }).categories, ['unverified'], 'unknown custom action fails closed');
 assert.deepEqual(inspect(unknown, 'act.press', { key: 'Delete', modifiers: ['command'], css: '#custom' }).categories, ['unverified'], 'unknown shortcut fails closed');
+for (const key of ['cmd+a', 'META+C', 'cmd+x', 'cmd+v', ' shift + cmd + a ']) {
+  assert.deepEqual(inspect(unknown, 'act.press', { key, css: '#custom' }).categories, ['unverified'], 'chord shortcut fails closed: ' + key);
+}
+assert.deepEqual(inspect(draft, 'act.press', { key: 'cmd+Enter', css: '#message' }).categories, ['messages'], 'chord Enter retains composer classification');
 
 const identityA = inspect(unknown, 'act.click', { css: '#custom' }).fingerprint;
 unknown.dom.window.document.querySelector('#custom').remove();

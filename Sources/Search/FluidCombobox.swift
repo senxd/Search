@@ -53,8 +53,13 @@ final class FluidComboboxModel {
     var highlightKeyboard = false
     /// Whether the list is showing.
     var open = false
-    /// Chips mode: selected items leave the list (hideSelected).
+    /// Chips mode: selected items leave the list (hideSelected). The
+    /// source gates it on `isMultiple` — the field owns the mode and
+    /// writes it here.
     var hideSelected = false
+    /// Single or chips — the field writes it; hideSelected reads it
+    /// (combobox.tsx's `hideChecked = hideSelected && isMultiple`).
+    var multiple = false
     /// Match an item against the typed query (combobox.tsx `filter`).
     /// Default: case-insensitive contains on the label.
     var filter: ((FluidComboboxItem, String) -> Bool)? = nil
@@ -75,9 +80,11 @@ final class FluidComboboxModel {
         self.init(items: items.map { FluidComboboxItem($0) })
     }
 
-    /// The selected item's label, for single-mode field display.
+    /// The selected item's label, for single-mode field display —
+    /// multiple mode shows "" (chips own the display; combobox.tsx:245-249).
     var selectedLabel: String {
-        guard let v = values.first,
+        guard !multiple,
+              let v = values.first,
               let item = items.first(where: { $0.value == v }) else { return "" }
         return item.label
     }
@@ -101,7 +108,7 @@ final class FluidComboboxModel {
             item.label.localizedCaseInsensitiveContains(q)
         }
         var visible = query.isEmpty ? items : items.filter { match($0, query) }
-        if hideSelected { visible.removeAll { values.contains($0.value) } }
+        if hideSelected && multiple { visible.removeAll { values.contains($0.value) } }
         if let c = createItem { visible.append(c) }
         return visible
     }
@@ -109,7 +116,8 @@ final class FluidComboboxModel {
     /// hideSelected emptied the list with nothing typed — every item is a
     /// chip already (combobox.tsx:283-284).
     var allSelected: Bool {
-        hideSelected && trimmedQuery.isEmpty && !items.isEmpty && filtered.isEmpty
+        hideSelected && multiple && trimmedQuery.isEmpty
+            && !items.isEmpty && filtered.isEmpty
     }
 
     /// setOpen — closing without a pick reverts the field to the
@@ -123,29 +131,30 @@ final class FluidComboboxModel {
         }
     }
 
-    /// The field's binding: single mode writes inputValue, chips write
-    /// query directly (the chips, not the text, carry the selection).
+    /// The field's binding — the input's onChange. SwiftUI fires the
+    /// setter only for real edits, so every write here IS user typing:
+    /// it opens the list and pre-picks the first row
+    /// (combobox.tsx:375-384). Programmatic resets — select's `query = ""`,
+    /// setOpen's revert — never come through this path, so a filtered
+    /// pick's close can't re-trigger `typed`.
     func fieldText(multiple: Bool) -> Binding<String> {
         Binding(
             get: { multiple ? self.query : self.inputValue },
             set: { v in
                 if multiple {
                     self.query = v
-                } else if v == self.selectedLabel {
-                    // Selection echo, not typing — the list stays unfiltered.
-                    self.inputValue = v
-                    self.query = ""
                 } else {
                     self.inputValue = v
                     self.query = v
                 }
+                self.typed()
             }
         )
     }
 
-    /// onChange → setInputValue: typing opens the list and pre-picks the
-    /// first row so Enter has a target (combobox.tsx:375-384).
-    func typed(_ multiple: Bool) {
+    /// Typing opens the list and pre-picks the first row so Enter has a
+    /// target (the input's onChange path).
+    private func typed() {
         setOpen(true)
         highlight = filtered.isEmpty ? nil : 0
         highlightKeyboard = true
@@ -184,6 +193,7 @@ final class FluidComboboxModel {
         values = [item.value]
         inputValue = item.label
         query = ""
+        highlight = nil
         open = false
     }
 
@@ -234,9 +244,11 @@ struct FluidComboboxField: View {
     var variant: FluidComboboxVariant = .bordered
     var error: String? = nil
     var size: FluidSize = .default
+    var disabled = false
     @FocusState.Binding var focused: Bool
 
     var compact: Bool { size == .compact }
+    @Environment(\.fluidShape) private var shape
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -259,13 +271,18 @@ struct FluidComboboxField: View {
             .frame(minHeight: size.controlHeight, alignment: multiple ? .top : .center)
             .frame(minWidth: compact ? 128 : 160, maxWidth: .infinity, alignment: .leading)
             .background(
-                RoundedRectangle(cornerRadius: FluidShape.rounded.input, style: .continuous)
+                RoundedRectangle(cornerRadius: shape.input, style: .continuous)
                     .fill(fieldFill)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: FluidShape.rounded.input, style: .continuous)
+                RoundedRectangle(cornerRadius: shape.input, style: .continuous)
                     .strokeBorder(ringColor, lineWidth: 1)
             )
+            // data-[disabled]:opacity-50 pointer-events-none — and the
+            // input/buttons take the disabled path too.
+            .disabled(disabled)
+            .opacity(disabled ? 0.5 : 1)
+            .allowsHitTesting(!disabled)
             .background(FluidViewResolver { model.fieldView = $0 })
             .onHover { hovered = $0 }
             // FieldFrame's onMouseDown: a press on the frame's padding or
@@ -274,6 +291,10 @@ struct FluidComboboxField: View {
             // on an already-focused field also reopens the list.
             .contentShape(Rectangle())
             .simultaneousGesture(TapGesture().onEnded {
+                // FieldFrame's click skips button regions — a press that
+                // began on a control (clear/chip-✕/chevron) latched
+                // controlDown on mouseDown, before this tap evaluates.
+                guard !disabled, !controlDown else { return }
                 focused = true
                 if !model.open { model.setOpen(true) }
             })
@@ -287,9 +308,24 @@ struct FluidComboboxField: View {
                     .padding(.leading, 12)
             }
         }
+        // The model's mode gate (hideChecked) follows this field.
+        .onAppear { model.multiple = multiple }
     }
 
     @State private var hovered = false
+    /// A press that began on a field control (clear ✕, chip ✕, chevron).
+    /// The frame's tap reads it to skip button regions — the source's
+    /// `closest("button")` exclusion on FieldFrame's onClick.
+    @State private var controlDown = false
+
+    /// Latches `controlDown` on mouseDown and clears it after the event
+    /// dispatch — a drag gesture evaluates before the frame's tap, so the
+    /// tap sees the press's origin; the deferred clear survives it.
+    private var controlLatch: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { _ in controlDown = true }
+            .onEnded { _ in Task { @MainActor in controlDown = false } }
+    }
 
     /// bordered: transparent → muted/50 hover → card focused.
     /// borderless: transparent + transparent ring → muted/50 + border
@@ -316,9 +352,16 @@ struct FluidComboboxField: View {
         .font(.system(size: size.text))
         .foregroundStyle(FluidTone.foreground)
         .focused($focused)
+        .disableAutocorrection(true)
         .frame(minWidth: 24)
-        .onChange(of: focused) { _, f in model.setOpen(f) }
-        .onChange(of: model.query) { _, _ in model.typed(multiple) }
+        // Focus alone never opens — the source opens on the input's
+        // onClick only (combobox.tsx:640-643). Blur still closes.
+        .onChange(of: focused) { _, f in if !f { model.setOpen(false) } }
+        // An external `values` write mirrors the selection into the field —
+        // the source's `setInputValueState(selectedLabel)` effect.
+        .onChange(of: model.values) { _, _ in
+            if !multiple { model.inputValue = model.selectedLabel }
+        }
         .onKeyPress(.upArrow) {
             if model.open { model.move(-1) } else { model.openForArrow(-1) }
             return .handled
@@ -329,15 +372,20 @@ struct FluidComboboxField: View {
         }
         .onKeyPress(.return) {
             // Enter picks the highlighted row only — no highlight, no
-            // select (combobox.tsx:588-595; the input is the stop).
-            if model.open, let i = model.highlight,
+            // select, and a closed list lets it bubble
+            // (combobox.tsx:588-595; the input is the stop).
+            guard model.open else { return .ignored }
+            if let i = model.highlight,
                model.filtered.indices.contains(i) {
                 model.select(model.filtered[i], multiple: multiple)
             }
             return .handled
         }
         .onKeyPress(.escape) {
-            if model.open { model.setOpen(false) }
+            // Esc belongs to the list only while it's open — a closed
+            // combobox must not eat a containing dialog's Esc.
+            guard model.open else { return .ignored }
+            model.setOpen(false)
             return .handled
         }
         // An empty field backspaces into the last-picked chip. The field
@@ -346,14 +394,20 @@ struct FluidComboboxField: View {
         // focus (and only when there's actually a chip to pop).
         .onChange(of: focused) { _, f in
             if f {
-                backspaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                backspaceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak fieldView = model.fieldView] event in
                     guard event.keyCode == 51, multiple,
+                          event.window === fieldView?.window,
                           model.fieldText(multiple: true).wrappedValue.isEmpty,
                           let last = model.values.last else { return event }
                     model.remove(last)
                     return nil
                 }
             } else if let m = backspaceMonitor {
+                NSEvent.removeMonitor(m); backspaceMonitor = nil
+            }
+        }
+        .onDisappear {
+            if let m = backspaceMonitor {
                 NSEvent.removeMonitor(m); backspaceMonitor = nil
             }
         }
@@ -368,28 +422,44 @@ struct FluidComboboxField: View {
             ForEach(model.values, id: \.self) { v in
                 FluidComboboxChip(label: model.items.first { $0.value == v }?.label ?? v,
                                   size: size) { model.remove(v); focused = true }
+                    .simultaneousGesture(controlLatch)
             }
             input
                 .layoutPriority(1)
         }
+        .animation(FluidSpring.fast, value: model.values)
     }
 
-    /// Clear ✕ + chevron — the field's right-side controls. The ✕'s slot
-    /// is always reserved so the field's width never changes (hidden, not
-    /// removed, while there is nothing to clear).
+    /// Clear ✕ + chevron — the field's right-side controls. The ✕ only
+    /// exists under `clearable`; even then it stays mounted-but-invisible
+    /// while empty so the field's width never changes
+    /// (combobox.tsx:675-688 — `hidden`, not removed).
     private var controls: some View {
         HStack(spacing: 2) {
-            Button(action: { model.clear(); focused = true }) {
-                Image(systemName: "xmark")
-                    .font(.system(size: compact ? 9 : 10, weight: .semibold))
-                    .foregroundStyle(FluidTone.mutedForeground)
-                    .frame(width: compact ? 20 : 24, height: compact ? 20 : 24)
-                    .contentShape(Rectangle())
+            if clearable {
+                // Multiple-mode typing writes `query`, not inputValue —
+                // either field text shows the ✕ (combobox.tsx:682).
+                let empty = model.values.isEmpty && model.inputValue.isEmpty
+                    && model.query.isEmpty
+                Button(action: { model.clear(); focused = true }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: compact ? 9 : 10, weight: .semibold))
+                        .foregroundStyle(clearHovered ? FluidTone.foreground
+                                                      : FluidTone.mutedForeground)
+                        .frame(width: compact ? 20 : 24, height: compact ? 20 : 24)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(clearHovered ? FluidTone.hover : .clear)
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .opacity(empty ? 0 : 1)
+                .disabled(empty || disabled)
+                .onHover { clearHovered = $0 }
+                .animation(.easeOut(duration: 0.08), value: clearHovered)
+                .accessibilityLabel("Clear")
             }
-            .buttonStyle(.plain)
-            .opacity(clearable && (!model.values.isEmpty || !model.inputValue.isEmpty) ? 1 : 0)
-            .disabled(!clearable || (model.values.isEmpty && model.inputValue.isEmpty))
-            .accessibilityLabel("Clear")
             // The chevron is a real button in the source — a press focuses
             // the input and toggles the list. Not a tab stop (the field
             // itself opens on ArrowDown or typing).
@@ -402,11 +472,15 @@ struct FluidComboboxField: View {
             }
             .buttonStyle(.plain)
             .focusable(false)
+            .disabled(disabled)
             .accessibilityLabel("Open")
         }
         .frame(height: compact ? 20 : 24)
         .padding(.top, multiple ? compact ? 2 : 4 : 0)
+        .simultaneousGesture(controlLatch)
     }
+
+    @State private var clearHovered = false
 }
 
 /// A selected value in the chips field: bg-hover fill, pl-2 pr-0.5,
@@ -416,6 +490,9 @@ struct FluidComboboxChip: View {
     var size: FluidSize = .default
     var onRemove: () -> Void
     @State private var hovered = false
+    /// rounded-md normally, rounded-full under the pill shape
+    /// (combobox.tsx:879).
+    @Environment(\.fluidShape) private var shape
 
     var compact: Bool { size == .compact }
 
@@ -443,7 +520,8 @@ struct FluidComboboxChip: View {
         .padding(.leading, 8).padding(.trailing, 2)
         .frame(height: compact ? 20 : 24)
         .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous).fill(FluidTone.hover)
+            RoundedRectangle(cornerRadius: shape.pillish ? (compact ? 10 : 12) : 6,
+                             style: .continuous).fill(FluidTone.hover)
         )
         .transition(.scale(scale: 0.9).combined(with: .opacity))
     }
@@ -515,10 +593,17 @@ struct FluidComboboxList: View {
     var body: some View {
         let items = model.filtered
         // ComboboxContent unmounts while closed — the list only exists
-        // when the field has opened it (focus, typing, arrows).
-        if model.open {
-            listBody(items)
+        // when the field has opened it (focus, typing, arrows). Open and
+        // close play the source's popup pose (lib/popup.ts — bottom-anchored
+        // enters from y:-4, scaleY .96, origin top) on spring.fast.
+        Group {
+            if model.open {
+                listBody(items)
+                    .transition(.modifier(active: FluidPopupPose(hidden: true),
+                                          identity: FluidPopupPose(hidden: false)))
+            }
         }
+        .animation(FluidSpring.fast, value: model.open)
     }
 
     private func listBody(_ items: [FluidComboboxItem]) -> some View {
@@ -530,7 +615,15 @@ struct FluidComboboxList: View {
                     hover: hover,
                     from: multiple ? nil
                         : checkedIndices.first.flatMap { hover.rects[$0] },
-                    radius: FluidShape.rounded.bg
+                    radius: FluidShape.rounded.bg,
+                    // handlers.onClick — list padding routes to the lit
+                    // row (combobox.tsx:1148).
+                    onGapPick: { i in
+                        let f = model.filtered
+                        if f.indices.contains(i) {
+                            model.select(f[i], multiple: multiple)
+                        }
+                    }
                 ) {
                     VStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(items.enumerated()), id: \.offset) { i, item in
@@ -568,9 +661,10 @@ struct FluidComboboxList: View {
                         checked: checkedIndices,
                         mergedRadius: FluidShape.rounded.bg,
                         // Single mode: one pinned block glides between
-                        // picks and pops in (initial={false}); multiple
-                        // mode merges/splits runs with fades.
-                        exitFades: multiple,
+                        // picks and pops in (initial={false}); its exit
+                        // still fades — AnimatePresence exit in both
+                        // modes (combobox.tsx:1169-1191).
+                        exitFades: true,
                         enterFades: multiple,
                         pinIds: !multiple
                     )
@@ -643,6 +737,22 @@ struct FluidComboboxList: View {
         // against the list's own bounds while it's mounted.
         .background(FluidOutsideClick(alsoInside: model.fieldView) { model.setOpen(false) })
         .fluidSurface(min(substrate + 2, 8), radius: FluidShape.rounded.container)
+        // The model's mode gate (hideChecked) — a list can mount without
+        // its field, so it publishes the same mode.
+        .onAppear { model.multiple = multiple }
+    }
+}
+
+/// The popup enter/exit pose — bottom-anchored content enters from y:-4
+/// at scaleY .96 with an origin-top anchor (lib/popup.ts's
+/// `--popup-enter-y`), on spring.fast / spring.fast.exit.
+private struct FluidPopupPose: ViewModifier {
+    var hidden: Bool
+    func body(content: Content) -> some View {
+        content
+            .opacity(hidden ? 0 : 1)
+            .offset(y: hidden ? -4 : 0)
+            .scaleEffect(x: 1, y: hidden ? 0.96 : 1, anchor: .top)
     }
 }
 
@@ -681,7 +791,9 @@ private struct FluidOutsideClick: NSViewRepresentable {
         return v
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.alsoInside = alsoInside
+    }
 
     func sizeThatFits(
         _ proposal: ProposedViewSize, nsView: NSView, context: Context

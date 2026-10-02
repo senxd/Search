@@ -1,6 +1,32 @@
 import AppKit
+import CoreGraphics
+import ObjectiveC.runtime
 import SwiftUI
 import WebKit
+
+/// Direct responder delivery keeps synthetic input inside the granted tab,
+/// but AppKit's global pressed-button table only tracks events posted through
+/// its event stream. WebKit's own test runner uses this scoped override for
+/// the same case. Restore the class method before returning to the run loop.
+private enum SyntheticMouseButtons {
+    static func with(_ mask: UInt, dispatch: () -> Void) {
+        let type: AnyClass = NSEvent.self
+        let selector = #selector(getter: NSEvent.pressedMouseButtons)
+        guard let method = class_getClassMethod(type, selector) else { dispatch(); return }
+        let original = method_getImplementation(method)
+        let originalCall = unsafeBitCast(original, to: (@convention(c) (AnyClass, Selector) -> UInt).self)
+        let replacementBlock: @convention(block) (AnyObject) -> UInt = { object in
+            originalCall(object as! AnyClass, selector) | mask
+        }
+        let replacement = imp_implementationWithBlock(replacementBlock)
+        let installed = method_setImplementation(method, replacement)
+        defer {
+            method_setImplementation(method, installed)
+            imp_removeBlock(replacement)
+        }
+        dispatch()
+    }
+}
 
 // The ops layer behind Ask — the one implementation of Runtime/ask/PROTOCOL.md,
 // reached two ways: the in-app harness's bridge and the persistent sessions on
@@ -107,6 +133,101 @@ final class Drive: Driving {
     @MainActor private var guardGeneration: [DriveOrigin: Int] = [:]
     @MainActor private var pendingApprovals: [UUID: PendingApproval] = [:]
 
+    @MainActor
+    private final class KeyResend {
+        let event: NSEvent
+        weak var view: PageView?
+        let action: Selector
+        let tabID: UUID
+        let origin: DriveOrigin
+
+        init(event: NSEvent, view: PageView, action: Selector, tabID: UUID, origin: DriveOrigin) {
+            self.event = event
+            self.view = view
+            self.action = action
+            self.tabID = tabID
+            self.origin = origin
+        }
+    }
+    @MainActor
+    private final class MouseAck {
+        weak var view: PageView?
+        let key: ObjectIdentifier
+        let origin: DriveOrigin
+        private let done: (Bool, Bool) -> Void
+        private var watcher: UUID?
+        private(set) var finished = false
+        private var waiting = false
+        private(set) var dialogPending = false
+
+        init(view: PageView, origin: DriveOrigin, done: @escaping (Bool, Bool) -> Void) {
+            self.view = view
+            self.key = ObjectIdentifier(view)
+            self.origin = origin
+            self.done = done
+        }
+
+        func watch() -> Bool {
+            guard let view else { return false }
+            switch AgentInteractions.shared.watchPending(view, session: origin,
+                found: { [weak self] in self?.noticePendingDialog() },
+                cancelled: { [weak self] in self?.finish(dialogPending: false, cancelled: true) }) {
+            case .unavailable: return true
+            case .alreadyPending: return false
+            case .watching(let id): watcher = id; return true
+            }
+        }
+
+        func afterPendingMouseEvents(_ completion: @escaping () -> Void) {
+            guard !finished else { return }
+            if dialogPending { finish(dialogPending: true); return }
+            guard let view else { finish(dialogPending: false); return }
+            waiting = true
+            let ready: () -> Void = { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, !self.finished else { return }
+                    if self.dialogPending { self.finish(dialogPending: true); return }
+                    completion()
+                }
+            }
+            let selector = NSSelectorFromString("_doAfterProcessingAllPendingMouseEvents:")
+            guard view.responds(to: selector) else {
+                view.evaluateJavaScript("void 0") { _, _ in ready() }
+                return
+            }
+            typealias Completion = @convention(block) () -> Void
+            typealias Call = @convention(c) (AnyObject, Selector, Completion) -> Void
+            let callback: Completion = { ready() }
+            unsafeBitCast(view.method(for: selector), to: Call.self)(view, selector, callback)
+        }
+
+        func continueAfterWait(_ completion: () -> Void) {
+            guard !finished else { return }
+            if dialogPending { finish(dialogPending: true); return }
+            waiting = false
+            completion()
+        }
+
+        func wait() {
+            afterPendingMouseEvents { self.finish(dialogPending: false) }
+        }
+
+        private func noticePendingDialog() {
+            dialogPending = true
+            if waiting { finish(dialogPending: true) }
+        }
+
+        func finish(dialogPending: Bool, cancelled: Bool = false) {
+            guard !finished else { return }
+            finished = true
+            if let watcher { AgentInteractions.shared.stopWatching(key, id: watcher) }
+            done(dialogPending, cancelled)
+        }
+    }
+    @MainActor private var keyBounceMonitor: Any?
+    @MainActor private var keyResends: [KeyResend] = []
+    @MainActor private var nativeMouseEventNumber = 0
+
     /// The chat the `.app` session last sent into — learned in `ask`,
     /// the only door a turn comes through. parkApproval needs it when the
     /// panel's `currentID` has gone (a `new` chat landing mid-turn nils
@@ -118,6 +239,8 @@ final class Drive: Driving {
     /// `Always: submit · acme.com`, not "always submit". Same lifetime as
     /// every other consent here: gone with the chat, the socket, the app.
     @MainActor private var remembered: [DriveOrigin: Set<Policy.AlwaysKey>] = [:]
+    @MainActor private let artifacts = AgentArtifacts()
+    @MainActor private var socketApprovalUI = Set<DriveOrigin>()
 
     /// The consent registry: tabs the user handed the agent layer through a
     /// composer chip — which arrives as `tabs.grant` on the in-app door
@@ -138,7 +261,7 @@ final class Drive: Driving {
     /// that tears the context down can settle them instead of leaving the
     /// request to die of old age. The flag marks the op a mutation — one
     /// that may legitimately have caused the navigation it dies of.
-    @MainActor private var flying: [UUID: [Int: (mutating: Bool, settle: ([String: Any]) -> Void)]] = [:]
+    @MainActor private var flying: [UUID: [Int: (mutating: Bool, cancellationToken: String?, settle: ([String: Any]) -> Void)]] = [:]
     @MainActor private var nextFlight = 0
 
     /// Bumped while a synthetic event is being handed to a view, so the
@@ -178,6 +301,9 @@ final class Drive: Driving {
     /// is still its own, before the fd can be handed out again.
     @MainActor
     func leave(_ origin: DriveOrigin) {
+        keyResends.removeAll { $0.origin == origin }
+        clearHighlights(from: origin)
+        AgentCursor.shared.sleep(origin)
         AgentInteractions.shared.release(origin)
         for id in Array(inspectorClients.keys) { releaseInspector(id, from: origin) }
         inspectorEvents[origin] = nil
@@ -194,6 +320,7 @@ final class Drive: Driving {
         for id in share.attached {
             let held = sessions.values.contains { $0.attached.contains(id) || $0.mine.contains(id) }
             if !held, let tab = browser.allTabs.first(where: { $0.id == id }), !tab.bench {
+                tab.built?.restoreRenderingAfterAgent()
                 grantedTabs.remove(Bench.short(tab))
                 seen.removeValue(forKey: id)
             }
@@ -201,8 +328,10 @@ final class Drive: Driving {
         // Its cards, its remembered always-rules and its mode die with it —
         // consent's whole lifetime is the session's.
         denyPending(for: origin, reason: "the session ended")
+        for download in artifacts.remove(origin) { download.cancel(nil) }
         remembered[origin] = nil
         modes[origin] = nil
+        socketApprovalUI.remove(origin)
         // The closed rows — if anyone subscribed — announce themselves in
         // the diff, which also sweeps whatever state of theirs remains.
         diff()
@@ -214,7 +343,11 @@ final class Drive: Driving {
     /// consent belongs to the routine, and the next run inherits it.
     @MainActor
     func endRun(_ origin: DriveOrigin) {
+        keyResends.removeAll { $0.origin == origin }
+        clearHighlights(from: origin)
+        AgentCursor.shared.sleep(origin)
         denyPending(for: origin, reason: "the run ended")
+        for download in artifacts.remove(origin) { download.cancel(nil) }
         AgentInteractions.shared.release(origin)
         for id in Array(inspectorClients.keys) { releaseInspector(id, from: origin) }
         inspectorEvents[origin] = nil
@@ -230,6 +363,7 @@ final class Drive: Driving {
         for id in share.attached {
             let held = sessions.values.contains { $0.attached.contains(id) || $0.mine.contains(id) }
             if !held, let tab = browser.allTabs.first(where: { $0.id == id }), !tab.bench {
+                tab.built?.restoreRenderingAfterAgent()
                 grantedTabs.remove(Bench.short(tab))
                 seen.removeValue(forKey: id)
             }
@@ -373,36 +507,156 @@ final class Drive: Driving {
 
     @MainActor
     func perform(_ op: String, _ args: [String: Any], from origin: DriveOrigin,
-                 cancellation: AgentCancellation, done: @escaping ([String: Any]) -> Void) {
+                 cancellation: AgentCancellation, tokenReady: ((String) -> Void)? = nil,
+                 done: @escaping ([String: Any]) -> Void) {
         let token = UUID().uuidString
-        cancellations[token] = cancellation
-        cancellation.onCancel = { [weak self] in
-            guard let self else { return }
-            if let view = self.tab(args)?.built {
-                self.drive(view, "function(d) { (d.__guardCancelled || (d.__guardCancelled = new Set())).add(\(self.json(token))); return {ok:true}; }") { _ in }
-            }
-            let ids = self.pendingApprovals.filter { $0.value.args["_cancelToken"] as? String == token }.map(\.key)
-            for id in ids {
-                Mind.shared.removeApproval(id)
-                Routines.shared.removeApproval(id)
-                self.pendingApprovals.removeValue(forKey: id)?.finish([
-                    "error": "cancelled before approval", "code": "GUARD_CANCELLED", "guardStopped": true])
-            }
+        tokenReady?(token)
+        performCancellable(token: token, args: args, from: origin,
+                           cancellation: cancellation, done: done) { args, finish in
+            self.perform(op, args, from: origin) { result in finish(result) }
         }
-        var args = args
-        args["_cancelToken"] = token
-        perform(op, args, from: origin) { [weak self] result in
+    }
+
+    /// The single cancellation door for native operations. The injected operation closure
+    /// keeps its callback one-shot even when cancellation and a late native reply race.
+    @MainActor
+    private func performCancellable(
+        token: String,
+        args: [String: Any],
+        from origin: DriveOrigin,
+        cancellation: AgentCancellation,
+        done: @escaping ([String: Any]) -> Void,
+        operation: (_ args: [String: Any], _ finish: @escaping ([String: Any]) -> Void) -> Void
+    ) {
+        cancellations[token] = cancellation
+        var finished = false
+        let finish: ([String: Any]) -> Void = { [weak self] result in
+            guard !finished else { return }
+            finished = true
             cancellation.onCancel = nil
             self?.cancellations[token] = nil
             done(result)
         }
+        cancellation.onCancel = { [weak self] in
+            let approvals = self?.pendingApprovals.filter { $0.value.args["_cancelToken"] as? String == token }.map(\.key) ?? []
+            // Latch the canonical reply before cleanup invokes synchronous callbacks.
+            if approvals.isEmpty {
+                finish(["error": "cancelled; outcome unknown", "code": "CANCELLED",
+                        "guardStopped": true, "outcome": "unknown"])
+            } else {
+                finish(["error": "cancelled before approval", "code": "GUARD_CANCELLED",
+                        "guardStopped": true, "outcome": "cancelled"])
+            }
+            if let self {
+                if let view = self.tab(args)?.built {
+                    if !self.cancelScriptFlights(token, in: view) {
+                        self.drive(view, "function(d) { (d.__guardCancelled || (d.__guardCancelled = new Set())).add(\(self.json(token))); return {ok:true}; }") { _ in }
+                    }
+                }
+                for id in approvals {
+                    Mind.shared.removeApproval(id)
+                    Routines.shared.removeApproval(id)
+                    self.pendingApprovals.removeValue(forKey: id)?.finish([
+                        "error": "cancelled before approval", "code": "GUARD_CANCELLED", "guardStopped": true])
+                }
+            }
+        }
+        var args = args
+        args["_cancelToken"] = token
+        operation(args) { result in finish(result) }
+    }
+
+    /// Exercises the exact production cancellation door without starting WebKit work.
+    /// `check-queue` uses this to cover dropped native replies and pending approval cleanup.
+    @MainActor
+    func checkCancellationDoor() -> [String: Any] {
+        let token = UUID().uuidString
+        let cancellation = AgentCancellation()
+        var rawReply: (([String: Any]) -> Void)?
+        var replyCount = 0
+        var result: [String: Any] = [:]
+        performCancellable(token: token, args: [:], from: .socket(UUID()), cancellation: cancellation,
+                           done: { result = $0; replyCount += 1 }) { _, finish in
+            rawReply = finish
+        }
+        cancellation.cancel()
+        let cancelledSynchronously = replyCount == 1 && result["code"] as? String == "CANCELLED"
+            && result["outcome"] as? String == "unknown"
+        rawReply?(["ok": true])
+        rawReply?(["late": true])
+        var lateStepReply: [String: Any]?
+        let lateStepSuppressed = cancelled(["_cancelToken": token]) { lateStepReply = $0 }
+        let activeOK = cancelledSynchronously && cancellations[token] == nil
+            && replyCount == 1 && lateStepSuppressed
+            && lateStepReply?["code"] as? String == "CANCELLED"
+
+        let approvalToken = UUID().uuidString
+        let approvalCancellation = AgentCancellation()
+        let approvalID = UUID()
+        var approvalReplyCount = 0
+        var approvalResult: [String: Any] = [:]
+        pendingApprovals[approvalID] = PendingApproval(
+            origin: .socket(UUID()), op: "page.click", args: ["_cancelToken": approvalToken],
+            summary: "test approval", host: "", finish: { _ in }, evidence: nil)
+        performCancellable(token: approvalToken, args: [:], from: .socket(UUID()),
+                           cancellation: approvalCancellation,
+                           done: { approvalResult = $0; approvalReplyCount += 1 }) { _, _ in }
+        approvalCancellation.cancel()
+        let approvalOK = approvalReplyCount == 1 && approvalResult["code"] as? String == "GUARD_CANCELLED"
+            && approvalResult["outcome"] as? String == "cancelled"
+                && pendingApprovals[approvalID] == nil && cancellations[approvalToken] == nil
+        return ["ok": activeOK && approvalOK, "active_cancel_replied_once": cancelledSynchronously,
+                "active_token_removed": cancellations[token] == nil, "late_raw_reply_ignored": replyCount == 1,
+                "late_native_step_suppressed": lateStepSuppressed, "approval_known_cancelled": approvalOK]
+    }
+
+    /// Internal state assertion used only by the bounded benchmark preflight.
+    @MainActor
+    func checkScriptState(_ view: WKWebView, requestToken: String) -> [String: Bool] {
+        guard Store.testing, let tab = browser.allTabs.first(where: { $0.built === view }) else {
+            return ["flight_present": false, "watcher_present": false,
+                    "flight_removed": false, "watcher_removed": false]
+        }
+        let flightPresent = flying[tab.id]?.values.contains { $0.cancellationToken == requestToken } ?? false
+        let watcherPresent = AgentInteractions.shared.hasWatcher(view, requestToken: requestToken)
+        return ["flight_present": flightPresent, "watcher_present": watcherPresent,
+                "flight_removed": !flightPresent, "watcher_removed": !watcherPresent]
+    }
+
+    @MainActor
+    func checkScriptCancellationGate(_ view: PageView, origin: DriveOrigin, tab: String) -> Bool {
+        let requestToken = UUID().uuidString
+        let cancellation = AgentCancellation()
+        var starts = 0, lateReplies = 0, replies = 0
+        var result: [String: Any] = [:]
+        performCancellable(token: requestToken, args: ["tab": tab], from: origin,
+                           cancellation: cancellation, done: { result = $0; replies += 1 }) { _, finish in
+            self.scriptCompletion(view, mutating: false, cancellationToken: requestToken, { _ in }) { _ in
+                self.scriptCompletion(view, mutating: false, cancellationToken: requestToken,
+                                      { _ in starts += 1 }, { _ in lateReplies += 1 })
+                finish(["error": "translated internal cancellation error"])
+            }
+        }
+        let active = checkScriptState(view, requestToken: requestToken)
+        cancellation.cancel()
+        let state = checkScriptState(view, requestToken: requestToken)
+        return starts == 0 && lateReplies == 1 && replies == 1 && result["code"] as? String == "CANCELLED"
+            && result["outcome"] as? String == "unknown"
+            && active["flight_present"] == true && active["watcher_present"] == true
+            && state["flight_removed"] == true && state["watcher_removed"] == true
     }
 
     @MainActor
     private func cancelled(_ args: [String: Any], _ done: ([String: Any]) -> Void) -> Bool {
-        guard let token = args["_cancelToken"] as? String,
-              cancellations[token]?.isCancelled == true else { return false }
-        done(["error": "cancelled before the next native action", "code": "GUARD_CANCELLED", "guardStopped": true])
+        guard let token = args["_cancelToken"] as? String else { return false }
+        guard let cancellation = cancellations[token] else {
+            done(["error": "request already finished", "code": "CANCELLED", "guardStopped": true,
+                  "outcome": "unknown"])
+            return true
+        }
+        guard cancellation.isCancelled else { return false }
+        done(["error": "cancelled before the next native action", "code": "GUARD_CANCELLED",
+              "guardStopped": true, "outcome": "unknown"])
         return true
     }
 
@@ -414,10 +668,24 @@ final class Drive: Driving {
     }
 
     @MainActor
+    private func configureBenchmarkDialogs(_ tab: Tab, origin: DriveOrigin) {
+        guard Store.testing, ProcessInfo.processInfo.environment["SEARCH_BENCHMARK"] == "broad",
+              tab.bench, sessions[origin]?.mine.contains(tab.id) == true,
+              BenchmarkRuns.shared.websiteStore(for: origin) != nil else { return }
+        _ = AgentInteractions.shared.configure(tab.web, session: origin, enabled: true) { [weak self, weak tab] data in
+            guard let self, let tab, self.granted(tab, origin) else { return }
+            var data = data
+            data["tab"] = Bench.short(tab)
+            self.emit("page.dialog", data, to: origin)
+        }
+    }
+
+    @MainActor
     func adoptAgentTab(_ tab: Tab, from opener: Tab) {
         guard tab.bench else { return }
         for origin in Array(sessions.keys) where sessions[origin]?.mine.contains(opener.id) == true {
             sessions[origin]?.mine.insert(tab.id)
+            configureBenchmarkDialogs(tab, origin: origin)
         }
     }
 
@@ -428,6 +696,7 @@ final class Drive: Driving {
             if sessions[origin]?.mine.remove(old.id) != nil { sessions[origin]?.mine.insert(new.id) }
             if sessions[origin]?.attached.remove(old.id) != nil { sessions[origin]?.attached.insert(new.id) }
             if sessions[origin]?.leases.remove(old.id) != nil { sessions[origin]?.leases.insert(new.id) }
+            configureBenchmarkDialogs(new, origin: origin)
         }
         let consented = grantedTabs.contains(Bench.short(old))
         drop(old.id)
@@ -484,6 +753,40 @@ final class Drive: Driving {
         sessions.first(where: { $0.value.mine.contains(tab.id) || $0.value.attached.contains(tab.id) })?.key
     }
 
+    @MainActor
+    func sessionTabs(_ origin: DriveOrigin) -> [Tab] {
+        browser.allTabs.filter { granted($0, origin) }
+    }
+
+    /// Agent-owned full-mode downloads go into the session's short-lived
+    /// artifact world, never the user's Downloads folder.
+    @MainActor
+    func agentDownloadFolder(_ download: WKDownload, tab: Tab) -> URL? {
+        guard tab.bench, let origin = holder(of: tab), mode(for: origin) == .full else { return nil }
+        return artifacts.startDownload(download, tab: Bench.short(tab), host: tab.address?.host() ?? "", origin: origin)
+    }
+
+    @MainActor
+    func agentDownloadFinished(_ download: WKDownload, file: URL) -> Bool {
+        guard artifacts.owns(download) else { return false }
+        guard let event = artifacts.finish(download, file: file),
+              let tag = event["origin"] as? String,
+              let origin = sessions.keys.first(where: { $0.tag == tag }) else { return true }
+        emit("artifact.created", ["artifact": event["artifact"] ?? [:]], to: origin)
+        return true
+    }
+
+    @MainActor
+    func agentDownloadFailed(_ download: WKDownload) -> Bool {
+        guard artifacts.owns(download) else { return false }
+        guard let event = artifacts.fail(download) else { return false }
+        if let tag = event["origin"] as? String,
+           let origin = sessions.keys.first(where: { $0.tag == tag }) {
+            emit("artifact.failed", ["id": event["id"] ?? "", "tab": event["tab"] ?? ""], to: origin)
+        }
+        return true
+    }
+
     /// The card's answer. `allow` dispatches the original op fresh — a tab
     /// that went meanwhile errors the ordinary way through `own`/`view`;
     /// `always` remembers (op, host) for the session first; `deny` settles
@@ -493,10 +796,6 @@ final class Drive: Driving {
         guard let pending = pendingApprovals.removeValue(forKey: id) else { return }
         if verdict == .deny {
             pending.finish(["error": "Action cancelled by you", "code": "GUARD_CANCELLED", "guardStopped": true])
-            return
-        }
-        if mode(for: pending.origin) == .read {
-            pending.finish(["error": "The run is now in Read mode", "code": "GUARD_CANCELLED", "guardStopped": true])
             return
         }
         // Old persisted Always verdicts now approve this action once only.
@@ -539,8 +838,10 @@ final class Drive: Driving {
     func refreshApproval(_ id: UUID) {
         guard let pending = pendingApprovals.removeValue(forKey: id) else { return }
         // Resolve the old UI card before recapturing; this never executes it.
-        if pending.origin == .app { Mind.shared.removeApproval(id) }
-        else if case .routine = pending.origin { Routines.shared.removeApproval(id) }
+        switch pending.origin {
+        case .app, .socket: Mind.shared.removeApproval(id)
+        case .routine: Routines.shared.removeApproval(id)
+        }
         let generation = guardGeneration[pending.origin, default: 0]
         guardChecks.insert(pending.origin)
         inspectGuard(pending.op, pending.args, from: pending.origin) { [weak self] evidence in
@@ -569,6 +870,10 @@ final class Drive: Driving {
         let ids = pendingApprovals.filter { $0.value.origin == origin }.map(\.key)
         for id in ids {
             guard let pending = pendingApprovals.removeValue(forKey: id) else { continue }
+            switch origin {
+            case .app, .socket: Mind.shared.removeApproval(id)
+            case .routine: Routines.shared.removeApproval(id)
+            }
             pending.finish(["error": "Cancelled: \(reason)", "code": "GUARD_CANCELLED", "guardStopped": true])
         }
     }
@@ -649,8 +954,28 @@ final class Drive: Driving {
     /// have. Re-runs `own`/`view` fresh: a tab that navigated or closed
     /// while its card was up errors the ordinary way.
     @MainActor
-    private func dispatch(_ op: String, _ args: [String: Any], _ finish: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
-        if cancelled(args, finish) { return }
+    private func dispatch(_ op: String, _ args: [String: Any], _ answer: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
+        if cancelled(args, answer) { return }
+        var finish = answer
+        if op.hasPrefix("page.") || op.hasPrefix("act."), let subject = tab(args), granted(subject, origin) {
+            let id = subject.id
+            AgentCursor.shared.wake(id, from: origin)
+            finish = { reply in
+                AgentCursor.shared.rest(id)
+                answer(reply)
+            }
+        }
+        let selects = op == "tabs.select"
+            || (op == "tabs.open" && args["foreground"] as? Bool == true)
+            || (op == "tabs.surface" && (args["foreground"] as? Bool ?? true))
+        if selects && !browser.prefs.agentFocus {
+            finish(["error": "Agent tab switching is disabled in Settings > Ask. Use foreground:false for background tabs.", "code": "ATTENTION_DISABLED"])
+            return
+        }
+        if op == "page.highlight" && !browser.prefs.agentHighlights {
+            finish(["error": "Agent highlights are disabled in Settings > Ask.", "code": "ATTENTION_DISABLED"])
+            return
+        }
         switch op {
         case "ping":
             finish(["pong": true])
@@ -661,8 +986,10 @@ final class Drive: Driving {
             // session's leash along the way — a socket's own only: `.app`'s
             // is the chat's (pushed by Mind) and a routine's is the routine's
             // (set at dispatch) — a model must never lift its own leash.
-            if case .socket = origin,
-               let mode = (args["mode"] as? String).flatMap(AskMode.init(rawValue:)) {
+            if case .socket = origin, let value = args["mode"] {
+                guard let raw = value as? String, let mode = AskMode(rawValue: raw) else {
+                    finish(["error": "subscribe mode needs guard|full"]); return
+                }
                 modes[origin] = mode
             }
             finish(["subscribed": true])
@@ -719,6 +1046,13 @@ final class Drive: Driving {
             snapshot(args, finish, from: origin)
         case "page.screenshot":
             screenshot(args, finish, from: origin)
+        case "page.pdf":
+            pdf(args, finish, from: origin)
+        case "artifact.list":
+            finish(["artifacts": artifacts.list(for: origin, tab: args["tab"] as? String)])
+        case "artifact.read":
+            guard let id = args["id"] as? String else { finish(["error": "artifact.read needs id"]); return }
+            finish(artifacts.read(id: id, origin: origin, offset: args["offset"], length: args["length"]))
         case "page.eval":
             eval(args, finish, from: origin)
         case "page.code":
@@ -727,6 +1061,25 @@ final class Drive: Driving {
             console(args, finish, from: origin)
         case "page.frames":
             frames(args, finish, from: origin)
+        case "page.highlight", "page.clearHighlight":
+            guard let tab = own(args, finish, origin) else { return }
+            if op == "page.clearHighlight" {
+                guard let web = tab.built else { finish(["cleared": false]); return }
+                drive(web, "function(d) { return d.clearHighlight(\(json(origin.tag))); }",
+                      cancellationToken: args["_cancelToken"] as? String) { finish($0) }
+            } else {
+                let target = query("highlight", args)
+                let duration = args["duration"] as? NSNumber
+                guard target.count == 1, target.values.allSatisfy({ ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }),
+                      args["duration"] == nil || (duration != nil && CFGetTypeID(duration!) != CFBooleanGetTypeID() && (1...30).contains(duration!.doubleValue)),
+                      args["scroll"] == nil || args["scroll"] is Bool else {
+                    finish(["error": "highlight needs one target, duration 1..30 seconds, and optional boolean scroll", "code": "INVALID_ARGUMENT"])
+                    return
+                }
+                guard let web = view(of: tab, finish) else { return }
+                drive(web, "function(d) { return d.highlight(\(json(query("highlight", args))), \(json(args)), \(json(origin.tag))); }",
+                      cancellationToken: args["_cancelToken"] as? String) { finish($0) }
+            }
         case "act.click":
             click(args, finish, from: origin)
         case "act.type":
@@ -735,6 +1088,8 @@ final class Drive: Driving {
             press(args, finish, from: origin)
         case "act.clickAt":
             clickAt(args, finish, from: origin)
+        case "act.drag":
+            drag(args, finish, from: origin)
         case "act.fill", "act.hover", "act.scroll", "act.select", "act.check", "act.submit":
             actJS(op, args, finish, from: origin)
         case "agent.tabs":
@@ -752,16 +1107,22 @@ final class Drive: Driving {
                 finish(["error": "this session's mode is set by its owner — sockets set their own only"])
                 return
             }
-            guard let to = args["to"] as? String else {
-                finish(["mode": mode(for: origin).rawValue])
+            if args["to"] == nil {
+                finish(["mode": mode(for: origin).rawValue, "uiApproval": socketApprovalUI.contains(origin)])
                 return
             }
-            guard let parsed = AskMode(rawValue: to) else {
-                finish(["error": "agent.mode needs to: read|guard|full"])
+            guard let to = args["to"] as? String, let parsed = AskMode(rawValue: to) else {
+                finish(["error": "agent.mode needs to: guard|full"])
+                return
+            }
+            if parsed == .guard, args["uiApproval"] as? Bool == true, Mind.shared.currentID == nil {
+                finish(["error": "open an Ask chat before opting into external Guard approvals", "code": "NEEDS_UI"])
                 return
             }
             modes[origin] = parsed
-            finish(["mode": parsed.rawValue])
+            if parsed == .guard, args["uiApproval"] as? Bool == true { socketApprovalUI.insert(origin) }
+            else { socketApprovalUI.remove(origin) }
+            finish(["mode": parsed.rawValue, "uiApproval": socketApprovalUI.contains(origin)])
         case "ui.ask":
             // Posting/steering as the user is the interactive chat's door —
             // an unattended run reaching it is prompt injection into the
@@ -787,7 +1148,8 @@ final class Drive: Driving {
         }
         if op.hasPrefix("act."), !["act.hover", "act.scroll"].contains(op) {
             guard let subject = own(args, done, origin), let view = view(of: subject, done) else { return }
-            drive(view, "function(d) { return (\(GuardPage.inspect))(d, \(json(op)), \(json(actArgs(args)))); }") { out in
+            drive(view, "function(d) { return (\(GuardPage.inspect))(d, \(json(op)), \(json(actArgs(args)))); }",
+                  cancellationToken: args["_cancelToken"] as? String) { out in
                 MainActor.assumeIsolated { done(out) }
             }
             return
@@ -806,7 +1168,8 @@ final class Drive: Driving {
               "fingerprint": fingerprint, "sensitive": true,
               "url": subject?.address?.absoluteString ?? ""]
         guard !categories.isEmpty, let view = subject?.built else { done(evidence); return }
-        drive(view, "function(d) { return (\(GuardPage.inspect))(d, 'guard.context', {}); }") { out in
+        drive(view, "function(d) { return (\(GuardPage.inspect))(d, 'guard.context', {}); }",
+              cancellationToken: args["_cancelToken"] as? String) { out in
             MainActor.assumeIsolated {
                 guard out["error"] == nil, let page = out["fingerprint"] as? String else {
                     done(["error": "Cannot inspect the page for approval", "code": "GUARD_UNAVAILABLE"]); return
@@ -836,7 +1199,8 @@ final class Drive: Driving {
             if (!hit || !(hit === target || target.contains(hit))) return {error:'Click target moved or is covered'};
             """
         } else { hitCheck = "" }
-        drive(view, "function(d) { \(hitCheck) return (\(GuardPage.inspect))(d, \(json(op)), \(json(actArgs(args)))); }") { out in
+        drive(view, "function(d) { \(hitCheck) return (\(GuardPage.inspect))(d, \(json(op)), \(json(actArgs(args)))); }",
+              cancellationToken: args["_cancelToken"] as? String) { out in
             MainActor.assumeIsolated {
                 if self.cancelled(args, done) { return }
                 guard out["error"] == nil, out["fingerprint"] as? String == expected else {
@@ -934,9 +1298,8 @@ final class Drive: Driving {
     /// The ask path (design/permissions.md §3). The op's `finish` parks in
     /// `pendingApprovals` — `Share.pending` stays up, `done` never fires,
     /// the harness's promise just waits — while the card goes up through
-    /// the same door `ui.ask` uses: `Mind.raise`. Socket sessions never
-    /// get here: the wire owns no UI and its patience timer answers in 30s
-    /// regardless, so their `ask` verdict resolves as the honest error.
+    /// the same door `ui.ask` uses: `Mind.raise`. A socket reaches that door
+    /// only after explicitly opting in through `agent.mode`.
     ///
     /// Who catches a parked card an unattended origin raises — the
     /// routines controller parks it on the live run's waitingApprovals.
@@ -951,9 +1314,8 @@ final class Drive: Driving {
     @MainActor
     private func parkApproval(_ op: String, _ args: [String: Any], _ finish: @escaping ([String: Any]) -> Void,
                               from origin: DriveOrigin, tab subject: Tab?, evidence: [String: Any]? = nil) {
-        // Where the card goes up: the app's chat rail, or the live run's
-        // parked list through the sink. Anything else owns no UI — the
-        // wire's answer is the same error it has always been.
+        // Where the card goes up: the app's chat rail, the opted-in socket's
+        // current Ask chat, or the live run's parked list through the sink.
         let raise: ((AskApproval) -> Void)?
         switch origin {
         case .app:
@@ -961,7 +1323,8 @@ final class Drive: Driving {
         case .routine:
             raise = approvalSink.map { sink in { sink($0, origin) } }
         case .socket:
-            raise = nil
+            raise = socketApprovalUI.contains(origin) && Mind.shared.currentID != nil
+                ? { Mind.shared.open = true; Mind.shared.raise($0) } : nil
         }
         guard let raise else {
             finish(["error": "\(op) needs approval — the wire can't be shown a card",
@@ -978,6 +1341,8 @@ final class Drive: Driving {
         let chat: UUID?
         if case .routine = origin {
             chat = nil
+        } else if case .socket = origin {
+            chat = socketApprovalUI.contains(origin) ? Mind.shared.currentID : nil
         } else {
             chat = Mind.shared.runningChatID ?? Mind.shared.currentID
                 ?? appChat.flatMap { id in Mind.shared.chats.contains(where: { $0.id == id }) ? id : nil }
@@ -1019,7 +1384,8 @@ final class Drive: Driving {
                     try? FileManager.default.removeItem(at: file)
                     return
                 }
-                self.drive(view, "function(d) { return (\(GuardPage.inspect))(d, 'guard.context', {}); }") { context in
+                self.drive(view, "function(d) { return (\(GuardPage.inspect))(d, 'guard.context', {}); }",
+                           cancellationToken: args["_cancelToken"] as? String) { context in
                     MainActor.assumeIsolated {
                         guard self.pendingApprovals[id] != nil else {
                             try? FileManager.default.removeItem(at: file); return
@@ -1048,13 +1414,15 @@ final class Drive: Driving {
         }
         // Whose cookies the tab carries is a property fixed at open
         // (design/permissions.md §4): `fresh:true` asks for a tab signed in
-        // as nobody — Tab(shy:) on a .nonPersistent store — and a read-mode
-        // session gets nothing else.
-        let fresh = args["fresh"] as? Bool == true || mode(for: origin) == .read
-        let tab = browser.benchOpen(url, shy: fresh)
+        // as nobody — Tab(shy:) on a .nonPersistent store.
+        let fresh = args["fresh"] as? Bool == true
+        let store = Store.testing && ProcessInfo.processInfo.environment["SEARCH_BENCHMARK"] == "broad" && !fresh
+            ? BenchmarkRuns.shared.websiteStore(for: origin) : nil
+        let tab = browser.benchOpen(url, shy: fresh, store: store)
         tab.agentGroup = origin.tag
         tab.agentName = String((args["agentName"] as? String ?? agentLabel(for: origin)).prefix(80))
         sessions[origin, default: Share()].mine.insert(tab.id)
+        configureBenchmarkDialogs(tab, origin: origin)
         Bench.shared.house(tab)
         // Selecting on the real window is deliberately allowed for a tab the
         // agent opened — the attention was asked for on purpose.
@@ -1164,10 +1532,12 @@ final class Drive: Driving {
                 releaseInspector(id, from: who)
                 if let web = browser.allTabs.first(where: { $0.id == id })?.built {
                     AgentInteractions.shared.release(web, session: who)
+                    clearHighlight(web, from: who)
                 }
             }
         }
         for id in revoked where !sessions.values.contains(where: { $0.attached.contains(id) || $0.mine.contains(id) }) {
+            browser.allTabs.first(where: { $0.id == id })?.built?.restoreRenderingAfterAgent()
             seen.removeValue(forKey: id)
         }
         // The chat's asks and its remembered always-rules die with its
@@ -1191,11 +1561,16 @@ final class Drive: Driving {
         // its own attach mustn't burn it. A tab the session opened stays
         // `mine` regardless — detaching isn't disowning.
         releaseInspector(tab.id, from: origin)
-        if let web = tab.built { AgentInteractions.shared.release(web, session: origin) }
+        AgentCursor.shared.sleep(tab: tab.id)
+        if let web = tab.built {
+            AgentInteractions.shared.release(web, session: origin)
+            clearHighlight(web, from: origin)
+        }
         sessions[origin]?.attached.remove(tab.id)
         sessions[origin]?.leases.remove(tab.id)
         let held = sessions.values.contains { $0.attached.contains(tab.id) || $0.mine.contains(tab.id) }
         if !held, !tab.bench {
+            tab.built?.restoreRenderingAfterAgent()
             grantedTabs.remove(Bench.short(tab))
             // The tab leaves the watched row too: forget what the diff last
             // saw so its absence isn't announced as `tab.closed`. A tab
@@ -1212,6 +1587,8 @@ final class Drive: Driving {
     /// to whoever is listening.
     @MainActor
     private func drop(_ id: UUID) {
+        keyResends.removeAll { $0.tabID == id }
+        AgentCursor.shared.forget(id)
         inspectorArtifacts[id] = nil
         for client in inspectorClients[id] ?? [] { releaseInspector(id, from: client) }
         grantedTabs.remove(String(id.uuidString.prefix(8)).lowercased())
@@ -1255,6 +1632,20 @@ final class Drive: Driving {
     }
 
     // MARK: - page
+
+    @MainActor
+    func clearHighlights(from origin: DriveOrigin? = nil) {
+        for tab in browser.allTabs {
+            if let web = tab.built { clearHighlight(web, from: origin) }
+        }
+    }
+
+    @MainActor
+    private func clearHighlight(_ web: PageView, from origin: DriveOrigin?) {
+        // Never build a view or inject a driver just to clean up an overlay.
+        web.evaluateJavaScript("window.__drive && window.__drive.clearHighlight(\(origin.map { json($0.tag) } ?? "null"))",
+                               in: nil, in: Drive.agentWorld) { _ in }
+    }
 
     @MainActor
     private func go(_ args: [String: Any], _ done: ([String: Any]) -> Void, from origin: DriveOrigin) {
@@ -1322,12 +1713,14 @@ final class Drive: Driving {
     private func eval(_ args: [String: Any], _ done: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
         guard let tab = own(args, done, origin), let view = view(of: tab, done) else { return }
         guard let js = args["js"] as? String else { done(["error": "page.eval needs js"]); return }
-        view.evaluateJavaScript(js) { value, error in
-            MainActor.assumeIsolated {
-                if let error { done(["error": error.localizedDescription]); return }
-                done(["value": Bench.plain(value)])
+        scriptCompletion(view, mutating: false, cancellationToken: args["_cancelToken"] as? String, { complete in
+            view.evaluateJavaScript(js) { value, error in
+                MainActor.assumeIsolated {
+                    if let error { complete(["error": error.localizedDescription]); return }
+                    complete(["value": Bench.plain(value)])
+                }
             }
-        }
+        }, done)
     }
 
     // MARK: - drive.js
@@ -1378,7 +1771,9 @@ final class Drive: Driving {
     /// so a commit mid-call still answers `navChanged`; any other op dying
     /// the same death produced nothing and is the error `navigated mid-call`.
     @MainActor
-    private func drive(_ view: PageView, _ call: String, mutating: Bool = false, world: WKContentWorld = Drive.agentWorld, _ done: @escaping ([String: Any]) -> Void) {
+    private func drive(_ view: PageView, _ call: String, mutating: Bool = false,
+                       world: WKContentWorld = Drive.agentWorld, cancellationToken: String? = nil,
+                       _ done: @escaping ([String: Any]) -> Void) {
         let js = """
         window.__driveRefNamespace = \(world == .page ? "'code-'" : "''");
         \(AskJS.load("drive.js"))
@@ -1404,28 +1799,74 @@ final class Drive: Driving {
           finally { if (dark) { try { window.requestAnimationFrame = rafWas; } catch (e) {} } }
         })()
         """
-        // A navigation mid-call tears the context down before the completion
-        // can run — park the answerer so `navigated` can settle it.
-        let tab = browser.allTabs.first { $0.built === view }
-        let ticket = nextFlight; nextFlight += 1
-        var settled = false
-        let settle: ([String: Any]) -> Void = { out in
-            if settled { return }
-            settled = true
-            if let tab { self.flying[tab.id]?[ticket] = nil }
-            done(out)
-        }
-        if let tab { flying[tab.id, default: [:]][ticket] = (mutating, settle) }
-        view.callAsyncJavaScript(js, arguments: [:], in: nil, in: world) { result in
-            MainActor.assumeIsolated {
-                switch result {
-                case .success(let value):
-                    settle(value as? [String: Any] ?? ["value": Bench.plain(value)])
-                case .failure(let error):
-                    settle(["error": error.localizedDescription])
+        scriptCompletion(view, mutating: mutating, cancellationToken: cancellationToken, { complete in
+            view.callAsyncJavaScript(js, arguments: [:], in: nil, in: world) { result in
+                MainActor.assumeIsolated {
+                    switch result {
+                    case .success(let value):
+                        complete(value as? [String: Any] ?? ["value": Bench.plain(value)])
+                    case .failure(let error):
+                        complete(["error": error.localizedDescription])
+                    }
                 }
             }
+        }, done)
+    }
+
+    /// One completion path for script calls that can outlive their WebKit
+    /// callback. It also releases a blocked script when an intercepted dialog
+    /// appears, leaving the caller free to query and answer it.
+    @MainActor
+    private func scriptCompletion(_ view: PageView, mutating: Bool, cancellationToken: String? = nil,
+                                  _ start: (@escaping ([String: Any]) -> Void) -> Void,
+                                  _ done: @escaping ([String: Any]) -> Void) {
+        if let cancellationToken, cancelled(["_cancelToken": cancellationToken], done) { return }
+        let tabID = browser.allTabs.first { $0.built === view }?.id
+        let ticket = nextFlight; nextFlight += 1
+        var settled = false
+        var watcher: UUID?
+        var reply: (([String: Any]) -> Void)? = done
+        let settle: ([String: Any]) -> Void = { [weak self, weak view] out in
+            guard !settled else { return }
+            settled = true
+            let complete = reply
+            reply = nil
+            if let watcher, let view {
+                AgentInteractions.shared.stopWatching(ObjectIdentifier(view), id: watcher)
+            }
+            if let tabID { self?.flying[tabID]?[ticket] = nil }
+            complete?(out)
         }
+        if let tabID { flying[tabID, default: [:]][ticket] = (mutating, cancellationToken, settle) }
+        switch AgentInteractions.shared.watchPending(view, requestToken: cancellationToken,
+            found: { settle(["error": "JavaScript dialog is pending", "code": "DIALOG_PENDING",
+                             "dialogPending": true, "outcome": "unknown"]) },
+            cancelled: { settle(["error": "cancelled while waiting on JavaScript dialog",
+                                 "code": "CANCELLED", "outcome": "unknown"]) }) {
+        case .unavailable:
+            break
+        case .alreadyPending:
+            settle(["error": "JavaScript dialog is pending", "code": "DIALOG_PENDING",
+                    "dialogPending": true, "outcome": "unknown"])
+        case .watching(let id):
+            watcher = id
+        }
+        guard !settled else { return }
+        start { result in settle(result) }
+    }
+
+    @MainActor
+    @discardableResult
+    private func cancelScriptFlights(_ token: String, in view: WKWebView) -> Bool {
+        guard let tab = browser.allTabs.first(where: { $0.built === view }) else { return false }
+        let settle = flying[tab.id]?.values
+            .filter { $0.cancellationToken == token }
+            .map(\.settle) ?? []
+        for complete in settle {
+            complete(["error": "cancelled; outcome unknown", "code": "CANCELLED",
+                      "guardStopped": true, "outcome": "unknown"])
+        }
+        return !settle.isEmpty
     }
 
     /// A commit is the page's context going away. What it still owed us
@@ -1454,8 +1895,9 @@ final class Drive: Driving {
     private func snapshot(_ args: [String: Any], _ done: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
         guard let tab = own(args, done, origin), let view = view(of: tab, done) else { return }
         var opts: [String: Any] = [:]
-        for key in ["scope", "boxes", "maxChars", "interactive", "selector", "ref"] { if let v = args[key] { opts[key] = v } }
-        drive(view, "function (d) { return d.snapshot(\(json(opts))); }", done)
+        for key in ["scope", "boxes", "textColors", "maxChars", "cssLocators", "interactive", "selector", "ref"] { if let v = args[key] { opts[key] = v } }
+        drive(view, "function (d) { return d.snapshot(\(json(opts))); }",
+              cancellationToken: args["_cancelToken"] as? String, done)
     }
 
     @MainActor
@@ -1466,7 +1908,8 @@ final class Drive: Driving {
         // it, and how much the console heard meanwhile. A commit mid-run is
         // an error, not navChanged: a program torn down before it returned
         // produced nothing, whatever it was about to do.
-        drive(view, "function (d) { return d.run(\(json(js))); }", world: .page, done)
+        drive(view, "function (d) { return d.run(\(json(js))); }", world: .page,
+              cancellationToken: args["_cancelToken"] as? String, done)
     }
 
     @MainActor
@@ -1479,7 +1922,7 @@ final class Drive: Driving {
           if (m) return { messages: m };
           return { messages: [] };
         }
-        """, world: .page, done)
+        """, world: .page, cancellationToken: args["_cancelToken"] as? String, done)
     }
 
     @MainActor
@@ -1492,7 +1935,7 @@ final class Drive: Driving {
           if (m) return { frames: m };
           return { frames: [] };
         }
-        """, done)
+        """, cancellationToken: args["_cancelToken"] as? String, done)
     }
 
     // MARK: - screenshots
@@ -1513,46 +1956,80 @@ final class Drive: Driving {
             ?? shotsFolder().appendingPathComponent("shot-\(Bench.short(tab))-\(Int(Date().timeIntervalSince1970 * 1000)).png").path
         let marks = args["marks"] as? Bool == true
         let width = (args["width"] as? NSNumber)?.doubleValue
+        if let width, (!width.isFinite || width < 1 || width > 8192) {
+            done(["error": "screenshot width must be a finite value from 1 to 8192", "code": "INVALID_ARGUMENT"])
+            return
+        }
 
         func finish(_ reply: [String: Any]) {
             if marks {
-                drive(view, "function(d) { d.unmark(); return {ok:true}; }") { _ in done(reply) }
+                drive(view, "function(d) { d.unmark(); return {ok:true}; }", cancellationToken: args["_cancelToken"] as? String) { _ in done(reply) }
             } else {
                 done(reply)
             }
         }
-        func snap(_ width: Double?, _ jpeg: Bool) {
+        func viewport(_ done: @escaping ([Int]?, String?) -> Void) {
+            drive(view, "function(d) { return {size: [innerWidth, innerHeight]}; }", cancellationToken: args["_cancelToken"] as? String) { out in
+                guard let size = (out["size"] as? [Any])?.compactMap({ ($0 as? NSNumber)?.intValue }),
+                      size.count == 2, size.allSatisfy({ $0 > 0 }) else {
+                    done(nil, out["error"] as? String ?? "page viewport is unavailable")
+                    return
+                }
+                done(size, nil)
+            }
+        }
+        func resized(_ source: NSBitmapImageRep, width: Int, height: Int) -> NSBitmapImageRep? {
+            guard width > 0, height > 0,
+                  let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+                  let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                          bytesPerRow: width * 4, space: colorSpace,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+                  let sourceImage = source.cgImage else { return nil }
+            context.interpolationQuality = .high
+            context.draw(sourceImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            guard let image = context.makeImage() else { return nil }
+            return NSBitmapImageRep(cgImage: image)
+        }
+        func snap(_ viewportSize: [Int]) {
+            if cancelled(args, done) { return }
             let shot = WKSnapshotConfiguration()
             shot.afterScreenUpdates = true
             if let width { shot.snapshotWidth = NSNumber(value: width) }
             view.takeSnapshot(with: shot) { image, error in
                 MainActor.assumeIsolated {
+                    if self.cancelled(args, done) { return }
                     guard let image, let tiff = image.tiffRepresentation,
                           let rep = NSBitmapImageRep(data: tiff)
                     else {
                         finish(["error": error?.localizedDescription ?? "no picture"])
                         return
                     }
-                    let data = jpeg
-                        ? rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
-                        : rep.representation(using: .png, properties: [:])
-                    guard let data else { finish(["error": "no picture"]); return }
-                    // ~1.5 MB is all an answer should carry: a big PNG goes
-                    // once more at half width, then as a JPEG. A JPEG over
-                    // the cap is written anyway — it won't get smaller.
-                    if data.count > 1_500_000, !jpeg {
-                        if width == nil && rep.pixelsWide > 320 {
-                            snap(Double(rep.pixelsWide) / 2, false)
-                        } else {
-                            snap(width, true)
+                    // Agent coordinates use CSS pixels. A default AppKit
+                    // snapshot is backing-scale pixels, so resample it to
+                    // the page viewport before returning it. An explicit
+                    // width retains WKSnapshotConfiguration's existing
+                    // point-width behavior and reports its resulting scale.
+                    var output = rep
+                    if width == nil && (rep.pixelsWide != viewportSize[0] || rep.pixelsHigh != viewportSize[1]) {
+                        guard let normalized = resized(rep, width: viewportSize[0], height: viewportSize[1]) else {
+                            finish(["error": "could not normalize screenshot to CSS pixels"]); return
                         }
-                        return
+                        output = normalized
                     }
+                    let png = output.representation(using: .png, properties: [:])
+                    var data = png
+                    if let bytes = png, bytes.count > 1_500_000 {
+                        data = output.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
+                    }
+                    guard let data else { finish(["error": "no picture"]); return }
+                    if self.cancelled(args, done) { return }
                     do {
                         try data.write(to: URL(fileURLWithPath: path))
-                        finish(["path": path, "width": rep.pixelsWide, "height": rep.pixelsHigh,
+                        finish(["path": path, "width": output.pixelsWide, "height": output.pixelsHigh,
+                                "viewport": ["width": viewportSize[0], "height": viewportSize[1]],
+                                "scale": Double(output.pixelsWide) / Double(viewportSize[0]),
                                 "data": data.base64EncodedString(),
-                                "format": jpeg ? "jpeg" : "png"])
+                                "format": data.starts(with: Data([0x89, 0x50, 0x4e, 0x47])) ? "png" : "jpeg"])
                     } catch {
                         finish(["error": error.localizedDescription])
                     }
@@ -1560,9 +2037,38 @@ final class Drive: Driving {
             }
         }
         if marks {
-            drive(view, "function(d) { d.mark(); return {ok:true}; }") { _ in snap(width, false) }
+            drive(view, "function(d) { d.mark(); return {ok:true}; }", cancellationToken: args["_cancelToken"] as? String) { _ in
+                viewport { size, error in
+                    guard let size else { finish(["error": error ?? "page viewport is unavailable"]); return }
+                    snap(size)
+                }
+            }
         } else {
-            snap(width, false)
+            viewport { size, error in
+                guard let size else { finish(["error": error ?? "page viewport is unavailable"]); return }
+                snap(size)
+            }
+        }
+    }
+
+    @MainActor
+    private func pdf(_ args: [String: Any], _ done: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
+        guard let tab = own(args, done, origin), let view = view(of: tab, done) else { return }
+        view.createPDF(configuration: WKPDFConfiguration()) { [weak self] result in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.cancelled(args, done) { return }
+                guard self.granted(tab, origin) else {
+                    done(["error": "tab ownership changed while rendering the PDF", "code": "CANCELLED"]); return
+                }
+                do {
+                    let saved = try self.artifacts.savePDF(try result.get(), tab: Bench.short(tab),
+                                                          host: tab.address?.host() ?? "", origin: origin)
+                    done(saved)
+                } catch {
+                    done(["error": error.localizedDescription, "code": "PDF_FAILED"])
+                }
+            }
         }
     }
 
@@ -1573,6 +2079,11 @@ final class Drive: Driving {
     /// don't take `text` as a payload — `text=…` by the element's words.
     @MainActor
     private func query(_ verb: String, _ args: [String: Any]) -> [String: Any] {
+        if verb == "drag" {
+            if let source = args["source"] as? [String: Any] { return source }
+            if let source = args["source"] as? [Any] { return ["at": source] }
+            return [:]
+        }
         var q: [String: Any] = [:]
         for key in ["ref", "loc", "css"] { if let v = args[key] { q[key] = v } }
         if !["fill", "type", "press", "clickAt"].contains(verb), let t = args["text"] { q["text"] = t }
@@ -1585,6 +2096,13 @@ final class Drive: Driving {
     @MainActor
     private func actArgs(_ args: [String: Any]) -> [String: Any] {
         args.filter { $0.key != "tab" && $0.key != "_cancelToken" && !$0.key.hasPrefix("_guard") && !Policy.gateKeys.contains($0.key) }
+    }
+
+    @MainActor
+    private func postSnapshotCall(_ args: [String: Any]) -> String {
+        let opts: [String: Any] = ["maxChars": args["snapshotMaxChars"] ?? NSNull(),
+                                  "cssLocators": args["cssLocators"] ?? true]
+        return "function (d) { return d.snapshot(\(json(opts))); }"
     }
 
     /// A mutating action through drive.js, with a fresh snapshot folded in
@@ -1600,17 +2118,30 @@ final class Drive: Driving {
             if (args["ref"] as? String) == "page" { q = "page" }
             else if (q as? [String: Any])?.isEmpty == true { q = NSNull() }
         }
-        drive(view, guardCall(op, args, query: q, verb: verb), mutating: true) { [weak self] out in
+        let snapshotCall = postSnapshotCall(args)
+        drive(view, guardCall(op, args, query: q, verb: verb), mutating: true,
+              cancellationToken: args["_cancelToken"] as? String) { [weak self] out in
             MainActor.assumeIsolated {
+                if out["error"] == nil {
+                    let words = ["click": "Click", "hover": "Hover", "scroll": "Scroll", "fill": "Fill",
+                                 "select": "Select", "check": "Check", "submit": "Submit"]
+                    AgentCursor.shared.glide(tab.id, to: (out["at"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue },
+                                             word: words[verb], tap: verb == "click" || verb == "check")
+                }
                 // drive.js folds a fresh snapshot in itself when asked; this
                 // is the backstop for one that doesn't know withSnapshot.
                 guard args["withSnapshot"] as? Bool == true, out["error"] == nil, out["snapshot"] == nil else {
                     done(out)
                     return
                 }
-                self?.drive(view, "function (d) { return d.snapshot({}); }") { snap in
+                self?.drive(view, snapshotCall,
+                            cancellationToken: args["_cancelToken"] as? String) { snap in
                     var out = out
-                    if snap["error"] == nil { out["snapshot"] = snap["snapshot"] ?? snap }
+                    if snap["error"] == nil {
+                        out["snapshot"] = snap["snapshot"] ?? snap
+                        out["snapshotTruncated"] = snap["truncated"] ?? false
+                        out["snapshotVersion"] = snap["version"]
+                    }
                     done(out)
                 }
             }
@@ -1621,7 +2152,8 @@ final class Drive: Driving {
     /// view first — through `__drive` when there's a `ref`/`loc` to honour,
     /// through bench's finder for `css`/`text=`, which need nothing page-side.
     @MainActor
-    private func point(_ view: PageView, _ q: [String: Any], _ done: @escaping ([Double]?, String?) -> Void) {
+    private func point(_ view: PageView, _ q: [String: Any], cancellationToken: String? = nil,
+                       _ done: @escaping ([Double]?, String?) -> Void) {
         drive(view, """
         function(d) {
           var el = d.resolve(\(json(q)));
@@ -1629,29 +2161,63 @@ final class Drive: Driving {
           var r = el.getBoundingClientRect();
           return {at:[r.left+r.width/2,r.top+r.height/2]};
         }
-        """) { out in
+        """, cancellationToken: cancellationToken) { out in
             done((out["at"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue }, out["error"] as? String)
         }
     }
 
     @MainActor
-    private func focus(_ view: PageView, _ q: [String: Any], _ done: @escaping (String?) -> Void) {
-        guard !q.isEmpty else { done(nil); return }
+    private func focus(_ view: PageView, _ q: [String: Any], cancellationToken: String? = nil,
+                       _ done: @escaping (String?, [Double]?) -> Void) {
+        guard !q.isEmpty else { done(nil, nil); return }
         drive(view, """
         function(d) {
           var el = d.resolve(\(json(q)));
           el.scrollIntoView({block:'center',inline:'nearest'});
           if (el.focus) el.focus();
-          return {ok:true};
+          var r = el.getBoundingClientRect();
+          return {ok:true, at:[r.left+Math.min(r.width/2, 24),r.top+r.height/2]};
         }
-        """) { out in done(out["error"] as? String) }
+        """, cancellationToken: cancellationToken) { out in
+            done(out["error"] as? String, (out["at"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue })
+        }
+    }
+
+    @MainActor
+    private func mousePointError(_ view: PageView, _ point: [Double]) -> [String: Any]? {
+        guard point.count == 2, point.allSatisfy(\.isFinite), point[0] >= 0, point[1] >= 0,
+              point[0] < view.bounds.width, point[1] < view.bounds.height else {
+            return ["error": "click point must be finite and inside the page viewport", "code": "INVALID_ARGUMENT"]
+        }
+        return nil
     }
 
     /// A real press at a page point — down and up on the view itself, the way
     /// `bench tap` clicks: trusted, in whichever window the view is housed.
     @MainActor
-    private func mouse(_ view: PageView, at point: [Double], button: String, clicks: Int, flags: NSEvent.ModifierFlags) -> String? {
-        guard let window = view.window else { return "the tab's view has no window" }
+    private func mouse(_ view: PageView, tab: Tab, at point: [Double], button: String, clicks: Int, flags: NSEvent.ModifierFlags,
+                       origin: DriveOrigin, args: [String: Any] = [:], done: @escaping ([String: Any]?, Bool, Bool) -> Void) {
+        if let error = mousePointError(view, point) { done(error, false, false); return }
+        let word = button == "right" ? "Right-click" : (clicks > 1 ? "Double-click" : "Click")
+        AgentCursor.shared.approach(tab.id, in: view, to: point, word: word) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                var stopped: [String: Any]?
+                if self.cancelled(args, { stopped = $0 }) { done(stopped, false, false); return }
+                guard self.granted(tab, origin), tab.built === view else {
+                    done(["error": "tab ownership or page changed", "code": "CANCELLED"], false, false)
+                    return
+                }
+                AgentCursor.shared.tap(tab.id, at: point)
+                self.pressMouse(view, tab: tab, at: point, button: button, clicks: clicks, flags: flags, origin: origin, done: done)
+            }
+        }
+    }
+
+    @MainActor
+    private func pressMouse(_ view: PageView, tab: Tab, at point: [Double], button: String, clicks: Int, flags: NSEvent.ModifierFlags,
+                       origin: DriveOrigin, done: @escaping ([String: Any]?, Bool, Bool) -> Void) {
+        guard let window = view.window else { done(["error": "the tab's view has no window", "code": "NOT_VISIBLE"], false, false); return }
         let local = NSPoint(x: point[0], y: view.isFlipped ? point[1] : view.bounds.height - point[1])
         let spot = view.convert(local, to: nil)
         let downType: NSEvent.EventType
@@ -1661,35 +2227,51 @@ final class Drive: Driving {
         case "middle": (downType, upType) = (.otherMouseDown, .otherMouseUp)
         default: (downType, upType) = (.leftMouseDown, .leftMouseUp)
         }
+        var creationFailed = false
+        let ack = MouseAck(view: view, origin: origin) { dialogPending, cancelled in
+            let error = creationFailed ? ["error": "could not create native mouse event", "code": "ERROR"] as [String: Any] : nil
+            done(error, dialogPending, cancelled)
+        }
+        guard ack.watch() else {
+            done(["error": "a page dialog is already pending", "code": "DIALOG_PENDING"], true, false)
+            return
+        }
         Drive.injecting += 1
         defer { Drive.injecting -= 1 }
-        for click in 1...max(1, clicks) {
+        outer: for click in 1...max(1, clicks) {
             for type in [downType, upType] {
                 guard let event = NSEvent.mouseEvent(
                     with: type, location: spot, modifierFlags: flags,
                     timestamp: ProcessInfo.processInfo.systemUptime,
                     windowNumber: window.windowNumber, context: nil,
-                    eventNumber: 0, clickCount: click, pressure: type == downType ? 1 : 0
-                ) else { continue }
-                Drive.note(event)
-                switch type {
-                case .leftMouseDown: view.mouseDown(with: event)
-                case .leftMouseUp: view.mouseUp(with: event)
-                case .rightMouseDown: view.rightMouseDown(with: event)
-                case .rightMouseUp: view.rightMouseUp(with: event)
-                case .otherMouseDown: view.otherMouseDown(with: event)
-                case .otherMouseUp: view.otherMouseUp(with: event)
-                default: break
+                    eventNumber: nativeMouseEventNumber, clickCount: click, pressure: type == downType ? 1 : 0
+                ) else { creationFailed = true; break outer }
+                nativeMouseEventNumber &+= 1
+                let heldButtonMask: UInt = button == "right" ? 1 << 1 : (button == "middle" ? 1 << 2 : 1)
+                let held = type == downType ? heldButtonMask : 0
+                SyntheticMouseButtons.with(held) {
+                    Drive.note(event)
+                    switch type {
+                    case .leftMouseDown: view.mouseDown(with: event)
+                    case .leftMouseUp: view.mouseUp(with: event)
+                    case .rightMouseDown: view.rightMouseDown(with: event)
+                    case .rightMouseUp: view.rightMouseUp(with: event)
+                    case .otherMouseDown: view.otherMouseDown(with: event)
+                    case .otherMouseUp: view.otherMouseUp(with: event)
+                    default: break
+                    }
                 }
+                view.syntheticMousePoint = NSPoint(x: point[0], y: point[1])
             }
         }
-        return nil
+        ack.wait()
     }
 
     /// One key, down and up, as a real event on the view — `bench key`'s
     /// delivery for a single press.
     @MainActor
-    private func key(_ view: PageView, code: UInt16, chars: String, flags: NSEvent.ModifierFlags) {
+    private func key(_ view: PageView, code: UInt16, chars: String, flags: NSEvent.ModifierFlags,
+                     tabID: UUID, origin: DriveOrigin) {
         Drive.injecting += 1
         defer { Drive.injecting -= 1 }
         for type in [NSEvent.EventType.keyDown, .keyUp] {
@@ -1701,21 +2283,92 @@ final class Drive: Driving {
                 isARepeat: false, keyCode: code
             ) else { continue }
             Drive.note(event)
-            if type == .keyDown { view.keyDown(with: event) } else { view.keyUp(with: event) }
+            if type == .keyDown {
+                let action: Selector?
+                if flags.contains(.command), !flags.contains(.shift), !flags.contains(.control), !flags.contains(.option), chars.count == 1 {
+                    switch chars.lowercased() {
+                    case "a": action = NSSelectorFromString("selectAll:")
+                    case "c": action = NSSelectorFromString("copy:")
+                    case "v": action = NSSelectorFromString("paste:")
+                    case "x": action = NSSelectorFromString("cut:")
+                    default: action = nil
+                    }
+                } else { action = nil }
+                armKeyBounceMonitor()
+                if let action {
+                    let resend = KeyResend(event: event, view: view, action: action, tabID: tabID, origin: origin)
+                    keyResends.append(resend)
+                }
+                view.keyDown(with: event)
+            } else { view.keyUp(with: event) }
         }
     }
 
     @MainActor
-    private func flags(_ names: [String]?) -> NSEvent.ModifierFlags {
-        var flags: NSEvent.ModifierFlags = []
-        for name in names ?? [] {
-            switch name {
-            case "cmd": flags.insert(.command)
-            case "shift": flags.insert(.shift)
-            case "ctrl": flags.insert(.control)
-            case "opt": flags.insert(.option)
-            default: break
+    private func armKeyBounceMonitor() {
+        guard keyBounceMonitor == nil else { return }
+        keyBounceMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            let consumed = MainActor.assumeIsolated { self.consumeKeyBounce(event) }
+            return consumed ? nil : event
+        }
+    }
+
+    @MainActor
+    private func afterPendingKeyEvents(_ view: PageView, _ done: @escaping () -> Void) {
+        func finished() {
+            keyResends.removeAll { $0.view === view }
+            done()
+        }
+        let selector = NSSelectorFromString("_doAfterProcessingAllPendingKeyEvents:")
+        guard view.responds(to: selector) else {
+            view.evaluateJavaScript("void 0") { _, _ in MainActor.assumeIsolated { finished() } }
+            return
+        }
+        typealias Completion = @convention(block) () -> Void
+        typealias Call = @convention(c) (AnyObject, Selector, Completion) -> Void
+        let completion: Completion = { MainActor.assumeIsolated { finished() } }
+        unsafeBitCast(view.method(for: selector), to: Call.self)(view, selector, completion)
+    }
+
+    @MainActor
+    private func consumeKeyBounce(_ event: NSEvent) -> Bool {
+        if let index = keyResends.firstIndex(where: {
+            $0.event.windowNumber == event.windowNumber && PageView.same($0.event, event)
+        }) {
+            let resend = keyResends.remove(at: index)
+            if let view = resend.view, view.window?.windowNumber == event.windowNumber,
+               let tab = browser.allTabs.first(where: { $0.id == resend.tabID }), tab.built === view,
+               granted(tab, resend.origin) {
+                _ = view.tryToPerform(resend.action, with: view)
             }
+            return true
+        }
+        if let window = event.window, Bench.shared.isRoom(window) { return true }
+        return Drive.injected.contains {
+            $0.type == .keyDown && $0.windowNumber == event.windowNumber && PageView.same($0, event)
+        }
+    }
+
+    @MainActor
+    private func modifierFlag(_ name: String) -> NSEvent.ModifierFlags? {
+        switch name.lowercased() {
+        case "cmd", "meta": return .command
+        case "shift": return .shift
+        case "ctrl": return .control
+        case "opt", "alt": return .option
+        default: return nil
+        }
+    }
+
+    @MainActor
+    private func flags(_ raw: Any?) -> NSEvent.ModifierFlags? {
+        guard let raw else { return [] }
+        guard let names = raw as? [String] else { return nil }
+        var flags: NSEvent.ModifierFlags = []
+        for name in names {
+            guard let flag = modifierFlag(name) else { return nil }
+            flags.insert(flag)
         }
         return flags
     }
@@ -1725,46 +2378,83 @@ final class Drive: Driving {
     /// keymap's: same named keys, same digits, so a press lands the same with
     /// or without a driver in the page.
     @MainActor
-    private func keyFor(_ name: String) -> (UInt16, String) {
-        switch name.lowercased() {
-        case "enter", "return": return (36, "\r")
-        case "tab": return (48, "\t")
-        case "escape", "esc": return (53, "\u{1B}")
-        case "backspace": return (51, "\u{7F}")
-        case "delete": return (117, "\u{F728}")
-        case "space": return (49, " ")
-        case "arrowup", "up": return (126, "\u{F700}")
-        case "arrowdown", "down": return (125, "\u{F701}")
-        case "arrowleft", "left": return (123, "\u{F702}")
-        case "arrowright", "right": return (124, "\u{F703}")
-        case "home": return (115, "\u{F729}")
-        case "end": return (119, "\u{F72B}")
-        case "pageup": return (116, "\u{F72C}")
-        case "pagedown": return (121, "\u{F72D}")
-        case "f1": return (122, "\u{F704}")
-        case "f2": return (120, "\u{F705}")
-        case "f3": return (99, "\u{F706}")
-        case "f4": return (118, "\u{F707}")
-        case "f5": return (96, "\u{F708}")
-        case "f6": return (97, "\u{F709}")
-        case "f7": return (98, "\u{F70A}")
-        case "f8": return (100, "\u{F70B}")
-        case "f9": return (101, "\u{F70C}")
-        case "f10": return (109, "\u{F70D}")
-        case "f11": return (103, "\u{F70E}")
-        case "f12": return (111, "\u{F70F}")
-        default:
-            let character = name.first ?? " "
-            // Digits have their own key codes; letters and the rest go
-            // through bench's table (space where it has no answer).
-            let digits: [Character: UInt16] = ["1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25, "0": 29]
-            return (digits[character] ?? Bench.keyCode(for: character), String(character))
+    private func keyFor(_ rawName: String, flags rawFlags: NSEvent.ModifierFlags) -> (UInt16, String, NSEvent.ModifierFlags)? {
+        let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = rawName.count == 1 ? [rawName] : trimmed.split(separator: "+", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty }) else { return nil }
+        var flags = rawFlags
+        var explicitShift = flags.contains(.shift)
+        for name in parts.dropLast() {
+            guard let flag = modifierFlag(name) else { return nil }
+            flags.insert(flag)
+            explicitShift = explicitShift || flag == .shift
+        }
+        let name = parts.last!
+        let key: (UInt16, String)
+        switch name.lowercased() {
+        case "enter", "return": key = (36, "\r")
+        case "tab": key = (48, "\t")
+        case "escape", "esc": key = (53, "\u{1B}")
+        case "backspace": key = (51, "\u{7F}")
+        case "delete", "del": key = (117, "\u{F728}")
+        case " ", "space", "spacebar": key = (49, " ")
+        case "arrowup", "up": key = (126, "\u{F700}")
+        case "arrowdown", "down": key = (125, "\u{F701}")
+        case "arrowleft", "left": key = (123, "\u{F702}")
+        case "arrowright", "right": key = (124, "\u{F703}")
+        case "home": key = (115, "\u{F729}")
+        case "end": key = (119, "\u{F72B}")
+        case "pageup": key = (116, "\u{F72C}")
+        case "pagedown": key = (121, "\u{F72D}")
+        case "f1": key = (122, "\u{F704}")
+        case "f2": key = (120, "\u{F705}")
+        case "f3": key = (99, "\u{F706}")
+        case "f4": key = (118, "\u{F707}")
+        case "f5": key = (96, "\u{F708}")
+        case "f6": key = (97, "\u{F709}")
+        case "f7": key = (98, "\u{F70A}")
+        case "f8": key = (100, "\u{F70B}")
+        case "f9": key = (101, "\u{F70C}")
+        case "f10": key = (109, "\u{F70D}")
+        case "f11": key = (103, "\u{F70E}")
+        case "f12": key = (111, "\u{F70F}")
+        default:
+            guard name.count == 1, let character = name.first, character.isASCII else { return nil }
+            let digits: [Character: UInt16] = ["1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25, "0": 29]
+            let punctuation: [Character: UInt16] = [";": 41, "=": 24, ",": 43, "-": 27, ".": 47, "/": 44,
+                                                     "`": 50, "[": 33, "\\": 42, "]": 30, "'": 39]
+            let shifted: [Character: UInt16] = ["!": 18, "@": 19, "#": 20, "$": 21, "%": 23, "^": 22, "&": 26,
+                "*": 28, "(": 25, ")": 29, ":": 41, "+": 24, "<": 43, "_": 27, ">": 47, "?": 44,
+                "~": 50, "{": 33, "|": 42, "}": 30, "\"": 39]
+            if let code = shifted[character] {
+                flags.insert(.shift)
+                key = (code, String(character))
+            } else if character.isLetter {
+                let commandish = flags.contains(.command) || flags.contains(.control) || flags.contains(.option)
+                let wantsShift = explicitShift || (character.isUppercase && !commandish)
+                if wantsShift { flags.insert(.shift) }
+                let chars = wantsShift ? String(character).uppercased() : String(character).lowercased()
+                key = (Bench.keyCode(for: character), chars)
+            } else if let code = digits[character] ?? punctuation[character] {
+                let shiftedDigit: [Character: Character] = ["1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&", "8": "*", "9": "(", "0": ")"]
+                let chars = flags.contains(.shift) ? String(shiftedDigit[character] ?? character) : String(character)
+                key = (code, chars)
+            } else {
+                return nil
+            }
+        }
+        return (key.0, key.1, flags)
     }
 
     @MainActor
     private func click(_ args: [String: Any], _ done: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
         let tier = args["tier"] as? String ?? "auto"
+        guard flags(args["modifiers"]) != nil else {
+            done(["error": "act.click modifiers must be a list of cmd, meta, shift, ctrl, or alt", "code": "INVALID_ARGUMENT"])
+            return
+        }
         if tier == "js" { actJS("act.click", args, done, from: origin); return }
         guard let tab = own(args, done, origin), let view = view(of: tab, done) else { return }
         let q = query("click", args)
@@ -1775,14 +2465,15 @@ final class Drive: Driving {
         // the point back rather than clicking: the trusted part is ours.
         callArgs["_guardFingerprint"] = args["_guardFingerprint"]
         callArgs["_guardOp"] = args["_guardOp"]
-        drive(view, guardCall("act.click", callArgs, query: q, verb: "click"), mutating: true) { [weak self] out in
+        drive(view, guardCall("act.click", callArgs, query: q, verb: "click"), mutating: true,
+              cancellationToken: args["_cancelToken"] as? String) { [weak self] out in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if self.cancelled(args, done) { return }
                 if let at = (out["at"] as? [Any])?.compactMap({ ($0 as? NSNumber)?.doubleValue }),
                    (out["handoff"] as? String) == "event" {
                     self.validateGuard(view, args, done, at: at) {
-                        self.handClick(view, out: out, at: at, args: args, done)
+                        self.handClick(view, tab: tab, from: origin, out: out, at: at, args: args, done)
                     }
                     return
                 }
@@ -1790,7 +2481,7 @@ final class Drive: Driving {
                 if missing, args["_guardFingerprint"] == nil, q["ref"] == nil, q["loc"] == nil {
                     // No driver in the page — but css/text are locators the
                     // bench's own finder can still take to a point.
-                    self.clickResolved(view, q, args: args, done)
+                    self.clickResolved(view, tab: tab, from: origin, q, args: args, done)
                 } else {
                     done(out)
                 }
@@ -1801,43 +2492,379 @@ final class Drive: Driving {
     /// A handoff or escalation answer became a real click: down and up at the
     /// point the driver proved out, with its button/double/modifiers.
     @MainActor
-    private func handClick(_ view: PageView, out: [String: Any], at: [Double], args: [String: Any], _ done: @escaping ([String: Any]) -> Void) {
-        let flags = flags((out["modifiers"] as? [String]) ?? args["modifiers"] as? [String])
-        let clicks = (out["double"] as? Bool ?? args["double"] as? Bool) == true ? 2 : 1
-        if let error = mouse(view, at: at, button: out["button"] as? String ?? args["button"] as? String ?? "left", clicks: clicks, flags: flags) {
-            done(["error": error])
+    private func handClick(_ view: PageView, tab: Tab, from origin: DriveOrigin, out: [String: Any], at: [Double],
+                           args: [String: Any], _ done: @escaping ([String: Any]) -> Void) {
+        guard let flags = flags(out["modifiers"] ?? args["modifiers"]) else {
+            done(["error": "act.click modifiers must be a list of cmd, meta, shift, ctrl, or alt", "code": "INVALID_ARGUMENT"])
             return
         }
-        var reply = out
-        reply["ok"] = true
-        reply["tier"] = "event"
-        reply["handoff"] = nil
-        reply["at"] = at.map { Int($0) }
-        reply["navChanged"] = nil
-        if args["withSnapshot"] as? Bool == true {
-            drive(view, "function (d) { return d.snapshot({}); }") { snapshot in
-                if let tree = snapshot["snapshot"] { reply["snapshot"] = tree }
-                if let error = snapshot["error"] { reply["snapshotError"] = error }
-                done(reply)
+        let clicks = (out["double"] as? Bool ?? args["double"] as? Bool) == true ? 2 : 1
+        mouse(view, tab: tab, at: at, button: out["button"] as? String ?? args["button"] as? String ?? "left", clicks: clicks, flags: flags,
+              origin: origin, args: args) { error, dialogPending, cancelled in
+            MainActor.assumeIsolated {
+                if cancelled { done(["error": "tab ownership or page changed", "code": "CANCELLED"]); return }
+                if let error { done(error); return }
+                if self.cancelled(args, done) { return }
+                guard self.granted(tab, origin), tab.built === view else {
+                    done(["error": "tab ownership or page changed", "code": "CANCELLED"])
+                    return
+                }
+                var reply = out
+                reply["ok"] = true
+                reply["tier"] = "event"
+                reply["handoff"] = nil
+                reply["at"] = at.map { Int($0) }
+                reply["navChanged"] = nil
+                if dialogPending {
+                    reply["dialogPending"] = true
+                    if args["withSnapshot"] as? Bool == true { reply["snapshotError"] = "snapshot unavailable while a page dialog is pending" }
+                    done(reply)
+                    return
+                }
+                if args["withSnapshot"] as? Bool == true {
+                    self.drive(view, self.postSnapshotCall(args),
+                               cancellationToken: args["_cancelToken"] as? String) { snapshot in
+                        if self.cancelled(args, done) { return }
+                        guard self.granted(tab, origin), tab.built === view else {
+                            done(["error": "tab ownership or page changed", "code": "CANCELLED"])
+                            return
+                        }
+                        if let tree = snapshot["snapshot"] {
+                            reply["snapshot"] = tree
+                            reply["snapshotTruncated"] = snapshot["truncated"] ?? false
+                            reply["snapshotVersion"] = snapshot["version"]
+                        }
+                        if let error = snapshot["error"] { reply["snapshotError"] = error }
+                        done(reply)
+                    }
+                } else { done(reply) }
             }
-        } else { done(reply) }
+        }
     }
 
     /// The event tier with no driver to ask: bench's finder takes a css/text
     /// locator to a point, and the click lands for real.
     @MainActor
-    private func clickResolved(_ view: PageView, _ q: [String: Any], args: [String: Any], _ done: @escaping ([String: Any]) -> Void) {
-        point(view, q) { at, error in
+    private func clickResolved(_ view: PageView, tab: Tab, from origin: DriveOrigin, _ q: [String: Any],
+                               args: [String: Any], _ done: @escaping ([String: Any]) -> Void) {
+        point(view, q, cancellationToken: args["_cancelToken"] as? String) { at, error in
             MainActor.assumeIsolated {
                 if self.cancelled(args, done) { return }
                 guard let at else { done(["error": error ?? "nothing to click"]); return }
-                let flags = self.flags(args["modifiers"] as? [String])
-                let clicks = (args["double"] as? Bool == true) ? 2 : 1
-                if let error = self.mouse(view, at: at, button: args["button"] as? String ?? "left", clicks: clicks, flags: flags) {
-                    done(["error": error])
+                guard let flags = self.flags(args["modifiers"]) else {
+                    done(["error": "act.click modifiers must be a list of cmd, meta, shift, ctrl, or alt", "code": "INVALID_ARGUMENT"])
                     return
                 }
-                done(["ok": true, "at": at.map { Int($0) }, "tier": "event"])
+                let clicks = (args["double"] as? Bool == true) ? 2 : 1
+                self.mouse(view, tab: tab, at: at, button: args["button"] as? String ?? "left", clicks: clicks, flags: flags,
+                           origin: origin, args: args) { error, dialogPending, cancelled in
+                    MainActor.assumeIsolated {
+                        if cancelled { done(["error": "tab ownership or page changed", "code": "CANCELLED"]); return }
+                        if let error { done(error); return }
+                        if self.cancelled(args, done) { return }
+                        guard self.granted(tab, origin), tab.built === view else {
+                            done(["error": "tab ownership or page changed", "code": "CANCELLED"])
+                            return
+                        }
+                        var reply: [String: Any] = ["ok": true, "at": at.map { Int($0) }, "tier": "event"]
+                        if dialogPending { reply["dialogPending"] = true }
+                        guard args["withSnapshot"] as? Bool == true else { done(reply); return }
+                        if dialogPending {
+                            reply["snapshotError"] = "snapshot unavailable while a page dialog is pending"
+                            done(reply)
+                            return
+                        }
+                        self.drive(view, self.postSnapshotCall(args),
+                                   cancellationToken: args["_cancelToken"] as? String) { snapshot in
+                            if self.cancelled(args, done) { return }
+                            guard self.granted(tab, origin), tab.built === view else {
+                                done(["error": "tab ownership or page changed", "code": "CANCELLED"])
+                                return
+                            }
+                            if let tree = snapshot["snapshot"] {
+                                reply["snapshot"] = tree
+                                reply["snapshotTruncated"] = snapshot["truncated"] ?? false
+                                reply["snapshotVersion"] = snapshot["version"]
+                            }
+                            if let error = snapshot["error"] { reply["snapshotError"] = error }
+                            done(reply)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func drag(_ args: [String: Any], _ done: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
+        guard let tab = own(args, done, origin), let view = view(of: tab, done) else { return }
+        guard let flags = flags(args["modifiers"]) else {
+            done(["error": "act.drag modifiers must be a list of cmd, meta, shift, ctrl, or alt", "code": "INVALID_ARGUMENT"])
+            return
+        }
+        let holdMs: Int
+        if let raw = args["holdMs"] {
+            guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
+                  (0...2000).contains(number.doubleValue) else {
+                done(["error": "act.drag holdMs must be an integer from 0 to 2000", "code": "INVALID_ARGUMENT"]); return
+            }
+            holdMs = number.intValue
+        } else { holdMs = 0 }
+        let steps: Int
+        if let raw = args["steps"] as? NSNumber {
+            let value = raw.doubleValue
+            guard value.isFinite, value.rounded() == value, (1...64).contains(value) else {
+                done(["error": "act.drag steps must be an integer from 1 to 64", "code": "INVALID_ARGUMENT"]); return
+            }
+            steps = Int(value)
+        } else { steps = 8 }
+        let q = query("drag", args)
+        drive(view, guardCall("act.drag", args, query: q, verb: "drag"), mutating: true,
+              cancellationToken: args["_cancelToken"] as? String) { [weak self] out in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.cancelled(args, done) { return }
+                guard out["error"] == nil,
+                      let start = (out["from"] as? [Any])?.compactMap({ ($0 as? NSNumber)?.doubleValue }), start.count == 2,
+                      let end = (out["to"] as? [Any])?.compactMap({ ($0 as? NSNumber)?.doubleValue }), end.count == 2,
+                      (start + end).allSatisfy(\.isFinite), out["handoff"] as? String == "drag" else {
+                    done(out["error"] == nil ? ["error": "drive.js did not prepare a drag", "code": "ERROR"] : out)
+                    return
+                }
+                self.validateGuard(view, args, done) {
+                    AgentCursor.shared.approach(tab.id, in: view, to: start, word: "Drag") {
+                        MainActor.assumeIsolated {
+                            if self.cancelled(args, done) { return }
+                            guard self.granted(tab, origin), tab.built === view else {
+                                done(["error": "tab ownership or page changed", "code": "CANCELLED"])
+                                return
+                            }
+                            view.window?.makeFirstResponder(view)
+                            self.nativeDrag(view, tab: tab, from: origin, start: start, to: end, steps: steps, path: args["path"], holdMs: holdMs,
+                                            flags: flags, args: args) { result in
+                                var reply = out
+                                reply["ok"] = result["error"] == nil
+                                reply["tier"] = "event"
+                                reply["from"] = start.map { Int($0) }
+                                reply["to"] = end.map { Int($0) }
+                                reply["steps"] = steps
+                                reply["holdMs"] = holdMs
+                                reply["handoff"] = nil
+                                for (key, value) in result { reply[key] = value }
+                                done(reply)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func nativeDrag(_ view: PageView, tab: Tab, from origin: DriveOrigin,
+                            start: [Double], to end: [Double], steps: Int,
+                            path rawPath: Any?,
+                            holdMs: Int,
+                            flags: NSEvent.ModifierFlags, args: [String: Any],
+                            done: @escaping ([String: Any]) -> Void) {
+        guard let window = view.window else { done(["error": "the tab's view has no window"]); return }
+        var targets: [[Double]] = []
+        var pace = 0.008
+        var mouseDown = false
+        func spot(_ p: [Double]) -> NSPoint {
+            let local = NSPoint(x: p[0], y: view.isFlipped ? p[1] : view.bounds.height - p[1])
+            return view.convert(local, to: nil)
+        }
+        func send(_ type: NSEvent.EventType, _ p: [Double], pressure: Swift.Float) -> Bool {
+            let simulate = NSSelectorFromString("_simulateMouseMove:")
+            let setCurrent = NSSelectorFromString("_setCurrentEvent:")
+            if type == .mouseMoved && (!view.responds(to: simulate) || !NSApp.responds(to: setCurrent)) { return false }
+            nativeMouseEventNumber &+= 1
+            guard let event = NSEvent.mouseEvent(with: type, location: spot(p), modifierFlags: flags,
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: NSGraphicsContext.current, eventNumber: nativeMouseEventNumber,
+                clickCount: type == .mouseMoved ? 0 : 1, pressure: pressure) else { return false }
+            var deliveredEvent = event
+            if type == .mouseMoved {
+                guard let cgEvent = event.cgEvent else { return false }
+                cgEvent.setIntegerValueField(.mouseEventDeltaX,
+                                             value: Int64((p[0] - Double(view.syntheticMousePoint.x)).rounded()))
+                cgEvent.setIntegerValueField(.mouseEventDeltaY,
+                                             value: Int64((p[1] - Double(view.syntheticMousePoint.y)).rounded()))
+                guard let rebuilt = NSEvent(cgEvent: cgEvent) else { return false }
+                deliveredEvent = rebuilt
+            }
+            Drive.note(deliveredEvent)
+            Drive.injecting += 1
+            defer { Drive.injecting -= 1 }
+            if type == .leftMouseDown {
+                mouseDown = true
+                AgentCursor.shared.hold(tab.id, true)
+                AgentCursor.shared.trace(tab.id, through: targets, over: pace * Double(targets.count))
+            } else if type == .leftMouseUp {
+                mouseDown = false
+                AgentCursor.shared.hold(tab.id, false)
+            }
+            let held: UInt = type == .leftMouseUp || type == .mouseMoved ? 0 : 1
+            SyntheticMouseButtons.with(held) {
+                switch type {
+                case .mouseMoved:
+                    let currentEvent = NSApp.currentEvent
+                    typealias SetCurrentEvent = @convention(c) (AnyObject, Selector, NSEvent?) -> Void
+                    typealias SimulateMouseMove = @convention(c) (AnyObject, Selector, NSEvent) -> Void
+                    let setCurrentEvent = unsafeBitCast(NSApp.method(for: setCurrent), to: SetCurrentEvent.self)
+                    let simulateMouseMove = unsafeBitCast(view.method(for: simulate), to: SimulateMouseMove.self)
+                    setCurrentEvent(NSApp, setCurrent, deliveredEvent)
+                    defer { setCurrentEvent(NSApp, setCurrent, currentEvent) }
+                    simulateMouseMove(view, simulate, deliveredEvent)
+                case .leftMouseDown: view.mouseDown(with: event)
+                case .leftMouseDragged: view.mouseDragged(with: event)
+                case .leftMouseUp: view.mouseUp(with: event)
+                default: break
+                }
+            }
+            view.syntheticMousePoint = NSPoint(x: p[0], y: p[1])
+            return true
+        }
+        if let rawPath {
+            guard let points = rawPath as? [[Any]], points.count <= 128 else {
+                done(["error": "drag path must contain at most 128 viewport points", "code": "INVALID_ARGUMENT"]); return
+            }
+            for point in points {
+                guard point.count == 2, let x = (point[0] as? NSNumber)?.doubleValue,
+                      let y = (point[1] as? NSNumber)?.doubleValue, x.isFinite, y.isFinite,
+                      x >= 0, y >= 0, x < view.bounds.width, y < view.bounds.height else {
+                    done(["error": "drag path points must be finite coordinates inside the viewport", "code": "INVALID_ARGUMENT"]); return
+                }
+                targets.append([x, y])
+            }
+            targets.append(end)
+        } else {
+            targets = (1...steps).map { index in
+                let fraction = Double(index) / Double(steps)
+                return [start[0] + (end[0] - start[0]) * fraction,
+                        start[1] + (end[1] - start[1]) * fraction]
+            }
+        }
+        pace = AgentCursor.shared.dragPace(tab.id, in: view, steps: targets.count)
+        var finalResult: [String: Any] = [:]
+        var step = 0
+        var current = start
+        var holdUntil: TimeInterval?
+        let ack = MouseAck(view: view, origin: origin) { dialogPending, cancelled in
+            // A watcher may finish before the next movement or hold tick.
+            if mouseDown { _ = send(.leftMouseUp, current, pressure: 0.0) }
+            AgentCursor.shared.hold(tab.id, false)
+            var result = finalResult
+            if dialogPending { result["dialogPending"] = true }
+            if cancelled {
+                done(["error": "tab ownership or page changed", "code": "CANCELLED"])
+                return
+            }
+            if result["error"] == nil {
+                if self.cancelled(args, { _ in }) {
+                    done(["error": "drag cancelled", "code": "GUARD_CANCELLED", "guardStopped": true])
+                    return
+                }
+                guard self.granted(tab, origin), tab.built === view, view.window === window else {
+                    done(["error": "tab ownership or page changed", "code": "CANCELLED"])
+                    return
+                }
+            }
+            done(result)
+        }
+        guard ack.watch() else {
+            done(["error": "a page dialog is already pending", "code": "DIALOG_PENDING"])
+            return
+        }
+        func finish(_ point: [Double], result: [String: Any]) {
+            finalResult = result
+            if !send(.leftMouseUp, point, pressure: 0.0), finalResult["error"] == nil {
+                finalResult = ["error": "could not create drag release event", "code": "ERROR"]
+            }
+            ack.wait()
+        }
+        guard send(.mouseMoved, start, pressure: 0.0) else {
+            finalResult = ["error": "could not create drag origin event", "code": "ERROR"]
+            ack.finish(dialogPending: false)
+            return
+        }
+        func advance() {
+            MainActor.assumeIsolated {
+                if ack.finished {
+                    if mouseDown { _ = send(.leftMouseUp, current, pressure: 0.0) }
+                    return
+                }
+                if ack.dialogPending {
+                    finish(current, result: [:])
+                    return
+                }
+                if self.cancelled(args, { _ in }) {
+                    finish(current, result: ["error": "drag cancelled", "code": "GUARD_CANCELLED", "guardStopped": true])
+                    return
+                }
+                guard self.granted(tab, origin), tab.built === view, view.window === window else {
+                    finish(current, result: ["error": "tab ownership or page changed", "code": "CANCELLED"])
+                    return
+                }
+                guard step < targets.count else {
+                    if let holdUntil {
+                        let remaining = holdUntil - ProcessInfo.processInfo.systemUptime
+                        if remaining > 0 {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + min(0.016, remaining), execute: advance)
+                            return
+                        }
+                    }
+                    finish(current, result: [:])
+                    return
+                }
+                let point = targets[step]
+                guard send(.leftMouseDragged, point, pressure: 1.0) else {
+                    finish(current, result: ["error": "could not create drag event"])
+                    return
+                }
+                current = point
+                step += 1
+                if step == targets.count && holdMs > 0 {
+                    holdUntil = ProcessInfo.processInfo.systemUptime + Double(holdMs) / 1000
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + pace, execute: advance)
+            }
+        }
+        ack.afterPendingMouseEvents {
+            guard !ack.finished else { return }
+            view.callAsyncJavaScript("return await new Promise(resolve => setTimeout(resolve, 32));",
+                                     arguments: [:], in: nil, in: .page) { result in
+                MainActor.assumeIsolated {
+                    ack.continueAfterWait {
+                        if case .failure(let error) = result {
+                            finalResult = ["error": "could not prepare drag origin", "code": "ERROR", "detail": error.localizedDescription]
+                            ack.finish(dialogPending: false)
+                            return
+                        }
+                        if ack.dialogPending {
+                            ack.finish(dialogPending: true)
+                            return
+                        }
+                        if self.cancelled(args, { _ in }) {
+                            finalResult = ["error": "drag cancelled", "code": "GUARD_CANCELLED", "guardStopped": true]
+                            ack.finish(dialogPending: false)
+                            return
+                        }
+                        guard self.granted(tab, origin), tab.built === view, view.window === window else {
+                            finalResult = ["error": "tab ownership or page changed", "code": "CANCELLED"]
+                            ack.finish(dialogPending: false)
+                            return
+                        }
+                        guard send(.leftMouseDown, start, pressure: 1.0) else {
+                            finalResult = ["error": "could not create drag event", "code": "ERROR"]
+                            ack.finish(dialogPending: false)
+                            return
+                        }
+                        advance()
+                    }
+                }
             }
         }
     }
@@ -1851,10 +2878,11 @@ final class Drive: Driving {
         // input handling. 16ms is a frame: fast enough to feel typed, slow
         // enough for each event to land before the next is handed over.
         let pace = max((args["delay"] as? NSNumber)?.doubleValue ?? 0, 16) / 1000
-        focus(view, query("type", args)) { error in
+        focus(view, query("type", args), cancellationToken: args["_cancelToken"] as? String) { error, at in
             MainActor.assumeIsolated {
                 if self.cancelled(args, done) { return }
                 if let error { done(["error": error]); return }
+                AgentCursor.shared.glide(tab.id, to: at, word: "Typing")
                 view.window?.makeFirstResponder(view)
                 let characters = Array(text)
                 var sent = 0
@@ -1870,12 +2898,27 @@ final class Drive: Driving {
                             return
                         }
                         if sent >= characters.count {
-                            done(["ok": true, "typed": text])
+                            self.afterPendingKeyEvents(view) {
+                                MainActor.assumeIsolated {
+                                    if self.cancelled(args, { result in
+                                        var result = result
+                                        result["typedCount"] = sent
+                                        done(result)
+                                    }) { return }
+                                    guard self.granted(tab, origin), tab.built === view else {
+                                        done(["error": "tab ownership or page changed", "code": "CANCELLED", "typedCount": sent])
+                                        return
+                                    }
+                                    done(["ok": true, "typed": text])
+                                }
+                            }
                             return
                         }
                         let character = characters[sent]
                         sent += 1
-                        self.key(view, code: Bench.keyCode(for: character), chars: String(character), flags: [])
+                        AgentCursor.shared.key(tab.id)
+                        self.key(view, code: Bench.keyCode(for: character), chars: String(character), flags: [],
+                                 tabID: tab.id, origin: origin)
                         DispatchQueue.main.asyncAfter(deadline: .now() + pace) { next() }
                     }
                 }
@@ -1888,31 +2931,65 @@ final class Drive: Driving {
     private func press(_ args: [String: Any], _ done: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
         guard let tab = own(args, done, origin), let view = view(of: tab, done) else { return }
         guard let name = args["key"] as? String else { done(["error": "act.press needs key"]); return }
-        let (code, chars) = keyFor(name)
-        let mflags = flags(args["modifiers"] as? [String])
+        guard let mflags = flags(args["modifiers"]) else {
+            done(["error": "act.press modifiers must be a list of cmd, meta, shift, ctrl, or alt", "code": "INVALID_ARGUMENT"])
+            return
+        }
+        guard let (code, chars, mflags) = keyFor(name, flags: mflags) else {
+            done(["error": "act.press has an unknown key or modifier: \(name)", "code": "INVALID_ARGUMENT"])
+            return
+        }
         // A locator, when one came, gets the focus first — Enter on a field
         // is a different press from Enter on the page.
-        focus(view, query("press", args)) { error in
+        focus(view, query("press", args), cancellationToken: args["_cancelToken"] as? String) { error, at in
             MainActor.assumeIsolated {
                 if self.cancelled(args, done) { return }
                 if let error { done(["error": error]); return }
+                AgentCursor.shared.glide(tab.id, to: at, word: Drive.keyWord(name, modifiers: args["modifiers"]))
                 view.window?.makeFirstResponder(view)
                 self.validateGuard(view, args, done) {
-                    self.key(view, code: code, chars: chars, flags: mflags)
-                    done(["ok": true, "key": name])
+                    self.key(view, code: code, chars: chars, flags: mflags, tabID: tab.id, origin: origin)
+                    // WebKit finishes the native editing action before the next op can move focus.
+                    self.afterPendingKeyEvents(view) {
+                        MainActor.assumeIsolated {
+                            if self.cancelled(args, done) { return }
+                            guard self.granted(tab, origin), tab.built === view else {
+                                done(["error": "tab ownership or page changed", "code": "CANCELLED"])
+                                return
+                            }
+                            done(["ok": true, "key": name])
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private static func keyWord(_ name: String, modifiers: Any?) -> String {
+        let marks: [String: String] = ["cmd": "⌘", "meta": "⌘", "shift": "⇧", "ctrl": "⌃", "opt": "⌥", "alt": "⌥"]
+        let held = ((modifiers as? [String]) ?? []).compactMap { marks[$0.lowercased()] }.joined()
+        let keys: [String: String] = ["enter": "Return", "return": "Return", "tab": "Tab", "escape": "Esc", "esc": "Esc",
+                                      "backspace": "Delete", "arrowup": "↑", "arrowdown": "↓", "arrowleft": "←",
+                                      "arrowright": "→", " ": "Space", "space": "Space"]
+        let shown = keys[name.lowercased()] ?? (name.count == 1 ? name.uppercased() : name)
+        return "Press " + held + shown
     }
 
     @MainActor
     private func clickAt(_ args: [String: Any], _ done: @escaping ([String: Any]) -> Void, from origin: DriveOrigin) {
         guard let tab = own(args, done, origin), let view = view(of: tab, done) else { return }
         guard let x = (args["x"] as? NSNumber)?.doubleValue, let y = (args["y"] as? NSNumber)?.doubleValue else {
-            done(["error": "act.clickAt needs x and y"])
+            done(["error": "act.clickAt needs finite x and y coordinates", "code": "INVALID_ARGUMENT"])
             return
         }
-        let flags = flags(args["modifiers"] as? [String])
+        if let error = mousePointError(view, [x, y]) {
+            done(error)
+            return
+        }
+        guard let flags = flags(args["modifiers"]) else {
+            done(["error": "act.clickAt modifiers must be a list of cmd, meta, shift, ctrl, or alt", "code": "INVALID_ARGUMENT"])
+            return
+        }
         let clicks = (args["double"] as? Bool == true) ? 2 : 1
         // What's there is worth knowing even though the tier needs nothing
         // page-side — the driver describes whatever the point lands on.
@@ -1921,17 +2998,26 @@ final class Drive: Driving {
           var el = document.elementFromPoint ? document.elementFromPoint(\(x), \(y)) : null;
           return { element: el && d._describe ? d._describe(el) : null };
         }
-        """) { out in
+        """, cancellationToken: args["_cancelToken"] as? String) { out in
             MainActor.assumeIsolated {
                 if self.cancelled(args, done) { return }
                 self.validateGuard(view, args, done) {
-                if let error = self.mouse(view, at: [x, y], button: args["button"] as? String ?? "left", clicks: clicks, flags: flags) {
-                    done(["error": error])
-                    return
-                }
-                var reply: [String: Any] = ["ok": true, "at": [Int(x), Int(y)], "tier": "event"]
-                if let element = out["element"], !(element is NSNull) { reply["element"] = element }
-                done(reply)
+                    self.mouse(view, tab: tab, at: [x, y], button: args["button"] as? String ?? "left", clicks: clicks, flags: flags,
+                               origin: origin, args: args) { error, dialogPending, cancelled in
+                        MainActor.assumeIsolated {
+                            if cancelled { done(["error": "tab ownership or page changed", "code": "CANCELLED"]); return }
+                            if let error { done(error); return }
+                            if self.cancelled(args, done) { return }
+                            guard self.granted(tab, origin), tab.built === view else {
+                                done(["error": "tab ownership or page changed", "code": "CANCELLED"])
+                                return
+                            }
+                            var reply: [String: Any] = ["ok": true, "at": [Int(x), Int(y)], "tier": "event"]
+                            if dialogPending { reply["dialogPending"] = true }
+                            if let element = out["element"], !(element is NSNull) { reply["element"] = element }
+                            done(reply)
+                        }
+                    }
                 }
             }
         }
@@ -1965,16 +3051,40 @@ final class Drive: Driving {
     /// falls back to send needs the seat just the same.
     @MainActor
     private func ask(_ args: [String: Any], _ done: ([String: Any]) -> Void) {
+        if args["status"] as? Bool == true {
+            let mind = Mind.shared
+            let chat = mind.current
+            let chatID = mind.currentID
+            let model = chat.map { $0.model.isEmpty ? mind.model.id : $0.model } ?? mind.model.id
+            let waiting = chatID != nil && ((mind.question?.chat == chatID) ||
+                mind.pendingApprovals.contains { $0.chat == chatID })
+            done([
+                "chat": chatID?.uuidString as Any? ?? NSNull(),
+                "running": chatID != nil && mind.runningChatID == chatID && mind.running,
+                "model": model,
+                "effort": chat?.effort as Any? ?? NSNull(),
+                "activity": chatID != nil && mind.runningChatID == chatID ? mind.activity : "",
+                "waiting": waiting
+            ])
+            return
+        }
         if let on = args["open"] as? Bool { Mind.shared.open = on }
         var reply: [String: Any] = ["open": Mind.shared.open]
         if args["new"] as? Bool == true {
+            guard !Mind.shared.running, Mind.shared.runningChatID == nil else {
+                reply["error"] = "stop the active Ask turn before starting a new chat"
+                reply["code"] = "CHAT_RUNNING"
+                done(reply)
+                return
+            }
             // A fresh chat per scenario — Mind.newChat also clears the
             // chips' grants, which is exactly the isolation the runner is
             // after (design/benchmarks.md §"the one code addition").
-            Mind.shared.newChat()
-            appChat = Mind.shared.currentID    // nil until the next send
+            let chat = Mind.shared.newChatForAgent()
+            appChat = chat
             reply["ok"] = true
             reply["newChat"] = true
+            reply["chat"] = chat.uuidString
         }
         if let text = args["send"] as? String {
             // Mind.send lets a blank fall on the floor — say so rather

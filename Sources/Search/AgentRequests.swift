@@ -80,7 +80,7 @@ final class AgentRequests {
         receipt.error = (reply["error"] as? String).map { String($0.prefix(512)) }
         receipt.typedCount = reply["typedCount"] as? Int
         receipt.outcome = reply["outcome"] as? String == "unknown" ? "unknown"
-            : reply["code"] as? String == "CANCELLED" ? "cancelled"
+            : ["CANCELLED", "GUARD_CANCELLED"].contains(reply["code"] as? String ?? "") ? "cancelled"
             : reply["error"] == nil ? "succeeded" : "failed"
         pending -= 1
         terminal.append(key)

@@ -12,6 +12,12 @@ import AppKit
 // which it is.
 enum Palette {
     static let ground = Color(nsColor: NS.ground)
+    static let floor = Color(nsColor: NS.floor)
+    /// The floor let through: the same grey as a tint, so a window that
+    /// isn't opaque shows the glass behind everything — the world, blurred
+    /// — rather than nothing at all (Settings › General › Opaque window).
+    static let glass = floor.opacity(0.5)
+    static let rim = Color(nsColor: NS.rim)
     static let ink = Color(nsColor: NS.ink)             // neutral-900 · neutral-100
     static let muted = Color(nsColor: NS.muted)         // neutral-500
     static let faint = Color(nsColor: NS.faint)         // neutral-300 · neutral-700
@@ -27,6 +33,8 @@ enum Palette {
     /// ink, a window's background — which want an NSColor and keep it.
     enum NS {
         static let ground = pair(1.0, 0.11)
+        static let floor = pair(0.945, 0.07)
+        static let rim = pair(0.87, 0.19)
         static let ink = pair(0.09, 0.93)
         static let muted = pair(0.55, 0.58)
         static let faint = pair(0.83, 0.32)
@@ -100,7 +108,7 @@ enum Metrics {
     /// traffic lights come down with the tabs — otherwise giving the row room
     /// to breathe just leaves it sitting below three buttons it used to line
     /// up with.
-    static let strip: CGFloat = 52
+    static let strip: CGFloat = 46
     /// Where the first tab starts. The traffic lights run from 19 to 79 —
     /// measured, not guessed — so this leaves them the same air on their right
     /// that the window gives them on their left.

@@ -129,7 +129,8 @@ struct AskPage: View {
             bindKeys()
         })
         .fluidDialog(isPresented: $switching, size: .lg, position: .top,
-                     showCloseButton: false) {
+                     topStyle: .palette,
+                     showCloseButton: false, panelPadding: 0, maxHeight: 440) {
             FluidCommandMenu(
                 items: switcherItems,
                 query: $switchQuery,
@@ -589,7 +590,7 @@ struct AskPage: View {
             FluidSidebarTrigger()
             AskTitleField(renameRequest: $renameRequest)
             if runningHere {
-                Ring(size: 9)
+                AskSpinner(size: 9)
             }
             Spacer(minLength: 0)
             if finding {
@@ -764,7 +765,7 @@ private struct FluidChatRow: View {
                     .foregroundStyle(FluidTone.mutedForeground)
             }
             if chat.id == mind.runningChatID {
-                Ring(size: 9)
+                AskSpinner(size: 9)
             } else if mind.question?.chat == chat.id {
                 Image(systemName: "questionmark.bubble")
                     .font(.system(size: 9, weight: .medium))

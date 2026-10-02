@@ -3,6 +3,10 @@
 socket's shell driver, one session per command.
 
     ./ask run FILE.py                run a Python program with a persistent `agent` SDK session
+    ./ask repl                       interactive Python session with a persistent `agent`
+    ./ask mcp                        MCP stdio server for an MCP host
+                                     includes drag paths and session artifacts;
+                                     see Runtime/ask/MCP.md for Guard approvals
     ./ask call OP JSON               one raw operation (use run for tab workflows)
     ./ask surface ID                 attach a consented tab, then keep it as a normal tab
     ./ask tabs                       every tab, yours and the agent's
@@ -149,6 +153,17 @@ def main(argv):
                     sys.exit("usage: ask run FILE.py")
                 import runpy
                 runpy.run_path(args[0], init_globals={"agent": a}, run_name="__main__")
+            elif verb == "repl":
+                if args:
+                    sys.exit("usage: ask repl")
+                import code
+                print("Search agent Python session. `agent` is connected; Ctrl-D exits.")
+                code.interact(banner="", local={"agent": a})
+            elif verb == "mcp":
+                if args:
+                    sys.exit("usage: ask mcp")
+                from search_mcp import MCPServer
+                MCPServer(a, sys.stdout).serve(sys.stdin)
             elif verb == "call":
                 if not 1 <= len(args) <= 2:
                     sys.exit("usage: ask call OP [JSON]")

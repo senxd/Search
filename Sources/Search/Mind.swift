@@ -229,11 +229,12 @@ struct AskChat: Codable, Identifiable, Equatable {
     /// ops, full asks never (design/permissions.md §1). Chat-scoped like
     /// the consent it steers; the composer's mode chip moves it.
     var mode = AskMode.guard
-    /// How hard the answering brain reasons — "off", "low", "medium",
-    /// "high" or the wires' "xhigh"/"max"; nil is "auto", the wire's own
-    /// call. Chat-scoped like the
-    /// mode; the composer's reasoning chip moves it, and the wire reads
-    /// it out of the job's chat.
+    /// How hard the answering brain reasons. nil is "auto", the model's
+    /// own default. A set value is a level the composer offered
+    /// ("none", "minimal", "low", "medium", "high", "xhigh", "max") or
+    /// the older word "off". Chat-scoped like the mode; the composer's
+    /// reasoning chip moves it. The wire does not send it raw —
+    /// AskChips.wireEffort maps it onto a level this model accepts.
     var effort: String? = nil
     /// The live turn's stamp (design/interaction.md §2): set on every
     /// send/retry, carried inside the job's chat, echoed on each event —
@@ -282,17 +283,19 @@ extension AskChat {
 struct AskModel: Codable, Equatable, Identifiable {
     var provider: String
     var model: String
-    var label: String { provider == "echo" ? "Echo" : model }
+    var label: String {
+        let tail = model.split(separator: "/").last.map(String.init) ?? model
+        return tail.split(separator: "-").map { word in
+            let part = String(word)
+            let upper = part.uppercased()
+            if ["GPT", "GLM", "AI", "REST"].contains(upper) { return upper }
+            return part.prefix(1).uppercased() + part.dropFirst()
+        }.joined(separator: " ").replacingOccurrences(of: "GPT ", with: "GPT-")
+            .replacingOccurrences(of: "GLM ", with: "GLM-")
+    }
     var id: String { "\(provider)/\(model)" }
 
-    /// What the composer's chip reads: the wire and the model's tail —
-    /// "openrouter/glm-5.3-flash". A provider that *is* the model
-    /// ("devin"/"devin", echo) needs no tail on it.
-    var readout: String {
-        provider == "echo" || provider == model
-            ? label
-            : "\(provider)/\(model.components(separatedBy: "/").last ?? model)"
-    }
+    var readout: String { label }
 
     /// Whether the wire takes a reasoning effort — the reasoning chip's
     /// whole case for showing (openrouter and codex carry one; a REST
@@ -545,6 +548,9 @@ final class Mind: ObservableObject {
     #endif
 
     init() {
+        if Store.settings.string(forKey: "ask.mode") == "read" {
+            Store.settings.set(AskMode.guard.rawValue, forKey: "ask.mode")
+        }
         chats = AskStore.list()
         currentID = chats.first?.id
     }
@@ -726,6 +732,21 @@ final class Mind: ObservableObject {
         pendingApprovals.removeAll()
         AskRuntime.drive?.perform("tabs.ungrantAll", [:], from: .app) { _ in }
         pushMode()
+    }
+
+    /// Start an empty, addressable chat for a local agent client. The UI's
+    /// normal `newChat()` stays lazy and creates a chat on first send.
+    func newChatForAgent() -> UUID {
+        newChat()
+        var chat = AskChat()
+        chat.model = model.id
+        chat.mode = AskMode(rawValue: Store.settings.string(forKey: "ask.mode") ?? "") ?? .guard
+        chat.effort = Store.settings.string(forKey: "ask.effort")
+        chats.insert(chat, at: 0)
+        currentID = chat.id
+        AskStore.save(chat)
+        pushMode()
+        return chat.id
     }
 
     func select(_ chat: AskChat) {

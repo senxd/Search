@@ -7,15 +7,26 @@ that turns some ops into approval cards.
 
 ## 1. Modes
 
-Three, matching Aside's recon names mapped to this codebase's vocabulary:
+Two modes: Confirm and Full. The Confirm wire value remains `guard`.
+
+Before each model round, the native host supplies the active seat's mode and
+the enabled action confirmation categories from user settings. Confirm explains
+which actions require approval and waits on the existing native approval cards.
+Full completes requested actions without action confirmation. Both modes honor
+explicit requests to leave a draft unsubmitted. Permission context is a read-only
+host message, outside the model's tool list; missing context stops inference.
+
+Task benchmarks use Full mode. Fresh benchmark worlds stage `ask.mode=full`,
+broad benchmark seats explicitly set their Drive session to Full, and MiniWoB
+checks the persisted preflight and task chats, including reused worlds. Tool
+profiles restrict capabilities and presentation; they do not select consent rules.
 
 ```swift
-enum AskMode: String, Codable { case read, guard, full }
+enum AskMode: String, Codable { case `guard`, full }
 ```
 
 | mode | meaning | analog |
 |---|---|---|
-| `read` | read-class ops only; everything else is refused, not asked | Aside `read-only`, Codex `--sandbox read-only` |
 | `guard` | reads+writes free; destructive and privileged ops ask | Aside `guard`, Codex `on-request` × `workspace-write` |
 | `full` | everything allowed (the grant door stays a door) | `danger-full-access` |
 
@@ -33,7 +44,7 @@ Where stored:
   in Settings › Ask beside the model picker (Settings.swift:403).
 
 UI: a capsule in the composer's bottom row next to ModelMenu (AskUI.swift:313)
-— shield icon + mode name, menu of three. The `.app` session's mode is *the
+— shield icon + mode name, menu of two. The `.app` session's mode is *the
 current chat's*: `Mind.select/send/newChat` push it into Drive
 (`drive.setMode(chat.mode, for: .app)`), the same push pattern `hear` uses.
 
@@ -85,8 +96,8 @@ case .ask(let card): parkApproval(card, finish);      // finish parked
 ```
 
 `Policy` (new `Sources/Search/AskPolicy.swift`, one file per concern):
-`check(op:mode:tab:) -> Verdict`. Verdict matrix: read allows `meta|read`;
-guard allows ≤`write`, asks on `destructive|privileged`, denies nothing;
+`check(op:mode:tab:) -> Verdict`. Confirm applies the configured guard categories;
+guard asks when any matching action category is enabled;
 full allows all but the door-bound ops (those stay refused by origin, not
 mode — a socket in `full` still can't `tabs.grant`). `always` decisions land
 as remembered rules: `[DriveOrigin: Set<AlwaysKey>]` where
@@ -115,7 +126,7 @@ leak page-side.
 
 **Socket sessions never block.** AgentSocket answers any op after a 30s
 patience timer and owns no UI; parked approvals can't ride a socket. If a
-socket session is in `guard`/`read`, `ask` verdicts resolve immediately to
+socket session is in `guard`, `ask` verdicts resolve immediately to
 `["error":"…needs approval — the wire can't be shown a card","code":"NEEDS_UI"]`.
 `full` default means today's tests (`ui.ask send`) are unaffected.
 
@@ -135,21 +146,19 @@ extensions, no history.
 
 | mode | agent-tab data store | op ceiling | asks? |
 |---|---|---|---|
-| `read` | `.nonPersistent()` — fresh forced | `read` ops | never |
 | `guard` | signed-in (today); `fresh:true` opt-in per `tabs.open` | ≤ write | destructive + privileged |
 | `full` | signed-in; `fresh` opt-in | all | never |
 
 The store is fixed in `Tab.init(configuration:)` before the view exists — so
 sandbox level is a **`tabs.open`-time property of the tab**, not a live
-session switch: `open()` computes `fresh = args["fresh"] ?? (mode == .read)`
+session switch: `open()` computes `fresh = args["fresh"] as? Bool == true`
 → `Tab(shy: fresh, bench: true)`. `tab.shy` is already the marker; no new
 flag. Chips compose cleanly: a granted user tab still reads signed-in
-content in `read` mode (the chip is consent for *that* tab) while fresh
+content with confirmation while fresh
 agent tabs stay logged-out.
 
 Downloads: `Browser.keep(_:)` gets the initiating tab via `tab(for:)`;
-bench tab whose holder session is `< full` → ask (guard) or
-`download.cancel()` (read).
+bench tab in Confirm mode asks for approval before a guarded download.
 
 Domain allowlists (v2 hook, cheap): derive a per-chat `allowedHosts` from
 the chips' origins + the first `page.go` host; off-list `page.go` on a user
@@ -195,8 +204,7 @@ ToolRows render:
 - Denied tool result: `{error:"denied by user — submit the form on
   acme.com", code:"DENIED"}`. System prompt gains one line: *"A denied call
   is the user's answer — say what you wanted and why; never retry it."*
-  Codes: `DENIED`, `NEEDS_UI`, `MODE` (op above ceiling: `"act.submit is
-  above read mode"`).
+  Codes include `GUARD_CANCELLED`, `GUARD_CHANGED`, and `NEEDS_UI`.
 - A steer landing during a pending card reaches the model after the card
   resolves. Deleting the chat kills grants *and* pendings — one lifetime.
 - Audit: every ask + verdict persists as note messages; `always` rules are

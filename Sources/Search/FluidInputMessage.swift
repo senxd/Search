@@ -78,7 +78,12 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
     var queue: Binding<[FluidQueuedMessage]>? = nil
     var status: FluidComposerStatus = .idle
     var disabled = false
-    var size: FluidSize = .default
+    /// One step of the size ladder — nil follows the ambient `\.fluidSize`
+    /// (the source's `useSize(size)` reads the SizeProvider).
+    var size: FluidSize? = nil
+    /// Shape ladder — nil follows the ambient `\.fluidShape`
+    /// (input-message.tsx reads shape.container / shape.bg via useShape()).
+    var shape: FluidShape? = nil
     /// Minimum visible rows before the editor grows (source: minRows).
     var minRows = 1
     /// Maximum visible rows before the editor scrolls (source: maxRows).
@@ -113,6 +118,8 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
     /// Stop control while streaming with an empty draft. Nil → the button
     /// falls back to send (the source's `onStop ? "stop" : "send"`).
     var onStop: (() -> Void)? = nil
+    var pill = false
+    var accent: AnyView? = nil
     /// Content rendered in the attachment slot (above the editor) — the
     /// AskUser question flow embeds here.
     @ViewBuilder var header: () -> Header
@@ -146,9 +153,26 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
     @State private var dragY: CGFloat = 0
     @State private var dragOrigin: Int = 0
     @State private var iBeamPushed = false
+    @State private var multiline = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private var compact: Bool { size == .compact }
+    @Environment(\.fluidSize) private var ambientSize
+    @Environment(\.fluidShape) private var ambientShape
+    private var resolvedSize: FluidSize { size ?? ambientSize }
+    private var resolvedShape: FluidShape { shape ?? ambientShape }
+    private var compact: Bool { resolvedSize == .compact }
+    private var lineHeight: CGFloat { compact ? 18 : 20 }
+    private var pillDim: CGFloat { compact ? 30 : 34 }
+    private var pillPad: CGFloat { 5 }
+    private var editorInset: CGFloat { pill ? (pillDim - lineHeight) / 2 : (compact ? 6 : 8) }
+    private var pillExpanded: Bool {
+        multiline || !(files?.wrappedValue.isEmpty ?? true)
+            || (showQueue && !(queue?.wrappedValue.isEmpty ?? true)) || suggestionsOpen
+    }
+    private var radius: CGFloat {
+        guard pill else { return resolvedShape.container }
+        return pillExpanded ? 16 : 999
+    }
     private var canSend: Bool {
         !disabled && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                       || !(files?.wrappedValue.isEmpty ?? true))
@@ -193,7 +217,9 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
     /// SizeProvider wraps the whole composer, so header content sees the
     /// same step as the footer slots.
     private var headerContent: some View {
-        header().environment(\.fluidSize, size)
+        header()
+            .environment(\.fluidSize, resolvedSize)
+            .environment(\.fluidShape, resolvedShape)
     }
 
     /// The footer's left cluster: the built-in paperclip only when files
@@ -217,7 +243,8 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
             leading()
         }
         .environment(\.fluidComposerSlot, slotContext)
-        .environment(\.fluidSize, size)
+        .environment(\.fluidSize, resolvedSize)
+        .environment(\.fluidShape, resolvedShape)
     }
 
     /// The footer's right cluster — rightSlot then the send button
@@ -228,7 +255,8 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
             sendButton
         }
         .environment(\.fluidComposerSlot, slotContext)
-        .environment(\.fluidSize, size)
+        .environment(\.fluidSize, resolvedSize)
+        .environment(\.fluidShape, resolvedShape)
     }
 
     /// Editor + ghost/placeholder overlay (input-message.tsx:1141-1236).
@@ -238,8 +266,8 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
                 text: $text,
                 focused: $focused,
                 fontSize: compact ? 13 : 14,
-                lineHeight: compact ? 18 : 20,
-                inset: compact ? 6 : 8,
+                lineHeight: lineHeight,
+                inset: editorInset,
                 minLines: minRows, maxLines: maxRows,
                 // A lit suggestion is accepted even when plain Enter
                 // newlines — the source's suggestion branch precedes
@@ -264,7 +292,9 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
                 shouldConsumeTab: { placeholderSuggestion != nil && text.isEmpty },
                 // Esc drops a lit suggestion; with none lit it passes
                 // through (the source lets the event propagate).
-                shouldConsumeEscape: { activeSuggestion != nil },
+                // Esc is consumed only while a lit suggestion exists in an
+                // OPEN list (input-message.tsx:786 — `suggestionsOpen &&`).
+                shouldConsumeEscape: { suggestionsOpen && activeSuggestion != nil },
                 // ↑ walks the lit row back up and out, then falls to
                 // readline history; ↓ enters the open list — anything
                 // else is plain caret movement (input-message.tsx:779-863).
@@ -279,6 +309,9 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
                 onArrowDown: arrowDown,
                 onArrowUp: arrowUp,
                 onEscape: { activeSuggestion = nil },
+                onMultilineChange: { m in
+                    withAnimation(FluidSpring.moderate) { multiline = m }
+                },
                 onCommandReturn: onCommandReturn,
                 // Real typing exits history mode and drops the lit
                 // suggestion (source: textarea onChange).
@@ -291,8 +324,8 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
                 }
                 .font(.system(size: compact ? 13 : 14))
                 .foregroundStyle(FluidTone.mutedForeground)
-                .padding(.horizontal, compact ? 6 : 8)
-                .padding(.vertical, compact ? 6 : 8)
+                .padding(.horizontal, editorInset)
+                .padding(.vertical, editorInset)
                 .allowsHitTesting(false)
             } else if text.isEmpty {
                 // No ghost: the textarea's own placeholder — the drop
@@ -301,8 +334,9 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
                      ? "Drop files here to add to chat" : placeholder)
                     .font(.system(size: compact ? 13 : 14))
                     .foregroundStyle(FluidTone.mutedForeground)
-                    .padding(.horizontal, compact ? 6 : 8)
-                    .padding(.vertical, compact ? 6 : 8)
+                    .lineLimit(1)
+                    .padding(.horizontal, editorInset)
+                    .padding(.vertical, editorInset)
                     .allowsHitTesting(false)
             }
         }
@@ -313,7 +347,7 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
          history: [String] = [], files: Binding<[URL]>? = nil,
          queue: Binding<[FluidQueuedMessage]>? = nil,
          status: FluidComposerStatus = .idle, disabled: Bool = false,
-         size: FluidSize = .default,
+         size: FluidSize? = nil, shape: FluidShape? = nil,
          minRows: Int = 1, maxRows: Int = 8,
          clickToFocus: Bool = true, sendLabel: String = "Send",
          accept: String = "image/png,image/jpeg,application/pdf",
@@ -324,6 +358,8 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
          onSend: @escaping (String, [URL]) -> Void = { _, _ in },
          onAutoDispatch: ((FluidQueuedMessage) -> Void)? = nil,
          onStop: (() -> Void)? = nil,
+         pill: Bool = false,
+         accent: AnyView? = nil,
          @ViewBuilder header: @escaping () -> Header,
          @ViewBuilder trailing: @escaping () -> Trailing = { EmptyView() },
          @ViewBuilder leading: @escaping () -> Leading = { EmptyView() }) {
@@ -331,7 +367,7 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
         self.placeholderSuggestion = placeholderSuggestion
         self.suggestions = suggestions; self.history = history
         self.files = files; self.queue = queue; self.status = status
-        self.disabled = disabled; self.size = size
+        self.disabled = disabled; self.size = size; self.shape = shape
         self.minRows = minRows; self.maxRows = maxRows
         self.clickToFocus = clickToFocus; self.sendLabel = sendLabel
         self.accept = accept; self.maxFiles = maxFiles
@@ -340,6 +376,7 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
         self.onCommandReturn = onCommandReturn
         self.onSend = onSend; self.onAutoDispatch = onAutoDispatch
         self.onStop = onStop
+        self.pill = pill; self.accent = accent
         self.header = header; self.trailing = trailing
         self.leading = leading
     }
@@ -348,36 +385,57 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
         if focus?.wrappedValue != f { focus?.wrappedValue = f }
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            headerContent
-            if let files, !files.wrappedValue.isEmpty { fileStrip }
-            if let queue, showQueue, !queue.wrappedValue.isEmpty { queueStrip }
-
-            // Editor + ghost overlay.
-            editorArea
-
-            // Footer: left cluster (paperclip + leading), spacer, right
-            // cluster (trailing + send). The clusters run gap-1.5 inside a
-            // justify-between row — the source's action-bar shape.
-            HStack(spacing: compact ? 6 : 8) {
-                leftCluster
-                Spacer(minLength: 0)
-                rightCluster
+    @ViewBuilder
+    private var stack: some View {
+        if pill {
+            VStack(alignment: .leading, spacing: 4) {
+                headerContent
+                if let files, !files.wrappedValue.isEmpty { fileStrip }
+                if let queue, showQueue, !queue.wrappedValue.isEmpty { queueStrip }
+                HStack(alignment: .bottom, spacing: 4) {
+                    leftCluster
+                    editorArea
+                    rightCluster
+                }
+                if suggestionsOpen { suggestionList }
             }
+            .padding(pillPad)
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                headerContent
+                if let files, !files.wrappedValue.isEmpty { fileStrip }
+                if let queue, showQueue, !queue.wrappedValue.isEmpty { queueStrip }
 
-            if suggestionsOpen { suggestionList }
+                // Editor + ghost overlay.
+                editorArea
+
+                // Footer: left cluster (paperclip + leading), spacer, right
+                // cluster (trailing + send). The clusters run gap-1.5 inside a
+                // justify-between row — the source's action-bar shape.
+                HStack(spacing: compact ? 6 : 8) {
+                    leftCluster
+                    Spacer(minLength: 0)
+                    rightCluster
+                }
+
+                if suggestionsOpen { suggestionList }
+            }
+            .padding(8)
         }
-        .padding(8)
-        .background(
-            RoundedRectangle(cornerRadius: FluidShape.rounded.container, style: .continuous)
-                .fill(FluidTone.surface(2))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: FluidShape.rounded.container, style: .continuous)
-                .strokeBorder(edgeColor, lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.1), radius: 0.5, y: 0.5)
+    }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: pill && !pillExpanded ? .circular : .continuous)
+        stack
+        .background {
+            shape.fill(pill ? Palette.ground : FluidTone.surface(2))
+            if let accent {
+                accent.clipShape(shape).allowsHitTesting(false)
+            }
+        }
+        .overlay(shape.strokeBorder(edgeColor, lineWidth: 1))
+        .shadow(color: .black.opacity(pill ? 0 : 0.1), radius: 0.5, y: 0.5)
+        .animation(FluidSpring.moderate, value: pillExpanded)
         .opacity(disabled ? 0.5 : 1)
         .allowsHitTesting(!disabled)
         .onHover { h in
@@ -454,6 +512,7 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
     private var edgeColor: Color {
         if dragOver { return FluidTone.focusRing }
         if focused { return FluidTone.foreground.opacity(0.2) }
+        if pill { return hovered ? FluidTone.foreground.opacity(0.14) : Palette.rim }
         if hovered && clickToFocus && !disabled { return FluidTone.border }
         return FluidTone.border.opacity(0.6)
     }
@@ -629,7 +688,7 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
                     .frame(height: compact ? 28 : 32)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(
-                        RoundedRectangle(cornerRadius: FluidShape.rounded.bg, style: .continuous)
+                        RoundedRectangle(cornerRadius: resolvedShape.bg, style: .continuous)
                             .fill(activeSuggestion == i ? FluidTone.hover : .clear)
                     )
                     .contentShape(Rectangle())
@@ -648,12 +707,13 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
         // the extra top pad lands the divider mt-2 (8px) below the footer.
         .padding(.horizontal, 6)
         .padding(.top, 6)
-        .padding(.horizontal, -8)
+        // The divider spans the composer's full width — negate the actual
+        // container pad (8 default, 5 pill) so it never overshoots the rim.
+        .padding(.horizontal, pill ? -pillPad : -8)
         .overlay(alignment: .top) {
             Rectangle().fill(FluidTone.border.opacity(0.6)).frame(height: 1)
         }
         .padding(.top, 4)
-        .padding(.bottom, -8)
         .animation(.easeOut(duration: 0.08), value: activeSuggestion)
         .transition(.move(edge: .top).combined(with: .opacity))
     }
@@ -663,19 +723,20 @@ struct FluidInputMessage<Trailing: View, Header: View, Leading: View>: View {
     private var sendButton: some View {
         FluidSendButton(
             compact: compact,
+            round: pill ? pillDim : nil,
             disabled: buttonMode == .stop ? disabled : !canSend,
             action: { if buttonMode == .stop { onStop?() } else { send() } }
         ) {
             ZStack {
                 if buttonMode == .stop {
-                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    RoundedRectangle(cornerRadius: pill ? 2.5 : 3, style: .continuous)
                         .fill(FluidTone.background)
-                        .frame(width: 12, height: 12)
+                        .frame(width: pill ? 10 : 12, height: pill ? 10 : 12)
                         .transition(reduceMotion
                                     ? .opacity
                                     : .scale(scale: 0.6).combined(with: .opacity))
                 } else {
-                    FluidIcon("arrow.up", size: compact ? 15 : 19)
+                    FluidIcon("arrow.up", size: pill ? (compact ? 14 : 16) : (compact ? 15 : 19))
                         .foregroundStyle(FluidTone.background)
                         .transition(reduceMotion
                                     ? .opacity
@@ -911,7 +972,7 @@ extension FluidInputMessage where Header == EmptyView {
          history: [String] = [], files: Binding<[URL]>? = nil,
          queue: Binding<[FluidQueuedMessage]>? = nil,
          status: FluidComposerStatus = .idle, disabled: Bool = false,
-         size: FluidSize = .default,
+         size: FluidSize? = nil, shape: FluidShape? = nil,
          minRows: Int = 1, maxRows: Int = 8,
          clickToFocus: Bool = true, sendLabel: String = "Send",
          accept: String = "image/png,image/jpeg,application/pdf",
@@ -928,6 +989,7 @@ extension FluidInputMessage where Header == EmptyView {
                   placeholderSuggestion: placeholderSuggestion,
                   suggestions: suggestions, history: history, files: files,
                   queue: queue, status: status, disabled: disabled, size: size,
+                  shape: shape,
                   minRows: minRows, maxRows: maxRows,
                   clickToFocus: clickToFocus, sendLabel: sendLabel,
                   accept: accept, maxFiles: maxFiles,
@@ -948,7 +1010,7 @@ extension FluidInputMessage where Leading == EmptyView {
          history: [String] = [], files: Binding<[URL]>? = nil,
          queue: Binding<[FluidQueuedMessage]>? = nil,
          status: FluidComposerStatus = .idle, disabled: Bool = false,
-         size: FluidSize = .default,
+         size: FluidSize? = nil, shape: FluidShape? = nil,
          minRows: Int = 1, maxRows: Int = 8,
          clickToFocus: Bool = true, sendLabel: String = "Send",
          accept: String = "image/png,image/jpeg,application/pdf",
@@ -965,6 +1027,7 @@ extension FluidInputMessage where Leading == EmptyView {
                   placeholderSuggestion: placeholderSuggestion,
                   suggestions: suggestions, history: history, files: files,
                   queue: queue, status: status, disabled: disabled, size: size,
+                  shape: shape,
                   minRows: minRows, maxRows: maxRows,
                   clickToFocus: clickToFocus, sendLabel: sendLabel,
                   accept: accept, maxFiles: maxFiles,
@@ -984,14 +1047,16 @@ extension FluidInputMessage where Leading == EmptyView {
 /// (fg fill, bg glyph, hover 90 / press 80 + 1px inset) at its own size.
 private struct FluidSendButton<Label: View>: View {
     var compact = false
+    var round: CGFloat? = nil
     var disabled = false
     var action: () -> Void
     @ViewBuilder var label: () -> Label
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.fluidShape) private var shape
     @State private var hovered = false
     @State private var pressed = false
 
-    private var dim: CGFloat { compact ? 24 : 28 }
+    private var dim: CGFloat { round ?? (compact ? 24 : 28) }
 
     var body: some View {
         Button(action: action) {
@@ -999,7 +1064,7 @@ private struct FluidSendButton<Label: View>: View {
                 .frame(width: dim, height: dim)
                 .foregroundStyle(FluidTone.background)
                 .background {
-                    RoundedRectangle(cornerRadius: FluidShape.rounded.button,
+                    RoundedRectangle(cornerRadius: round.map { $0 / 2 } ?? shape.button,
                                      style: .continuous)
                         .fill(pressed ? FluidMix.fgOverBg(80, for: scheme)
                                       : hovered ? FluidMix.fgOverBg(90, for: scheme)
@@ -1009,7 +1074,7 @@ private struct FluidSendButton<Label: View>: View {
         }
         .buttonStyle(.plain)
         .disabled(disabled)
-        .opacity(disabled ? 0.5 : 1)
+        .opacity(disabled ? (round == nil ? 0.5 : 0.22) : 1)
         .onHover { h in withAnimation(.easeOut(duration: 0.08)) { hovered = h } }
         .simultaneousGesture(
             DragGesture(minimumDistance: 0)
@@ -1435,19 +1500,24 @@ final class FluidTextView: NSTextView {
         case 36, 76:                          // Return / keypad Enter
             let parent = coordinator?.parent
             // ⌘↵ keeps the port-level override when one is wired (AskUser's
-            // Continue/Finish — the source's bubble-to-card). Every other
-            // non-shift Enter sends, meta/alt/ctrl included — the source's
-            // `e.key === "Enter" && !e.shiftKey` (input-message.tsx:866).
-            if flags == .command, let cb = parent?.onCommandReturn {
+            // Continue/Finish — the source's isMac-mod chord, metaKey
+            // regardless of shift). Every other non-shift Enter sends —
+            // `e.key === "Enter" && !e.shiftKey` (:866).
+            if flags.contains(.command), let cb = parent?.onCommandReturn {
                 cb()
             } else if !flags.contains(.shift), parent?.enterSends ?? true {
                 parent?.onSend()
             } else {
                 super.keyDown(with: event)
             }
-        case 48 where flags.isEmpty:          // Tab
+        case 48 where flags.isEmpty || flags == [.shift]:  // Tab / Shift-Tab
             let parent = coordinator?.parent
-            if parent?.shouldConsumeTab?() ?? true {
+            if flags == [.shift] {
+                // Backtab — a plain NSTextView ignores Shift-Tab, so drive
+                // key-view traversal ourselves (the source's contract:
+                // Shift+Tab still moves focus backward).
+                window?.selectKeyView(preceding: self)
+            } else if parent?.shouldConsumeTab?() ?? true {
                 parent?.onTab()
             } else {
                 // No ghost to fill — resume normal focus traversal.

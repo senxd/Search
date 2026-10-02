@@ -44,12 +44,27 @@ const PAGE = `<!doctype html><html><body>
   <p data-rect="8,80,400,20">Words for the agent to read.</p>
   <form id="f">
     <label for="who">Your name</label>
-    <input id="who" type="text" data-rect="8,110,200,22">
+    <input id="who" type="text" value="initial-attribute-marker" data-rect="8,110,200,22">
+    <label for="notes">Notes</label>
+    <textarea id="notes" data-rect="8,135,200,40">initial-textarea-marker</textarea>
+    <label for="secret">Password</label>
+    <input id="secret" type="password" value="secret-password-marker" data-rect="8,178,200,22">
+    <input type="mystery" value="invalid-type-marker">
+    <input type="hidden" value="hidden-input-marker">
+    <input type="text" style="display:none" value="display-none-marker">
+    <div aria-hidden="true"><input type="text" value="aria-hidden-marker"></div>
     <input id="agree" type="checkbox" data-rect="8,140,16,16">
     <select id="pick" data-rect="8,170,120,22"><option value="a">Aye</option><option value="b">Bee</option></select>
     <button id="save" data-rect="8,200,80,28">Save</button>
   </form>
   <div id="cursorDiv" style="cursor:pointer" data-rect="8,240,100,30">not a button but acts like one</div>
+  <svg id="plot" width="200" height="100">
+    <path id="decorative" d="M0 0L10 10" />
+    <text id="svg-static" x="8" y="20" data-rect="180,580,30,20">3</text>
+    <text id="svg-action" role="button" aria-label="SVG action" x="8" y="40" data-rect="180,610,50,20">1</text>
+    <text id="svg-pointer" style="cursor:pointer" x="8" y="60" data-rect="180,650,40,20">2</text>
+    <text id="svg-hidden" aria-hidden="true" x="8" y="80" data-rect="180,710,60,20">hiddenSVG</text>
+  </svg>
   <input type="hidden" value="ghost">
   <button id="below" data-rect="8,2000,80,28">Below the fold</button>
 </main>
@@ -58,6 +73,12 @@ const PAGE = `<!doctype html><html><body>
 // jsdom gives each iframe its own realm — prototypes included — so the
 // layout mocks have to be installed per window, not once.
 function patchWindow(w) {
+  // jsdom's outside-only Window fails the generated EventTarget realm check.
+  // Keep a real event target for window lifecycle events exercised below.
+  const windowEvents = w.document.createDocumentFragment();
+  for (const method of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+    w[method] = windowEvents[method].bind(windowEvents);
+  }
   // Layout, such as it is: an element's rect is its data-rect, or a default
   // box so "is it visible" has an answer.
   w.Element.prototype.getBoundingClientRect = function () {
@@ -130,6 +151,10 @@ w.eval(readFileSync(DRIVE, 'utf8'));
 ok(w.__drive === drive && drive.version === v0, 're-injection is a no-op');
 
 console.log('snapshot');
+const who = w.document.getElementById('who');
+who.value = 'Ada "typed"';
+const notes = w.document.getElementById('notes');
+notes.value = 'unsaved draft';
 const s1 = drive.snapshot({});
 const out = s1.snapshot;
 console.log('--- snapshot ---\n' + out + '\n----------------');
@@ -139,15 +164,61 @@ ok(/- link "Home" \[/.test(out) || /- link "Home" \*\[/.test(out), 'link line wi
 ok(/- heading "A small fixture" \[level=1\]/.test(out), 'heading with level');
 ok(/- "Words for the agent to read\."/.test(out), 'text run line');
 ok(/- textbox "Your name"/.test(out), 'input named by <label for>');
+ok(/- textbox "Your name".*\[value="Ada \\"typed\\""\]/.test(out), 'input snapshot shows its live value beside the accessible name');
+ok(/- textbox "Notes".*\[value="unsaved draft"\]/.test(out), 'textarea snapshot shows its live value');
+ok(/\[value="invalid-type-marker"\]/.test(out) && w.document.querySelector('input[type="mystery"]').type === 'text', 'invalid input types use the normalized text type');
+ok(!out.includes('initial-attribute-marker') && !out.includes('initial-textarea-marker'), 'snapshot omits stale default values');
+ok(!out.includes('secret-password-marker') && !out.includes('hidden-input-marker') && !out.includes('display-none-marker') && !out.includes('aria-hidden-marker'), 'snapshot excludes password and hidden field values');
+notes.value = '  exact\ttext\nwith a trailing space ';
+ok(drive.snapshot({}).snapshot.includes('[value=' + JSON.stringify(notes.value) + ']'), 'field values preserve exact whitespace and escape control characters');
+notes.value = 'unsaved draft';
 ok(/- checkbox/.test(out), 'checkbox line');
 ok(/- combobox/.test(out), 'select as combobox');
 ok(/- button "Save" \*?\[ref=e\d+\]/.test(out), 'button line with ref');
 ok(/- button "Save" \*?\[ref=e\d+\].*\[loc=css:#save\]/.test(out), 'css loc beside ref');
 ok(/\[loc=role:button\[name="Save"\]\]/.test(out), 'role loc beside ref');
 ok(/- generic \*?\[ref=e\d+\]/.test(out), 'cursor:pointer div earns a generic+ref line');
+ok(/- "3"/.test(out), 'visible SVG text appears in the full snapshot');
+ok(/- button "SVG action" \*?\[ref=e\d+\]/.test(out), 'explicit SVG role and label produce a ref');
+ok(/- generic \*?\[ref=e\d+\].*\[loc=css:#svg-pointer\]/.test(out), 'pointer SVG text earns a ref');
+ok(!/decorative/.test(out), 'decorative SVG paths stay out of the snapshot');
+ok(!/hiddenSVG/.test(out), 'aria-hidden SVG text stays out of the snapshot');
 ok(!/hidden/.test(out.match(/ghost/) || ''), 'input[type=hidden] skipped');
 ok(/below the fold/.test(out), 'below-fold note emitted');
 ok(/note: 1 interactive element below/.test(out), 'exactly one below-fold element counted');
+
+console.log('snapshot text colors');
+const colorDom = makeDom('<div style="color:rgb(255,0,0)">Target</div><span style="color:rgb(27,155,216)">Other</span><button style="color:rgb(0,128,0)">Confirm</button><div style="display:none;color:red">hiddenColor</div><div aria-hidden="true" style="color:red">ariaColor</div><div style="visibility:hidden;color:red"><span style="visibility:visible;color:blue">Visible child</span></div><button aria-label="Icon only" style="color:red"></button><svg><text style="fill:red;color:blue">SVG label</text></svg>');
+colorDom.window.eval(readFileSync(DRIVE, 'utf8'));
+const colored = colorDom.window.__drive.snapshot({ textColors: true }).snapshot;
+ok(/- "Target" \[color=rgb\(255, 0, 0\)\]/.test(colored), 'text colors expose computed rendered text color');
+ok(/- "Other" \[color=rgb\(27, 155, 216\)\]/.test(colored), 'each text line retains its own color');
+ok(/- button "Confirm".*\[color=rgb\(0, 128, 0\)\]/.test(colored), 'named controls carry their rendered text color');
+ok(!colored.includes('hiddenColor') && !colored.includes('ariaColor'), 'colored snapshots retain hidden-text filtering');
+ok(/- "Visible child" \[color=rgb\(0, 0, 255\)\]/.test(colored), 'visible child uses its own color under a hidden ancestor');
+ok(!colorDom.window.__drive.snapshot({}).snapshot.includes('[color='), 'text colors are opt-in');
+ok(/- button "Icon only"[^\n]*$/.test(colored.split('\n').find(line => line.includes('Icon only'))) && !colored.split('\n').find(line => line.includes('Icon only')).includes('[color='), 'ARIA-only names have no rendered text color');
+ok(/- "SVG label" \[color=rgb\(255, 0, 0\)\]/.test(colored), 'SVG text uses fill rather than its unrelated CSS color');
+const colorTarget = colorDom.window.document.querySelector('div');
+colorTarget.style.color = 'blue';
+ok(/- "Target" \[color=rgb\(0, 0, 255\)\]/.test(colorDom.window.__drive.snapshot({ textColors: true }).snapshot), 'colored snapshots read changed feedback rather than cache it');
+colorDom.window.close();
+const nestedDom = makeDom('<button><span style="color:red">Nested label</span></button><svg><text style="fill:blue">Base<tspan style="fill:red">Accent</tspan></text></svg><p style="opacity:0;color:red">opacityColor</p>');
+nestedDom.window.eval(readFileSync(DRIVE, 'utf8'));
+const nestedColors = nestedDom.window.__drive.snapshot({ textColors: true }).snapshot;
+ok(/- "Nested label" \[color=rgb\(255, 0, 0\)\]/.test(nestedColors), 'full color snapshot retains nested HTML text feedback');
+ok(!nestedDom.window.__drive.snapshot({ textColors: true, interactive: true }).snapshot.includes('[color='), 'interactive-only snapshot does not guess an aggregate label color');
+ok(nestedColors.includes('BaseAccent') && !nestedColors.split('\n').find(line => line.includes('BaseAccent')).includes('[color='), 'aggregate SVG labels do not claim a single fill');
+ok(!nestedColors.includes('opacityColor'), 'colored snapshots omit opacity-zero text');
+nestedDom.window.close();
+const paintDom = makeDom('<svg><defs><linearGradient id="mix"><stop stop-color="red"/></linearGradient></defs><text style="fill:url(#mix)">Gradient</text><text style="fill:none;stroke:red">Stroke only</text><text style="fill:red;fill-opacity:0;stroke:blue">Transparent fill</text></svg>');
+paintDom.window.eval(readFileSync(DRIVE, 'utf8'));
+const paintSnapshot = paintDom.window.__drive.snapshot({ textColors: true }).snapshot;
+ok(paintSnapshot.includes('Gradient') && paintSnapshot.includes('Stroke only') && !paintSnapshot.includes('[color='), 'SVG non-solid fills are not mislabeled as colors');
+ok(paintSnapshot.includes('Transparent fill') && !paintSnapshot.split('\n').find(line => line.includes('Transparent fill')).includes('[color='), 'SVG fill-opacity-zero text does not claim its unpainted fill color');
+paintDom.window.close();
+
+
 
 const refOf = (id) => { const el = w.document.getElementById(id); return el && el.__driveRef && el.__driveRef.ref; };
 const saveRef = refOf('save');
@@ -172,6 +243,10 @@ console.log('resolve');
 ok(drive.resolve({ ref: saveRef }) === w.document.getElementById('save'), 'ref resolves to element');
 ok(drive.resolve({ loc: 'css:#save' }) === w.document.getElementById('save'), 'loc css: resolves');
 ok(drive.resolve({ loc: 'role:button[name="Save"]' }) === w.document.getElementById('save'), 'loc role: resolves');
+ok(drive.resolve({ loc: 'role:button[name="SVG action"]' }) === w.document.getElementById('svg-action'), 'role loc resolves an explicit SVG button');
+ok(drive.resolve({ text: '2' }) === w.document.getElementById('svg-pointer'), 'text locator resolves visible interactive SVG text');
+try { drive.resolve({ text: 'hiddenSVG' }); ok(false, 'hidden SVG text must not resolve'); }
+catch (e) { ok(e.code === 'NOT_FOUND', 'hidden SVG text is not locator-visible'); }
 ok(drive.resolve({ loc: 'href:#about' }) === w.document.querySelector('a[href="#about"]'), 'loc href: resolves');
 ok(drive.resolve({ css: '#who' }) === w.document.getElementById('who'), 'css resolves');
 ok(drive.resolve({ text: 'save' }) === w.document.getElementById('save'), 'text= resolves case-folded');
@@ -192,7 +267,6 @@ try { drive.resolve({ ref: goneRef }); ok(false, 'stale ref throws'); }
 catch (e) { eq(e.code, 'STALE_REF', 'stale ref throws STALE_REF'); }
 
 console.log('act.fill');
-const who = w.document.getElementById('who');
 const events = [];
 who.addEventListener('input', (e) => events.push('input:' + who.value));
 who.addEventListener('change', () => events.push('change'));
@@ -200,6 +274,7 @@ const f1 = await drive.act('fill', { css: '#who' }, { text: 'Ada' });
 eq(f1.ok, true, 'fill ok');
 eq(who.value, 'Ada', 'fill sets value through the setter');
 eq(events.join('|'), 'input:Ada|change', 'fill fires input then change: ' + events.join('|'));
+
 
 console.log('act.click');
 let clicked = 0;
@@ -219,6 +294,74 @@ const staleAct = await drive.act('click', { ref: goneRef }, {});
 eq(staleAct.code, 'STALE_REF', 'act on stale ref returns {error, code}');
 ok(!!staleAct.error, 'stale act carries error string');
 
+const date = w.document.createElement('input');
+date.id = 'date'; date.type = 'date'; date.value = '2011-01-01';
+date.setAttribute('data-rect', '8,110,200,22');
+w.document.body.appendChild(date);
+let dateEvents = 0;
+date.addEventListener('input', () => dateEvents++);
+const beforeDateFocus = w.document.activeElement;
+const invalidDate = await drive.act('fill', { css: '#date' }, { text: '05/20/2010' });
+eq(invalidDate.code, 'INVALID_ARGUMENT', 'fill rejects a date value the browser would sanitize away');
+eq(date.value, '2011-01-01', 'invalid fill preserves the existing field value');
+eq(w.document.activeElement, beforeDateFocus, 'invalid fill preserves focus');
+eq(dateEvents, 0, 'invalid fill emits no input event');
+eq((await drive.act('fill', { css: '#date' }, { text: '2010-05-20' })).ok, true, 'fill accepts the native date format');
+ok(drive.snapshot({}).snapshot.includes('[type=date] [value="2010-05-20"]'), 'snapshot exposes date type and exact value');
+date.type = 'number'; date.value = '5';
+eq((await drive.act('fill', { css: '#date' }, { text: 'five' })).code, 'INVALID_ARGUMENT', 'number sanitization also fails explicitly');
+eq(date.value, '5', 'invalid number fill preserves the current value');
+date.remove();
+
+for (const [tag, attribute] of [['input', 'readonly'], ['textarea', 'readonly'], ['input', 'aria-readonly']]) {
+  const field = w.document.createElement(tag);
+  field.id = 'read-only'; field.value = 'original';
+  field.setAttribute(attribute, attribute === 'aria-readonly' ? 'true' : '');
+  field.setAttribute('data-rect', '8,110,200,22');
+  w.document.body.appendChild(field);
+  let events = 0;
+  field.addEventListener('input', () => events++);
+  field.addEventListener('change', () => events++);
+  const beforeFocus = w.document.activeElement;
+  eq((await drive.act('fill', { css: '#read-only' }, { text: 'changed' })).code, 'READ_ONLY', tag + ' ' + attribute + ' fill fails explicitly');
+  eq(field.value, 'original', 'read-only fill preserves the value');
+  eq(w.document.activeElement, beforeFocus, 'read-only fill preserves focus');
+  eq(events, 0, 'read-only fill emits no editing event');
+  ok(drive.snapshot({}).snapshot.includes('[readonly] [value="original"]'), 'snapshot exposes read-only state and current value');
+  field.remove();
+}
+
+console.log('act.drag');
+const dragSource = w.document.createElement('div');
+dragSource.id = 'drag-source'; dragSource.textContent = 'Drag me';
+dragSource.setAttribute('data-rect', '20,340,60,30');
+const dragTarget = w.document.createElement('div');
+dragTarget.id = 'drag-target'; dragTarget.textContent = 'Drop here';
+dragTarget.setAttribute('data-rect', '180,340,80,40');
+w.document.querySelector('main').append(dragSource, dragTarget);
+drive.snapshot({});
+const dragged = await drive.act('drag', { css: '#drag-source' }, { to: { css: '#drag-target' }, steps: 6 });
+eq(dragged.handoff, 'drag', 'drag hands off to the native tier');
+eq(dragged.from.join(','), '50,355', 'drag source center returned');
+eq(dragged.to.join(','), '220,360', 'drag destination center returned');
+eq(dragged.steps, 6, 'drag step count returned');
+eq(dragged.holdMs, 0, 'drag defaults to no endpoint hold');
+for (const holdMs of [0, 350, 2000]) {
+  const held = await drive.act('drag', { css: '#drag-source' }, { to: [300, 380], holdMs });
+  eq(held.holdMs, holdMs, 'drag preserves explicit hold duration ' + holdMs);
+}
+for (const holdMs of [-1, 2001, 1.5, Infinity, NaN, '350', true, null]) {
+  const invalid = await drive.act('drag', { css: '#missing' }, { to: [300, 380], holdMs });
+  eq(invalid.code, 'INVALID_ARGUMENT', 'invalid hold is rejected before resolving the source: ' + String(holdMs));
+}
+const draggedAt = await drive.act('drag', { css: '#drag-source' }, { to: [300, 380] });
+eq(draggedAt.to.join(','), '300,380', 'coordinate destination accepted');
+const draggedFrom = await drive.act('drag', { css: '#drag-source' }, { source: [35, 345], to: [300, 380], path: [[70, 360], [120, 370]] });
+eq(draggedFrom.from.join(','), '35,345', 'coordinate source accepted');
+eq(draggedFrom.path.length, 2, 'continuous path passed to the native tier');
+const badDrag = await drive.act('drag', { css: '#drag-source' }, { to: [-1, 500] });
+eq(badDrag.code, 'NOT_FOUND', 'out-of-viewport drag coordinate refused');
+
 console.log('act.check/select/press/hover');
 const k1 = await drive.act('check', { css: '#agree' }, { on: true });
 eq(k1.ok, true, 'check ok');
@@ -233,6 +376,32 @@ eq(sel.value, 'b', 'select set');
 eq(selChanged, 1, 'select fired change');
 const hov = await drive.act('hover', { css: '#save' }, {});
 eq(hov.ok, true, 'hover ok');
+const hoverArea = w.document.querySelector('#cursorDiv');
+const hoveredPoints = [];
+const hoverEvents = [];
+for (const type of ['pointerover', 'mouseover', 'mousemove', 'pointerenter', 'mouseenter']) {
+  hoverArea.addEventListener(type, e => hoverEvents.push([e.type, e.clientX, e.clientY, e.buttons]));
+}
+let hoverClicks = 0;
+hoverArea.addEventListener('mousemove', e => { hoveredPoints.push([e.clientX, e.clientY]); hoverArea.textContent = 'Pointer feedback ' + e.clientX + ',' + e.clientY; });
+hoverArea.addEventListener('click', () => hoverClicks++);
+const coordinateHover = await drive.act('hover', {}, { x: 20, y: 251, withSnapshot: true });
+eq(coordinateHover.ok, true, 'coordinate hover succeeds');
+eq(coordinateHover.element, 'div#cursorDiv', 'hover identifies the hit element so stale feedback outside a control can be recognized');
+eq(JSON.stringify(hoveredPoints), '[[20,251]]', 'coordinate hover dispatches the requested point instead of element center');
+eq(hoverClicks, 0, 'coordinate hover never clicks');
+eq(JSON.stringify(hoverEvents), JSON.stringify(['pointerover', 'mouseover', 'mousemove', 'pointerenter', 'mouseenter'].map(type => [type, 20, 251, 0])), 'all hover events preserve coordinates and release mouse buttons');
+const ambiguousHover = await drive.act('hover', { css: '#cursorDiv' }, { x: 20, y: 251 });
+eq(ambiguousHover.code, 'INVALID_ARGUMENT', 'coordinate hover cannot also name a locator');
+eq(hoveredPoints.length, 1, 'ambiguous hover dispatches no events');
+ok(coordinateHover.snapshot && coordinateHover.snapshot.includes('Pointer feedback 20,251'), 'coordinate hover returns updated visible feedback');
+for (const args of [{x: -1,y: 251}, {x: 20}, {x: Infinity,y: 251}, {x: w.innerWidth,y: 251}, {x: 20,y: -1}, {x: 20,y: w.innerHeight}]) {
+  const before = hoveredPoints.length;
+  const invalid = await drive.act('hover', {}, args);
+  eq(invalid.code, 'INVALID_ARGUMENT', 'invalid coordinate hover is refused');
+  eq(hoveredPoints.length, before, 'invalid coordinate hover dispatches no events');
+}
+
 who.focus();
 const keys = [];
 who.addEventListener('keydown', (e) => keys.push('down:' + e.key + ':' + e.keyCode));
@@ -314,6 +483,27 @@ const c3 = await drive.act('click', { ref: saveRef }, { tier: 'event' });
 eq(c3.ok, true, 'event tier ok');
 eq(c3.handoff, 'event', 'event tier hands off with coordinates');
 eq(clicked, 2, 'event tier did not JS-click');
+const svgPointer = w.document.getElementById('svg-pointer');
+let svgClicks = 0;
+svgPointer.addEventListener('click', () => { svgClicks++; });
+const svgRef = refOf('svg-pointer');
+const sequence = [];
+for (const type of ['pointerover', 'mouseover', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dblclick']) {
+  svgPointer.addEventListener(type, (e) => sequence.push([e.type, e.buttons]));
+}
+const svgJsClick = await drive.act('click', { ref: svgRef }, { tier: 'js' });
+eq(svgJsClick.ok, true, 'SVG text receives a JavaScript-tier click');
+eq(sequence.map(([type]) => type).join(','), 'pointerover,mouseover,mousemove,pointerdown,mousedown,pointerup,mouseup,click', 'click event order is complete');
+eq(sequence.filter(([type]) => type === 'pointerdown' || type === 'mousedown').map(([, buttons]) => buttons).join(','), '1,1', 'down events report a pressed button');
+eq(sequence.filter(([type]) => type === 'pointerup' || type === 'mouseup' || type === 'click').map(([, buttons]) => buttons).join(','), '0,0,0', 'release and click events report no pressed buttons');
+const svgClick = await drive.act('click', { ref: svgRef }, { tier: 'event' });
+eq(svgClick.handoff, 'event', 'SVG text click hands off to the native event tier: ' + JSON.stringify(svgClick));
+eq(JSON.stringify(svgClick.at), JSON.stringify([200, 660]), 'SVG text handoff uses its center point');
+eq(svgClicks, 1, 'native SVG click handoff does not dispatch a second JavaScript click');
+sequence.length = 0;
+await drive.act('click', { ref: svgRef }, { double: true });
+eq(sequence.filter(([type]) => type === 'pointerdown' || type === 'mousedown').map(([, buttons]) => buttons).join(','), '1,1,1,1', 'double-click down events report a pressed button');
+eq(sequence.filter(([type]) => ['pointerup', 'mouseup', 'click', 'dblclick'].includes(type)).map(([, buttons]) => buttons).join(','), '0,0,0,0,0,0,0', 'both clicks and double-click report released buttons');
 
 console.log('fix 1 — frame() without rAF (hidden tab)');
 {
@@ -446,6 +636,49 @@ console.log('fix 6 — refs pruned per snapshot');
   ok(!drive.refs.has(tref), 'snapshot prunes disconnected refs');
 }
 
+console.log('compact snapshots, bounded action evidence and live driver upgrades');
+{
+  const full = drive.snapshot({ interactive: true });
+  const compact = drive.snapshot({ interactive: true, cssLocators: false });
+  ok(full.snapshot.includes('[loc=css:'), 'SDK snapshot keeps CSS locators by default');
+  ok(!compact.snapshot.includes('[loc=css:') && compact.snapshot.includes('[loc=role:'), 'compact snapshot retains role locators');
+  const limited = await drive.act('click', { css: '#save' }, { withSnapshot: true, snapshotMaxChars: 500, cssLocators: false });
+  ok(limited.ok && limited.snapshot.length < 1000 && limited.snapshotTruncated, 'bounded post-action snapshot has an explicit marker');
+  ok(!limited.snapshot.includes('[loc=css:'), 'post-action snapshot honors compact mode');
+  const reinserted = w.document.createElement('button');
+  reinserted.textContent = 'Reinserted';
+  w.document.body.appendChild(reinserted);
+  drive.snapshot({});
+  const ref = reinserted.__driveRef.ref;
+  reinserted.remove(); drive.snapshot({});
+  w.document.body.appendChild(reinserted); drive.snapshot({});
+  ok(drive.resolve({ ref }) === reinserted, 'reinserted elements re-register their existing ref');
+  reinserted.remove();
+
+  const upgrade = new JSDOM('<button id="old">Old</button>', { url: 'https://example.test', runScripts: 'outside-only' });
+  const uw = upgrade.window;
+  uw.eval(readFileSync(DRIVE, 'utf8').replace('const BUILD = 8;', 'const BUILD = 7;'));
+  uw.__drive.snapshot({});
+  const old = uw.document.getElementById('old'), oldRef = old.__driveRef.ref;
+  const removed = uw.document.createElement('button'); removed.textContent = 'Removed'; uw.document.body.appendChild(removed);
+  uw.__drive.snapshot({}); const removedRef = removed.__driveRef.ref;
+  removed.remove(); uw.__drive.snapshot({});
+  delete uw.__drive._refCounter; delete uw.__drive._refEpoch; // simulate the legacy public state
+  uw.eval(readFileSync(DRIVE, 'utf8'));
+  const fresh = uw.document.createElement('button'); fresh.textContent = 'Fresh'; uw.document.body.appendChild(fresh);
+  uw.__drive.snapshot({});
+  ok(uw.__drive.resolve({ ref: oldRef }) === old, 'upgrade preserves advertised legacy refs');
+  ok(uw.__drive.resolve({ ref: fresh.__driveRef.ref }) === fresh && fresh.__driveRef.ref !== removedRef,
+     'upgrade cannot alias a pruned legacy ref');
+  const firstNew = fresh.__driveRef.ref; fresh.remove(); uw.__drive.snapshot({});
+  uw.eval(readFileSync(DRIVE, 'utf8').replace('const BUILD = 8;', 'const BUILD = 9;'));
+  const newer = uw.document.createElement('button'); newer.textContent = 'Newer'; uw.document.body.appendChild(newer);
+  uw.__drive.snapshot({});
+  ok(newer.__driveRef.ref !== firstNew && uw.__drive.resolve({ ref: newer.__driveRef.ref }) === newer,
+     'later upgrades preserve the counter beyond pruned refs');
+  upgrade.window.close();
+}
+
 console.log('fix 7 — misc correctness');
 {
   // labelledby beats label.
@@ -525,6 +758,63 @@ console.log('fix 8 — click inside a same-origin iframe is not ignored');
   eq(res.ok, true, 'frame click ok');
   eq(inClicks, 1, 'frame handler fired once');
   ok(!res.ignored, 'frame DOM ripple seen — no ignored:true, no double-click');
+}
+
+console.log('attention highlights');
+{
+  const doc = w.document, win = w;
+  const target = doc.getElementById('save');
+  const before = target.getAttribute('style');
+  const owner = 'attention-test';
+  let highlightBox;
+  const attachShadow = w.Element.prototype.attachShadow;
+  w.Element.prototype.attachShadow = function (opts) {
+    const shadow = attachShadow.call(this, opts);
+    if (this.hasAttribute('data-search-highlight')) highlightBox = shadow;
+    return shadow;
+  };
+  eq(drive.highlight({ css: '#save' }, { duration: 1, scroll: false }, owner).highlighted, true, 'target is highlighted');
+  w.Element.prototype.attachShadow = attachShadow;
+  const overlay = doc.querySelector('[data-search-highlight]');
+  ok(overlay && overlay.style.pointerEvents === 'none', 'outline allows page clicks');
+  eq(overlay.shadowRoot, null, 'outline styles are isolated in a closed shadow root');
+  eq(target.getAttribute('style'), before, 'target styles are preserved');
+  const oldRect = target.getAttribute('data-rect');
+  target.setAttribute('data-rect', '44,88,120,40');
+  await new Promise(r => setTimeout(r, 150));
+  eq(highlightBox.firstChild.style.left, '44px', 'outline follows target position');
+  eq(highlightBox.firstChild.style.width, '120px', 'outline follows target size');
+  target.setAttribute('data-rect', oldRect);
+  eq(drive.clearHighlight('other').cleared, false, 'another session cannot clear the outline');
+  let busy = false;
+  try { drive.highlight({ css: '#save' }, {}, 'other'); } catch (e) { busy = e.code === 'BUSY'; }
+  ok(busy, 'another session cannot replace the outline');
+  eq(drive.clearHighlight(owner).cleared, true, 'owner can clear the outline');
+  for (const [q, opts] of [[{}, {}], [{ css: '#save', text: 'Save' }, {}], [{ css: '' }, {}], [{ css: '#save' }, { duration: 31 }], [{ css: '#save' }, { duration: true }], [{ css: '#save' }, { scroll: 1 }]]) {
+    let invalid = false;
+    try { drive.highlight(q, opts, owner); } catch (e) { invalid = e.code === 'INVALID_ARGUMENT'; }
+    ok(invalid, 'malformed highlight rejected: ' + JSON.stringify([q, opts]));
+  }
+  drive.highlight({ css: '#save' }, { duration: 1 }, owner);
+  doc.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Escape' }));
+  eq(doc.querySelector('[data-search-highlight]'), null, 'Escape dismisses outline');
+  drive.highlight({ css: '#save' }, { duration: 1 }, owner);
+  await new Promise(r => setTimeout(r, 1100));
+  eq(doc.querySelector('[data-search-highlight]'), null, 'outline expires');
+  const removed = doc.createElement('button');
+  removed.id = 'attention-removed'; doc.body.appendChild(removed);
+  drive.highlight({ css: '#attention-removed' }, { scroll: false }, owner);
+  removed.remove();
+  await new Promise(r => setTimeout(r, 150));
+  eq(doc.querySelector('[data-search-highlight]'), null, 'removed target cleans up outline');
+  const framed = fr.contentDocument.getElementById('inner');
+  drive.highlight({ ref: framed.__driveRef.ref }, { scroll: false }, owner);
+  ok(fr.contentDocument.querySelector('[data-search-highlight]'), 'outline uses target frame geometry');
+  fr.contentDocument.dispatchEvent(new fr.contentWindow.KeyboardEvent('keydown', { key: 'Escape' }));
+  eq(fr.contentDocument.querySelector('[data-search-highlight]'), null, 'frame Escape dismisses outline');
+  drive.highlight({ css: '#save' }, { scroll: false }, owner);
+  win.dispatchEvent(new win.Event('pagehide'));
+  eq(doc.querySelector('[data-search-highlight]'), null, 'navigation clears outline before back-forward caching');
 }
 
 console.log('\n' + passed + ' passed, ' + failed + ' failed');

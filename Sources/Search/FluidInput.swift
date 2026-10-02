@@ -8,6 +8,7 @@ import SwiftUI
 /// flex flex-col gap-3 w-72 — the field column, tracking the pick.
 struct FluidInputGroup<Content: View>: View {
     var size: FluidSize? = nil
+    @Environment(\.fluidSize) private var ambientSize
     @State private var hover = FluidHover(axis: .y)
     @ViewBuilder var content: () -> Content
 
@@ -16,7 +17,9 @@ struct FluidInputGroup<Content: View>: View {
             VStack(alignment: .leading, spacing: 12) { content() }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .environment(\.fluidSize, size ?? .default)
+        // SizeProvider wraps only when `size` is set (input-group.tsx:79)
+        // — an unset prop must not flatten an ambient .compact.
+        .environment(\.fluidSize, size ?? ambientSize)
     }
 }
 

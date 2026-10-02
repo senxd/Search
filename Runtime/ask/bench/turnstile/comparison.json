@@ -1,0 +1,89 @@
+{
+  "model": "codex/gpt-6-luna",
+  "fixture_sha256": "d89cfeaacc6eb3098c1abb1f3737200e776024a2c3e33cbb956e54ffaddec463",
+  "observed_runs": [
+    {
+      "label": "after",
+      "effort": "high",
+      "pending_before": true,
+      "passed": true,
+      "seconds": 26.97,
+      "error": null,
+      "evidence": "results/turnstile-after-1790808808/results.json",
+      "clicks": [
+        {
+          "name": "captcha_click",
+          "args": "{\"tab\":\"f610c06c\",\"x\":61,\"y\":178,\"why\":\"Click the visible Cloudflare human-verification checkbox.\"}",
+          "failed": false
+        }
+      ]
+    },
+    {
+      "label": "after-auto",
+      "effort": "auto",
+      "pending_before": true,
+      "passed": true,
+      "seconds": 25.47,
+      "error": null,
+      "evidence": "results/turnstile-after-auto-1790808977/results.json",
+      "clicks": [
+        {
+          "name": "captcha_click",
+          "args": "{\"tab\":\"d0278452\",\"x\":60,\"y\":179,\"why\":\"Click the visible verification checkbox to complete the CAPTCHA.\"}",
+          "failed": false
+        }
+      ]
+    },
+    {
+      "label": "before",
+      "effort": "high",
+      "pending_before": true,
+      "passed": false,
+      "seconds": 26.24,
+      "error": null,
+      "evidence": "results/turnstile-before-1790808674/results.json",
+      "clicks": []
+    }
+  ],
+  "aborted_setup_runs": [
+    {
+      "label": "after-auto",
+      "effort": "auto",
+      "pending_before": null,
+      "passed": null,
+      "seconds": null,
+      "error": "bench pages on failed: error: pages only works on a --test run",
+      "evidence": "results/turnstile-after-auto-1790808875/results.json",
+      "clicks": []
+    },
+    {
+      "label": "after-auto",
+      "effort": "auto",
+      "pending_before": true,
+      "passed": null,
+      "seconds": null,
+      "error": "{'receipt': {'cancelRequested': False, 'requestId': 4, 'outcome': 'succeeded', 'timedOut': False, 'op': 'ui.ask', 'state': 'finished'}, 'effort': 'auto', 'chat': '1BDFD8A4-68B3-41A4-8333-E5BD5A9D5C5D', 'activity': '', 'waiting': False, 'model': 'codex/gpt-6-luna', 'running': True}",
+      "evidence": "results/turnstile-after-auto-1790808933/results.json",
+      "clicks": []
+    },
+    {
+      "label": "before",
+      "effort": "high",
+      "pending_before": true,
+      "passed": null,
+      "seconds": null,
+      "error": "tab 923349e3 is not this session's \u2014 attach it first (its chip in Ask)",
+      "evidence": "results/turnstile-before-1790808652/results.json",
+      "clicks": []
+    }
+  ],
+  "interpretation": "The skill plus CAPTCHA tool alias changed the observed behavior. Neither change was tested separately. Official interactive test widget results do not establish production anti-bot acceptance.",
+  "validation": [
+    "Swift build passed",
+    "41 harness unit checks passed",
+    "Browser profile/skill wire/native dispatch checks passed",
+    "MiniWoB packaging/input checks passed",
+    "Skill frontmatter validation passed"
+  ],
+  "cleanup": "All apps and servers launched by this runner stopped; staged OAuth removed."
+}

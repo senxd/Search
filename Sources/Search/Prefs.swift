@@ -81,6 +81,13 @@ final class Preferences: ObservableObject {
     @Published var shielded: Bool {
         didSet { store.set(shielded, forKey: "shield") }
     }
+    /// The window's ground is a solid grey rather than the Mac's glass —
+    /// off, what is behind the window shows through the chrome, blurred.
+    /// On unless turned off, a window nothing shows through being how it
+    /// always was.
+    @Published var opaqueWindow: Bool {
+        didSet { store.set(opaqueWindow, forKey: "window.opaque") }
+    }
     /// A private tab gets extensions too, not just every other page. Off
     /// unless asked for - a private tab keeps nothing by default, extensions
     /// included, and some watch what a page does.
@@ -216,6 +223,28 @@ final class Preferences: ObservableObject {
         didSet { store.set(ask, forKey: "ask") }
     }
 
+    @Published var agentFocus: Bool {
+        didSet { store.set(agentFocus, forKey: "ask.agentFocus") }
+    }
+    @Published var agentHighlights: Bool {
+        didSet {
+            store.set(agentHighlights, forKey: "ask.agentHighlights")
+            if !agentHighlights { (AskRuntime.drive as? Drive)?.clearHighlights() }
+        }
+    }
+    @Published var agentCursor: Bool {
+        didSet {
+            store.set(agentCursor, forKey: "ask.agentCursor")
+            AgentCursor.shared.showsCursor = agentCursor
+        }
+    }
+    @Published var agentEdge: AgentEdge {
+        didSet {
+            store.set(agentEdge.rawValue, forKey: "ask.agentEdge")
+            AgentCursor.shared.edge = agentEdge
+        }
+    }
+
     /// Whether a blank tab shows the chat and routine cards under the
     /// field. On unless turned off — the shelf is the two lists' shop
     /// window on the one surface every ⌘T passes through.
@@ -253,6 +282,7 @@ final class Preferences: ObservableObject {
         sleepsTabs = store.object(forKey: "tabs.sleep") as? Bool ?? true
         showsReading = store.object(forKey: "tabs.reading") as? Bool ?? true
         shielded = store.object(forKey: "shield") as? Bool ?? true
+        opaqueWindow = store.object(forKey: "window.opaque") as? Bool ?? true
         extensionsInPrivate = store.bool(forKey: "extensions.private")
         // Offered by default only in a build that can actually do them —
         // one with Apple's browser entitlement and its profile embedded. A
@@ -303,6 +333,10 @@ final class Preferences: ObservableObject {
         fastPages = fast
         FrameRate.fast = fast
         ask = store.object(forKey: "ask") as? Bool ?? true
+        agentFocus = store.object(forKey: "ask.agentFocus") as? Bool ?? true
+        agentHighlights = store.object(forKey: "ask.agentHighlights") as? Bool ?? true
+        agentCursor = store.object(forKey: "ask.agentCursor") as? Bool ?? true
+        agentEdge = AgentEdge(rawValue: store.string(forKey: "ask.agentEdge") ?? "") ?? .aura
         newTabCards = store.object(forKey: "newtab.cards") as? Bool ?? true
         // Left behind by the Web Inspector's switch, from before it was
         // always there.

@@ -166,8 +166,23 @@ private struct FluidSearchTypeahead: NSViewRepresentable {
                 parent.onReturn()
                 return nil
             default:
+                // Printable text only — arrows/F-keys arrive as private-
+                // use scalars, Esc/Return/Tabs as controls; appending
+                // them would inject control glyphs into the query (the
+                // navKey filter's rule). Space stays out: on a row it
+                // activates the item.
                 guard let chars = event.characters,
-                      chars.count == 1, chars != " " else { return event }
+                      chars.count == 1, chars != " ",
+                      chars.unicodeScalars.allSatisfy({ s in
+                          switch s.properties.generalCategory {
+                          case .control, .privateUse, .surrogate, .unassigned,
+                               .lineSeparator, .paragraphSeparator:
+                              return false
+                          default:
+                              return true
+                          }
+                      })
+                else { return event }
                 parent.focused.wrappedValue = true
                 parent.query.append(chars)
                 return nil

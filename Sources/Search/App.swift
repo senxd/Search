@@ -323,6 +323,26 @@ private final class CursorGroundView: NSView {
     }
 }
 
+struct Viewport: ViewModifier {
+    static let radius: CGFloat = 10
+    static let gap: CGFloat = 8
+
+    let on: Bool
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: on ? Self.radius : 0, style: .continuous)
+        content
+            .background(Palette.ground)
+            .clipShape(shape)
+            .overlay(
+                shape
+                    .strokeBorder(Palette.rim, lineWidth: 1)
+                    .opacity(on ? 1 : 0)
+                    .allowsHitTesting(false)
+            )
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var browser: Browser
     @Environment(\.openWindow) private var openWindow
@@ -350,7 +370,7 @@ struct ContentView: View {
         ZStack(alignment: .topLeading) {
             // Black while a page has the screen, so the frame of our own window
             // that survives the transition is not a white band across the top.
-            (browser.active?.immersed == true ? Color.black : Palette.ground)
+            (browser.active?.immersed == true ? Color.black : floor)
 
             // One stage, always. It starts beside the column and under the
             // strip, not behind them — a page sliding beneath floating chrome
@@ -361,9 +381,11 @@ struct ContentView: View {
             // again thirty times a second, the page juddered along its right
             // edge and overshot the window with the spring (see `room`).
             stage
-                .padding(.leading, roomed.width)
-                .padding(.top, roomed.height)
-                .padding(.trailing, railRoom)
+                .modifier(Viewport(on: framed))
+                .padding(.leading, roomed.width + inset.leading)
+                .padding(.top, roomed.height + inset.top)
+                .padding(.trailing, railRoom + inset.trailing)
+                .padding(.bottom, inset.bottom)
                 .offset(x: chrome.width - roomed.width, y: chrome.height - roomed.height)
 
             // The column of tabs, in the way that has one. It takes the full
@@ -422,7 +444,7 @@ struct ContentView: View {
                 // behind it, none of the page chrome meant for the web.
                 NativePageView(page: page, browser: browser)
             } else {
-                Page(tab: tab)
+                Page(tab: tab, radius: framed ? Viewport.radius : 0)
                     .overlay {
                         if browser.prefs.showsLinks { LinkBubble(status: browser.linkStatus) }
                     }
@@ -443,6 +465,29 @@ struct ContentView: View {
         } else {
             Palette.ground
         }
+    }
+
+    /// The window's ground: solid grey, or a tint over the glass when the
+    /// window is let through (Settings › General › Opaque window).
+    private var floor: Color {
+        browser.prefs.opaqueWindow ? Palette.floor : Palette.glass
+    }
+
+    private var framed: Bool { browser.active?.immersed != true }
+
+    private var inset: EdgeInsets {
+        guard framed else { return EdgeInsets() }
+        let gap = Viewport.gap
+        // Tuck the page a hair under the strip. The live tab is the page's
+        // own top colour and is drawn over that edge, so the card's stroke
+        // doesn't cut the two apart.
+        let top: CGFloat = band > 0 ? (barShown ? 0 : -2) : gap
+        return EdgeInsets(
+            top: top,
+            leading: sidebar ? 0 : gap,
+            bottom: gap,
+            trailing: railRoom > 0 ? 0 : gap
+        )
     }
 
     /// What the column and the strip take from the page right now: animated
@@ -597,6 +642,9 @@ struct ContentView: View {
             .background(WindowSetup { window = $0; dress($0) })
             .onChange(of: browser.prefs.sidebar) { _, _ in
                 DispatchQueue.main.async { measureLights() }
+            }
+            .onChange(of: browser.prefs.opaqueWindow) { _, _ in
+                if let window { glaze(window) }
             }
             // Stepping away to another app: macOS draws its own resting
             // buttons, and on a light window they come out nearly white. Ours
@@ -825,7 +873,7 @@ struct ContentView: View {
         // window only has to be the ground colour that goes with it.
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
-        window.backgroundColor = Palette.NS.ground
+        glaze(window)
         // The strip does the dragging, so the page underneath can't be grabbed
         // by accident while selecting text.
         window.isMovableByWindowBackground = false
@@ -862,6 +910,42 @@ struct ContentView: View {
             container.layer?.zPosition = 10
         }
     }
+
+    /// Under everything the window draws, a sheet of the Mac's own glass:
+    /// where the chrome is a tint rather than a solid grey (Palette.glass),
+    /// the world behind the window shows through, blurred. Opaque, there is
+    /// no sheet and the grey is the window's own background colour, as it
+    /// always was. The pane is found by its name so the switch can go either
+    /// way, any number of times.
+    ///
+    /// It goes into the frame view, under the content view — not into the
+    /// content view itself: a hosting view draws the tree into its own
+    /// layer, and a subview of it would sit over everything rather than
+    /// under it.
+    private func glaze(_ window: NSWindow) {
+        let through = !browser.prefs.opaqueWindow
+        window.isOpaque = !through
+        window.backgroundColor = through ? .clear : Palette.NS.floor
+        guard let content = window.contentView, let frame = content.superview else { return }
+        let pane = frame.subviews.first { $0.identifier == ContentView.paneName }
+        if through {
+            guard pane == nil else { return }
+            let glass = NSVisualEffectView(frame: frame.bounds)
+            glass.identifier = ContentView.paneName
+            glass.autoresizingMask = [.width, .height]
+            glass.blendingMode = .behindWindow
+            glass.material = .hudWindow
+            // Blurred whether or not the window is the one in front — a
+            // window that goes flat grey the moment you look elsewhere
+            // isn't glass.
+            glass.state = .active
+            frame.addSubview(glass, positioned: .below, relativeTo: content)
+        } else {
+            pane?.removeFromSuperview()
+        }
+    }
+
+    private static let paneName = NSUserInterfaceItemIdentifier("pane")
 
     // MARK: - keys
 

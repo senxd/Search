@@ -76,7 +76,7 @@ because the chip *is* the consent.
 - `ModeMenu` — new twin of `ModelMenu`: a `Menu` with the same capsule
   label (10pt medium, `Palette.ground.opacity(0.6)` fill, hairline,
   hidden indicator). It draws whatever the permissions design lands — the
-  contract here is only `label: String` ("Read"/"Guard"/"Full") plus a
+  contract here is only `label: String` ("Confirm"/"Full") plus a
   menu of modes; the chip doesn't know the semantics. Factor the shared
   capsule into `StatusChip(text:)` both menus use as `label:`.
 - Nothing else. While `mind.running` the stream's activity line and the

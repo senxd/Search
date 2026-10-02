@@ -212,13 +212,16 @@ struct TurnView: View {
                     openBinding: open,
                     browser: browser
                 )
+                .askArrive("work-\(turn.id)", anchor: .topLeading, delay: 0.05, rise: 8)
             }
             ForEach(turn.notes.filter(\.isError)) { note in
                 ErrorNote(note: note, you: turn.you)
+                    .askArrive("error-\(note.id)", anchor: .topLeading)
             }
             let answer = turn.answer(live: live)
             if !answer.isEmpty {
                 AnswerLine(text: answer, meta: turn.answerMessage, mixed: mixed, browser: browser)
+                    .askArrive("answer-\(turn.id)", anchor: .topLeading, rise: 10)
             }
         }
     }
@@ -253,10 +256,11 @@ private struct AnswerLine: View {
                         // The chip's own hover feeds the same flag — no
                         // dead pixel between the line and it.
                         .onHover { hovering = $0 }
+                        .transition(.offset(y: -4).combined(with: .opacity).combined(with: .scale(scale: 0.9, anchor: .topLeading)))
                 }
             }
             .onHover { hovering = $0 }
-            .animation(Motion.quick, value: hovering)
+            .animation(AskMotion.pop, value: hovering)
             .contextMenu {
                 Button("Copy") { AskUI.copy(text) }
                 if let meta, let fork = verdicts.fork {
@@ -366,7 +370,7 @@ struct WorkedFor: View {
             // doing still reads, so a folded live turn never looks dead.
             if live, !openBinding.wrappedValue, !activity.isEmpty {
                 HStack(spacing: 7) {
-                    Ring(size: 9)
+                    AskSpinner(size: 9)
                     Text(activity)
                         .font(.system(size: density.note))
                         .foregroundStyle(FluidTone.mutedForeground)
@@ -389,7 +393,7 @@ struct WorkedFor: View {
         } label: {
             HStack(spacing: 6) {
                 if live {
-                    Ring(size: 9)
+                    AskSpinner(size: 9)
                 }
                 label
                 Image(systemName: "chevron.right")
@@ -465,15 +469,16 @@ struct WorkedFor: View {
                 if turn.work(live: live).isEmpty && turn.notes.filter({ !$0.isError }).isEmpty {
                     // A live turn before its first block: the doing-line.
                     HStack(spacing: 7) {
-                        Ring(size: 9)
+                        AskSpinner(size: 9)
                         Text(activity.isEmpty ? "working…" : activity)
                             .font(.system(size: density.note))
                             .foregroundStyle(FluidTone.mutedForeground)
                     }
                     .padding(.leading, 2)
                 } else {
-                    ForEach(Array(sections.enumerated()), id: \.offset) { _, section in
+                    ForEach(Array(sections.enumerated()), id: \.offset) { index, section in
                         WorkSection(section: section, live: live, browser: browser)
+                            .askArrive("section-\(turn.id)-\(index)", anchor: .topLeading, rise: 6)
                     }
                     ForEach(turn.notes.filter { !$0.isError }) { note in
                         if let approval = note.approval {

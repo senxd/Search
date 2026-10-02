@@ -14,7 +14,8 @@ from search_agent import Agent, AgentError, world_folder
 assert len(sys.argv) == 2 and sys.argv[1] not in ("", "main"), "an isolated test world is required"
 html = b'''<!doctype html><title>Agent handoff check</title>
 <textarea id="draft" aria-label="Draft"></textarea>
-<button id="once" onclick="window.hits=(window.hits||0)+1">Count</button>
+<button id="once" onclick="window.hits=(window.hits||0)+1;document.querySelector('#hit-count').textContent='Hits: '+window.hits">Count</button>
+<p id="hit-count">Hits: 0</p>
 <button id="prompt" onclick="window.answer=prompt('Test question')">Prompt</button>
 <input id="file" type="file"><div id="shadow"></div>
 <script>document.querySelector('#shadow').attachShadow({mode:'open'}).innerHTML='<button id="inner">Shadow button</button>';</script>'''
@@ -63,11 +64,16 @@ try:
         time.sleep(.6)
         assert a.eval(tab, "window.hits") == 1
         a.dialogs(tab, True)
-        a.click(tab, "css:#prompt")
+        prompted = a.click(tab, "css:#prompt", tier="event", withSnapshot=True)
+        assert prompted.get("dialogPending") is True, prompted
+        assert "snapshotError" in prompted and "pending" in prompted["snapshotError"], prompted
         prompt = eventually(lambda: a.dialogs(tab).get("pending"))
         assert prompt["kind"] == "prompt"
         a.answer_dialog(tab, prompt["id"], True, "native answer")
         eventually(lambda: a.eval(tab, "window.answer") == "native answer")
+        resumed = a.click(tab, "css:#once", tier="event", withSnapshot=True)
+        assert "Hits: 2" in resumed.get("snapshot", ""), resumed
+        assert a.eval(tab, "window.hits") == 2
         a.click(tab, "css:#file")
         chooser = eventually(lambda: a.dialogs(tab).get("pending"))
         assert chooser["kind"] == "file"

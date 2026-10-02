@@ -1312,13 +1312,11 @@ private struct RoutineForm: View {
                     Text("Mode")
                         .font(.system(size: 12))
                         .foregroundStyle(FluidTone.mutedForeground)
-                    FluidSelect(selection: modeSel, placeholder: "Guard") {
-                        FluidSelectItem(index: 0, value: AskMode.read.rawValue,
-                                        icon: AskMode.read.icon, label: "Read — pages only")
-                        FluidSelectItem(index: 1, value: AskMode.guard.rawValue,
-                                        icon: AskMode.guard.icon, label: "Guard — heavy ops ask")
-                        FluidSelectItem(index: 2, value: AskMode.full.rawValue,
-                                        icon: AskMode.full.icon, label: "Full — never asks")
+                    FluidSelect(selection: modeSel, placeholder: "Confirm") {
+                        FluidSelectItem(index: 0, value: AskMode.guard.rawValue,
+                                        icon: AskMode.guard.icon, label: "Confirm guarded actions")
+                        FluidSelectItem(index: 1, value: AskMode.full.rawValue,
+                                        icon: AskMode.full.icon, label: "Full access")
                     }
                 }
             }

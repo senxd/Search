@@ -14,12 +14,16 @@ private let thinkingWords = ["Thinking", "Moonwalking", "Planning", "Refining"]
 
 struct FluidThinkingIndicator: View {
     var showIcon = true
+    /// `size` pins the indicator to one ladder step; omitted, it follows
+    /// the surrounding fluidSize.
+    var size: FluidSize? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.fluidSize) private var size
+    @Environment(\.fluidSize) private var ambientSize
     @State private var word = 0
     @State private var wordTask: Task<Void, Never>? = nil
 
-    private var compact: Bool { size == .compact }
+    private var resolvedSize: FluidSize { size ?? ambientSize }
+    private var compact: Bool { resolvedSize == .compact }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -44,6 +48,9 @@ struct FluidThinkingIndicator: View {
                             .animation(.timingCurve(0.4, 0, 0.2, 1, duration: 0.16))
                     ))
             }
+            // VoiceOver reads the static label once — announcing every
+            // 4s word swap would spam the user (the words are decorative).
+            .accessibilityHidden(true)
             .font(.system(size: compact ? 12 : 13, weight: .medium))
             .foregroundStyle(shimmerBase)
             // The #525252 sweep — masked band overlay, so the word's glyph
@@ -57,7 +64,19 @@ struct FluidThinkingIndicator: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .environment(\.fluidSize, resolvedSize)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Thinking…")
         .onAppear {
+            // role="status" — mounting announces the label like the
+            // source's sr-only live region (thinking-indicator.tsx).
+            if let win = NSApp.keyWindow ?? NSApp.mainWindow {
+                NSAccessibility.post(
+                    element: win, notification: .announcementRequested,
+                    userInfo: [.announcement: "Thinking…" as NSString,
+                               .priority: NSAccessibilityPriorityLevel.medium.rawValue as NSNumber]
+                )
+            }
             guard !reduceMotion, !FluidPerf.quiet else { return }
             wordTask = Task { @MainActor in
                 while true {

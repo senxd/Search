@@ -11,6 +11,7 @@ import WebKit
 /// what turns that into a redraw.
 struct Page: View {
     @ObservedObject var tab: Tab
+    var radius: CGFloat = 0
 
     var body: some View {
         ZStack {
@@ -24,7 +25,7 @@ struct Page: View {
             // Nor one of ours: `Page` may still be mounted for the beat the
             // stage takes to swap in NativePageView, and asking here is what
             // would rebuild the view go() just tore down.
-            WebStage(page: tab.isBlank || tab.asleep || tab.floating || tab.native != nil ? nil : tab.web)
+            WebStage(page: tab.isBlank || tab.asleep || tab.floating || tab.native != nil ? nil : tab.web, radius: radius)
 
             if let cover = tab.cover {
                 // The page as it was left, while it is rebuilt underneath —
@@ -66,7 +67,14 @@ struct Page: View {
                     // let go.
                     .transition(.opacity.combined(with: .scale(scale: 0.85)))
             }
+
+            if tab.native == nil {
+                AgentVeil(tab: tab.id, radius: radius)
+            }
         }
+        // The same colour the live tab is filled with, so a corner the page
+        // doesn't paint — and the edge the tab meets — isn't a second grey.
+        .background(tab.pageTop?.color ?? Palette.ground)
         .animation(Motion.quick, value: tab.failure)
         .animation(Motion.quick, value: tab.floating)
         .animation(.easeOut(duration: 0.2), value: tab.cover == nil)
@@ -127,10 +135,12 @@ private struct Disc: View {
 /// reload, no lost scroll position, no forgotten form.
 struct WebStage: NSViewRepresentable {
     let page: NSView?
+    var radius: CGFloat = 0
 
     func makeNSView(context: Context) -> StageView { StageView() }
 
     func updateNSView(_ view: StageView, context: Context) {
+        view.round(radius)
         view.show(page)
     }
 }
@@ -159,6 +169,14 @@ final class StageView: NSView {
         settle()
     }
 
+    func round(_ radius: CGFloat) {
+        wantsLayer = true
+        guard let layer, layer.cornerRadius != radius else { return }
+        layer.cornerRadius = radius
+        layer.cornerCurve = .continuous
+        layer.masksToBounds = radius > 0
+    }
+
     private func settle() {
         // A video filling the screen has its page lent to WebKit's own
         // window, with a placeholder left here in its place. The chrome
@@ -178,6 +196,10 @@ final class StageView: NSView {
         }
 
         guard let wanted, window != nil else { return }
+        if Bench.miniWoBViewport != nil, let page = wanted as? PageView {
+            Bench.shared.house(page)
+            return
+        }
         if wanted.superview !== self {
             // A web view can have only one superview, so taking it back is how
             // it is taken back.

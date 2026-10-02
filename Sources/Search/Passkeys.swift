@@ -114,7 +114,7 @@ final class Passkeys: NSObject {
         // The page in front of you only: a tab behind, a window behind, or
         // Search itself behind doesn't get to bring up the Mac's sheet over
         // what you're looking at. A test run is always behind.
-        guard Store.testing || (NSApp.isActive && caller.window?.isKeyWindow == true) else {
+        guard Store.testing || (NSApp.isActive && caller.window != nil && caller.window === NSApp.keyWindow) else {
             return refuse(answer, "NotAllowedError", "The document is not focused.")
         }
         // A frame from another site can't ask on the page's behalf.

@@ -1,0 +1,71 @@
+{
+  "label": "after",
+  "world": "turnstile-after-1790808808",
+  "model": "codex/gpt-6-luna",
+  "effort": "high",
+  "fixture_sha256": "d89cfeaacc6eb3098c1abb1f3737200e776024a2c3e33cbb956e54ffaddec463",
+  "started": "2026-09-30T22:53:28.812862+00:00",
+  "harness_sha256": "f46b78f9288f4d705d31e5c5d19def4bba219d735bb80289cf098ab77a81f0ba",
+  "skill_sha256": "d1e0945460af0c27e78a454ef22d45030aaf34a779c2f299399f1d536bee7b7c",
+  "pending_before": true,
+  "prompt": "Go to Search tab f610c06c and complete the CAPTCHA.",
+  "chat": "FA68F2BC-299C-47DA-88D2-7F7FE772679A",
+  "seconds": 26.97,
+  "passed": true,
+  "tools": [
+    {
+      "result": "{\"attached\":true,\"id\":\"f610c06c\"}",
+      "name": "tab_attach",
+      "id": "call_VD9qvujbOpXaIxm0D9JaXKZ3",
+      "args": "{\"id\":\"f610c06c\",\"why\":\"The requested Search tab is not currently attached.\"}",
+      "failed": false
+    },
+    {
+      "result": "{\"url\":\"http://127.0.0.1:55330/\",\"version\":808825089,\"title\":\"Turnstile interaction check\",\"truncated\":false,\"snapshot\":\"\"}",
+      "name": "snapshot",
+      "id": "call_X2BRLpteIUxNDXqhhrPD5TOv",
+      "args": "{\"tab\":\"f610c06c\",\"scope\":\"viewport\",\"interactive\":true}",
+      "failed": false
+    },
+    {
+      "result": "{\"scale\":1,\"height\":800,\"format\":\"png\",\"viewport\":{\"height\":800,\"width\":1280},\"path\":\"/Users/winter/Library/Application Support/Search (turnstile-after-1790808808)/ask/shots/shot-f610c06c-1790808828001.png\",\"width\":1280}",
+      "name": "screenshot",
+      "id": "call_vZO0EaBha8mw6nuI4m1YFURP",
+      "args": "{\"tab\":\"f610c06c\",\"marks\":true}",
+      "failed": false
+    },
+    {
+      "result": "{\"at\":[61,178],\"ok\":true,\"tier\":\"event\",\"element\":\"div\"}",
+      "name": "captcha_click",
+      "id": "call_9MNmHfGn5iM9BKnE54uZCXUQ",
+      "args": "{\"tab\":\"f610c06c\",\"x\":61,\"y\":178,\"why\":\"Click the visible Cloudflare human-verification checkbox.\"}",
+      "failed": false
+    },
+    {
+      "result": "{\"loading\":false,\"id\":\"f610c06c\",\"url\":\"http://127.0.0.1:55330/\",\"name\":\"\",\"group\":\"\",\"hollow\":false,\"view\":\"http://127.0.0.1:55330/\",\"space\":\"00000000-0000-0000-0000-000000000001\",\"asleep\":false,\"shy\":false,\"noisy\":false,\"spaceName\":\"Personal\",\"agentName\":\"\",\"extensions\":true,\"surfaced\":false,\"bench\":true,\"muted\":false,\"agentGroup\":\"\",\"title\":\"Turnstile interaction check\",\"active\":false}",
+      "name": "wait",
+      "id": "call_f853qvuyPa463haCmmRBXrzn",
+      "args": "{\"tab\":\"f610c06c\",\"seconds\":2}",
+      "failed": false
+    },
+    {
+      "result": "{\"version\":808825090,\"title\":\"Turnstile interaction check\",\"truncated\":false,\"url\":\"http://127.0.0.1:55330/\",\"snapshot\":\"\"}",
+      "name": "snapshot",
+      "id": "call_KuLoxHMzLYeHwKS9AKJXRoPo",
+      "args": "{\"tab\":\"f610c06c\",\"scope\":\"viewport\",\"interactive\":true}",
+      "failed": false
+    },
+    {
+      "result": "{\"scale\":1,\"path\":\"/Users/winter/Library/Application Support/Search (turnstile-after-1790808808)/ask/shots/shot-f610c06c-1790808840181.png\",\"height\":800,\"width\":1280,\"format\":\"png\",\"viewport\":{\"height\":800,\"width\":1280}}",
+      "name": "screenshot",
+      "id": "call_iQYLSRZp47IheIiDtPlKkxly",
+      "args": "{\"tab\":\"f610c06c\",\"marks\":true}",
+      "failed": false
+    }
+  ],
+  "replies": [
+    "Completed the CAPTCHA; the tab displays \u201cSuccess!\u201d and \u201cVerification complete.\u201d"
+  ],
+  "notes": [],
+  "cleaned_up": true
+}

@@ -164,7 +164,9 @@ struct TabBar: View {
                                         }
                                         .allowsHitTesting(false)
                                     }
+                                    .offset(y: MergedTab.drop)
                                 }
+                                .scrollClipDisabled(!overflowing(in: geo.size.width))
                                 .scrollDisabled(!overflowing(in: geo.size.width))
                                 .frame(width: run(in: geo.size.width))
                                 .onAppear { reveal(reader, in: geo.size.width) }
@@ -312,6 +314,7 @@ struct TabBar: View {
                 }
             }
             .frame(height: Metrics.strip)
+            .offset(y: MergedTab.drop)
             .allowsHitTesting(false)
         }
     }
@@ -844,6 +847,8 @@ private struct TabPill: View {
             shake = 0
             withAnimation(.easeOut(duration: 0.5)) { shake = 1 }
         }
+        .onAppear { if live { tab.measureIfShowing() } }
+        .onChange(of: live) { _, on in if on { tab.measureIfShowing() } }
         // Arriving and leaving from the strip rather than from nowhere.
         .transition(.scale(scale: 0.9, anchor: .leading).combined(with: .opacity))
     }
@@ -925,9 +930,9 @@ private struct TabPill: View {
                     if hovering {
                         Image(systemName: "xmark")
                             .font(.system(size: 8, weight: .semibold))
-                            .foregroundStyle(Palette.muted)
+                            .foregroundStyle(live ? quiet : Palette.muted)
                             .frame(width: 15, height: 15)
-                            .background(Palette.ink.opacity(0.07), in: Circle())
+                            .background((live ? (tab.pageTop?.ink ?? Palette.ink) : Palette.ink).opacity(0.07), in: Circle())
                             .transition(.opacity)
                     } else if tab.loading {
                         Ring().transition(.opacity)
@@ -961,29 +966,30 @@ private struct TabPill: View {
     @ViewBuilder
     private var ground: some View {
         if live {
-            // The grey fills from the left as you read down the page. It is
-            // the one thing in the window that says how far in you are, and
-            // it says it without adding anything to the window. In a group
-            // the same thing is said in the group's colour, deeper — a
-            // segment of the bar rather than a pill inside it, and the
-            // strongest thing in the run.
-            ZStack(alignment: .leading) {
-                Rectangle().fill(tint?.opacity(0.30) ?? Palette.wash)
-                // Not on a pinned square, nor a tab down to its mark. Thirty
-                // points of grey filling from the left behind a single letter
-                // says nothing about anything — it needs the width of a title
-                // to read as progress at all.
+            ZStack(alignment: .top) {
+                // The page's own top, so the tab and the page read as one surface.
+                MergedTab(flare: MergedTab.flare).fill(surface)
                 if !pinned && !compact && prefs.showsReading {
-                    Rectangle()
-                        .fill(tint?.opacity(0.16) ?? Palette.ink.opacity(0.055))
-                        .frame(width: span * tab.reading)
+                    MergedTab(flare: 0)
+                        .fill((tab.pageTop?.ink ?? Palette.ink).opacity(0.06))
+                        .mask(alignment: .leading) {
+                            Rectangle().frame(width: span * tab.reading)
+                        }
                         .animation(.easeOut(duration: 0.15), value: tab.reading)
                 }
+                MergedTab(flare: MergedTab.flare, open: true)
+                    .stroke(Palette.rim, lineWidth: 1)
+                if let tint {
+                    Capsule()
+                        .fill(tint)
+                        .frame(height: 2)
+                        .padding(.horizontal, 9)
+                        .padding(.top, 1.5)
+                }
             }
-            // A member's is a segment of its bar, corners a touch squarer
-            // than a pill's — the same modest turn the bar's own ends take,
-            // so it reads as part of the container it is drawn inside.
-            .clipShape(RoundedRectangle(cornerRadius: tint == nil ? 9 : 6.5, style: .continuous))
+            .frame(height: MergedTab.height)
+            .offset(y: (MergedTab.sink - MergedTab.rise) / 2)
+            .animation(Motion.quick, value: tab.pageTop)
             .matchedGeometryEffect(id: "live", in: pill)
         } else if hovering {
             // A member under the pointer is a segment of its bar too — the
@@ -1003,9 +1009,57 @@ private struct TabPill: View {
         // ground it sits on now.
     }
 
+    /// What the live tab is filled with: the top of its page, or the window's
+    /// own ground when the page has none yet.
+    private var surface: Color { tab.pageTop?.color ?? Palette.ground }
+
     private var colour: Color {
-        if live { return Palette.ink }
+        if live { return tab.pageTop?.ink ?? Palette.ink }
         return hovering ? Palette.ink.opacity(0.7) : Palette.muted
+    }
+
+    private var quiet: Color {
+        if live, let pageTop = tab.pageTop { return pageTop.muted }
+        return Palette.muted
+    }
+}
+
+struct MergedTab: Shape {
+    static let drop: CGFloat = 3
+    static let rise: CGFloat = 4
+    static let pill: CGFloat = 28
+    static let sink: CGFloat = (Metrics.strip - pill) / 2 - drop
+    static let height: CGFloat = pill + rise + sink
+    static let flare: CGFloat = 7
+    static let corner: CGFloat = 9
+
+    var flare: CGFloat
+    var open = false
+
+    func path(in rect: CGRect) -> Path {
+        let bottom = open ? rect.maxY - 0.5 : rect.maxY
+        let r = min(Self.corner, rect.width / 2)
+        var p = Path()
+        if flare > 0 {
+            p.move(to: CGPoint(x: rect.minX - flare, y: bottom))
+            p.addArc(tangent1End: CGPoint(x: rect.minX, y: bottom),
+                     tangent2End: CGPoint(x: rect.minX, y: rect.minY), radius: flare)
+        } else {
+            p.move(to: CGPoint(x: rect.minX, y: bottom))
+        }
+        p.addArc(tangent1End: CGPoint(x: rect.minX, y: rect.minY),
+                 tangent2End: CGPoint(x: rect.maxX, y: rect.minY), radius: r)
+        p.addArc(tangent1End: CGPoint(x: rect.maxX, y: rect.minY),
+                 tangent2End: CGPoint(x: rect.maxX, y: bottom), radius: r)
+        if flare > 0 {
+            p.addArc(tangent1End: CGPoint(x: rect.maxX, y: bottom),
+                     tangent2End: CGPoint(x: rect.maxX + flare, y: bottom), radius: flare)
+            p.addLine(to: CGPoint(x: rect.maxX + flare, y: bottom))
+        } else {
+            p.addLine(to: CGPoint(x: rect.maxX, y: bottom))
+        }
+        if !open { p.closeSubpath() }
+        return p
     }
 }
 

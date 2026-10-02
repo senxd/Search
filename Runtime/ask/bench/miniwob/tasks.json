@@ -1,0 +1,886 @@
+{
+  "benchmark": "BrowserGym MiniWoB++",
+  "browsergym_commit": "c05d7f38f4f788d6e4ee960512c3d5c8aabc6e42",
+  "browsergym_version": "0.14.4",
+  "miniwob_commit": "7fd85d71a4b60325c6585396ec4f48377d049838",
+  "miniwob_license": "MIT",
+  "browsergym_license": "Apache-2.0",
+  "task_count": 125,
+  "tasks": [
+    {
+      "id": "miniwob.ascending-numbers",
+      "name": "AscendingNumbersTask",
+      "subdomain": "ascending-numbers",
+      "description": "Click on the numbers in ascending order.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.bisect-angle",
+      "name": "BisectAngleTask",
+      "subdomain": "bisect-angle",
+      "description": "Find the line that bisects an angle evenly in two.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.book-flight",
+      "name": "BookFlightTask",
+      "subdomain": "book-flight",
+      "description": "Search for flight results.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.book-flight-nodelay",
+      "name": "BookFlightNodelayTask",
+      "subdomain": "book-flight-nodelay",
+      "description": "[book-flight] Removed animation.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.buy-ticket",
+      "name": "BuyTicketTask",
+      "subdomain": "buy-ticket",
+      "description": "Buy a ticket that matches the requested criteria.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.choose-date",
+      "name": "ChooseDateTask",
+      "subdomain": "choose-date",
+      "description": "Learn to operate a date picker tool.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.choose-date-easy",
+      "name": "ChooseDateEasyTask",
+      "subdomain": "choose-date-easy",
+      "description": "[choose-date] December only.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.choose-date-medium",
+      "name": "ChooseDateMediumTask",
+      "subdomain": "choose-date-medium",
+      "description": "[choose-date] December or November only.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.choose-date-nodelay",
+      "name": "ChooseDateNodelayTask",
+      "subdomain": "choose-date-nodelay",
+      "description": "[choose-date] Removed animation.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.choose-list",
+      "name": "ChooseListTask",
+      "subdomain": "choose-list",
+      "description": "Choose an item from a drop down list.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.circle-center",
+      "name": "CircleCenterTask",
+      "subdomain": "circle-center",
+      "description": "Find the center of a circle.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-button",
+      "name": "ClickButtonTask",
+      "subdomain": "click-button",
+      "description": "Click on a specific button in a generated form.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-button-sequence",
+      "name": "ClickButtonSequenceTask",
+      "subdomain": "click-button-sequence",
+      "description": "Click on buttons in a certain order.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-checkboxes",
+      "name": "ClickCheckboxesTask",
+      "subdomain": "click-checkboxes",
+      "description": "Click desired checkboxes.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-checkboxes-large",
+      "name": "ClickCheckboxesLargeTask",
+      "subdomain": "click-checkboxes-large",
+      "description": "[click-checkboxes] Click at least 5 out of up to 12 checkboxes.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-checkboxes-soft",
+      "name": "ClickCheckboxesSoftTask",
+      "subdomain": "click-checkboxes-soft",
+      "description": "[click-checkboxes] Paraphrased entries.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-checkboxes-transfer",
+      "name": "ClickCheckboxesTransferTask",
+      "subdomain": "click-checkboxes-transfer",
+      "description": "[click-checkboxes] Train and test on different number of targets.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-collapsible",
+      "name": "ClickCollapsibleTask",
+      "subdomain": "click-collapsible",
+      "description": "Click a collapsible element to expand it.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-collapsible-2",
+      "name": "ClickCollapsible2Task",
+      "subdomain": "click-collapsible-2",
+      "description": "Find and click on a specified link, from collapsible elements.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-collapsible-2-nodelay",
+      "name": "ClickCollapsible2NodelayTask",
+      "subdomain": "click-collapsible-2-nodelay",
+      "description": "[click-collapsible-2] Removed animation.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-collapsible-nodelay",
+      "name": "ClickCollapsibleNodelayTask",
+      "subdomain": "click-collapsible-nodelay",
+      "description": "[click-collapsible] Removed animation.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-color",
+      "name": "ClickColorTask",
+      "subdomain": "click-color",
+      "description": "Click the specified color.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-dialog",
+      "name": "ClickDialogTask",
+      "subdomain": "click-dialog",
+      "description": "Click the button to close the dialog box.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-dialog-2",
+      "name": "ClickDialog2Task",
+      "subdomain": "click-dialog-2",
+      "description": "Click a specific button in a dialog box.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-link",
+      "name": "ClickLinkTask",
+      "subdomain": "click-link",
+      "description": "Click on a specified link in text.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-menu",
+      "name": "ClickMenuTask",
+      "subdomain": "click-menu",
+      "description": "Click menu items.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-menu-2",
+      "name": "ClickMenu2Task",
+      "subdomain": "click-menu-2",
+      "description": "Find a specific item from a menu.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-option",
+      "name": "ClickOptionTask",
+      "subdomain": "click-option",
+      "description": "Click option boxes.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-pie",
+      "name": "ClickPieTask",
+      "subdomain": "click-pie",
+      "description": "Click items on a pie menu.",
+      "nondeterministic": true
+    },
+    {
+      "id": "miniwob.click-pie-nodelay",
+      "name": "ClickPieNodelayTask",
+      "subdomain": "click-pie-nodelay",
+      "description": "[click-pie] Removed animation.",
+      "nondeterministic": true
+    },
+    {
+      "id": "miniwob.click-scroll-list",
+      "name": "ClickScrollListTask",
+      "subdomain": "click-scroll-list",
+      "description": "Click multiple items from a scroll list.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-shades",
+      "name": "ClickShadesTask",
+      "subdomain": "click-shades",
+      "description": "Click the shades that match a specified color.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-shape",
+      "name": "ClickShapeTask",
+      "subdomain": "click-shape",
+      "description": "Click on a specific shape.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-tab",
+      "name": "ClickTabTask",
+      "subdomain": "click-tab",
+      "description": "Click on a tab element.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-tab-2",
+      "name": "ClickTab2Task",
+      "subdomain": "click-tab-2",
+      "description": "Click a link inside a specific tab element.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-tab-2-easy",
+      "name": "ClickTab2EasyTask",
+      "subdomain": "click-tab-2-easy",
+      "description": "[click-tab-2] One 1 tab.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-tab-2-hard",
+      "name": "ClickTab2HardTask",
+      "subdomain": "click-tab-2-hard",
+      "description": "[click-tab-2] Varying number of tabs from 2 to 6.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-tab-2-medium",
+      "name": "ClickTab2MediumTask",
+      "subdomain": "click-tab-2-medium",
+      "description": "[click-tab-2] Choose between a link or \u2018no match\u2019.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-test",
+      "name": "ClickTestTask",
+      "subdomain": "click-test",
+      "description": "Click on a single button.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-test-2",
+      "name": "ClickTest2Task",
+      "subdomain": "click-test-2",
+      "description": "Click on one of two buttons.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-test-transfer",
+      "name": "ClickTestTransferTask",
+      "subdomain": "click-test-transfer",
+      "description": "[click-test] Different buttons during train and test.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.click-widget",
+      "name": "ClickWidgetTask",
+      "subdomain": "click-widget",
+      "description": "Click on a specific widget in a generated form.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.copy-paste",
+      "name": "CopyPasteTask",
+      "subdomain": "copy-paste",
+      "description": "Copy text and paste it into an input.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.copy-paste-2",
+      "name": "CopyPaste2Task",
+      "subdomain": "copy-paste-2",
+      "description": "Copy text from a specific textarea and paste it into an input.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.count-shape",
+      "name": "CountShapeTask",
+      "subdomain": "count-shape",
+      "description": "Count number of shapes.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.count-sides",
+      "name": "CountSidesTask",
+      "subdomain": "count-sides",
+      "description": "Count the number of sides on a shape.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.daily-calendar",
+      "name": "DailyCalendarTask",
+      "subdomain": "daily-calendar",
+      "description": "Create an event on a daily calendar.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.drag-box",
+      "name": "DragBoxTask",
+      "subdomain": "drag-box",
+      "description": "Drag the smaller box into the larger box.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.drag-circle",
+      "name": "DragCircleTask",
+      "subdomain": "drag-circle",
+      "description": "Drag an item in a specified direction.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.drag-cube",
+      "name": "DragCubeTask",
+      "subdomain": "drag-cube",
+      "description": "Drag a 3D cube to show a specific face.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.drag-items",
+      "name": "DragItemsTask",
+      "subdomain": "drag-items",
+      "description": "Drag items in a list, in a specified direction",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.drag-items-grid",
+      "name": "DragItemsGridTask",
+      "subdomain": "drag-items-grid",
+      "description": "Drag items in a 2D grid around.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.drag-shapes",
+      "name": "DragShapesTask",
+      "subdomain": "drag-shapes",
+      "description": "Drag shapes into a box.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.drag-shapes-2",
+      "name": "DragShapes2Task",
+      "subdomain": "drag-shapes-2",
+      "description": "Drag shapes into boxes, categorized by type.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.drag-single-shape",
+      "name": "DragSingleShapeTask",
+      "subdomain": "drag-single-shape",
+      "description": "Drag a randomly generated shape in a specified direction.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.drag-sort-numbers",
+      "name": "DragSortNumbersTask",
+      "subdomain": "drag-sort-numbers",
+      "description": "Drag numbers into sorted ascending order.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.draw-circle",
+      "name": "DrawCircleTask",
+      "subdomain": "draw-circle",
+      "description": "Draw a circle around a marked point.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.draw-line",
+      "name": "DrawLineTask",
+      "subdomain": "draw-line",
+      "description": "Draw a line through a marked point.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox",
+      "name": "EmailInboxTask",
+      "subdomain": "email-inbox",
+      "description": "Navigate through an email inbox and perform some actions.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox-delete",
+      "name": "EmailInboxDeleteTask",
+      "subdomain": "email-inbox-delete",
+      "description": "[email-inbox] No scrolling + 1 subtask.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox-forward",
+      "name": "EmailInboxForwardTask",
+      "subdomain": "email-inbox-forward",
+      "description": "[email-inbox] No scrolling + 1 subtask.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox-forward-nl",
+      "name": "EmailInboxForwardNlTask",
+      "subdomain": "email-inbox-forward-nl",
+      "description": "[email-inbox-forward] varied instruction texts (30 templates).",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox-forward-nl-turk",
+      "name": "EmailInboxForwardNlTurkTask",
+      "subdomain": "email-inbox-forward-nl-turk",
+      "description": "[email-inbox-forward] varied instruction texts (100 templates).",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox-important",
+      "name": "EmailInboxImportantTask",
+      "subdomain": "email-inbox-important",
+      "description": "[email-inbox] No scrolling + 1 subtask.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox-nl-turk",
+      "name": "EmailInboxNlTurkTask",
+      "subdomain": "email-inbox-nl-turk",
+      "description": "[email-inbox] varied instruction texts (100 templates for each subtask).",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox-noscroll",
+      "name": "EmailInboxNoscrollTask",
+      "subdomain": "email-inbox-noscroll",
+      "description": "[email-inbox] No scrolling.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox-reply",
+      "name": "EmailInboxReplyTask",
+      "subdomain": "email-inbox-reply",
+      "description": "[email-inbox] No scrolling + 1 subtask.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.email-inbox-star-reply",
+      "name": "EmailInboxStarReplyTask",
+      "subdomain": "email-inbox-star-reply",
+      "description": "[email-inbox] No scrolling + 2 subtasks.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.enter-date",
+      "name": "EnterDateTask",
+      "subdomain": "enter-date",
+      "description": "Use the date input to pick the correct date.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.enter-password",
+      "name": "EnterPasswordTask",
+      "subdomain": "enter-password",
+      "description": "Enter the password into the form.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.enter-text",
+      "name": "EnterTextTask",
+      "subdomain": "enter-text",
+      "description": "Enter given text to a textfield.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.enter-text-2",
+      "name": "EnterText2Task",
+      "subdomain": "enter-text-2",
+      "description": "Convert given text to upper or lower case.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.enter-text-dynamic",
+      "name": "EnterTextDynamicTask",
+      "subdomain": "enter-text-dynamic",
+      "description": "Enter dynamically generated text to a textfield.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.enter-time",
+      "name": "EnterTimeTask",
+      "subdomain": "enter-time",
+      "description": "Enter the specified time into the input.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.find-greatest",
+      "name": "FindGreatestTask",
+      "subdomain": "find-greatest",
+      "description": "Find the card with the greatest number.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.find-midpoint",
+      "name": "FindMidpointTask",
+      "subdomain": "find-midpoint",
+      "description": "Find the shortest mid-point of two points.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.find-word",
+      "name": "FindWordTask",
+      "subdomain": "find-word",
+      "description": "Find nth word in a block of text.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.focus-text",
+      "name": "FocusTextTask",
+      "subdomain": "focus-text",
+      "description": "Focus into a text input.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.focus-text-2",
+      "name": "FocusText2Task",
+      "subdomain": "focus-text-2",
+      "description": "Focus on a specific text input.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.form-sequence",
+      "name": "FormSequenceTask",
+      "subdomain": "form-sequence",
+      "description": "Perform a series of instructions on a form.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.form-sequence-2",
+      "name": "FormSequence2Task",
+      "subdomain": "form-sequence-2",
+      "description": "Perform a series of instructions on a form.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.form-sequence-3",
+      "name": "FormSequence3Task",
+      "subdomain": "form-sequence-3",
+      "description": "Perform a series of instructions on a form.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.generate-number",
+      "name": "GenerateNumberTask",
+      "subdomain": "generate-number",
+      "description": "Generate a random number that meets certain criteria.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.grid-coordinate",
+      "name": "GridCoordinateTask",
+      "subdomain": "grid-coordinate",
+      "description": "Find the Cartesian coordinates on a grid.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.guess-number",
+      "name": "GuessNumberTask",
+      "subdomain": "guess-number",
+      "description": "Guess the number.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.highlight-text",
+      "name": "HighlightTextTask",
+      "subdomain": "highlight-text",
+      "description": "Highlight all the text.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.highlight-text-2",
+      "name": "HighlightText2Task",
+      "subdomain": "highlight-text-2",
+      "description": "Highlight the specified paragraph.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.hot-cold",
+      "name": "HotColdTask",
+      "subdomain": "hot-cold",
+      "description": "Find and click on the hot area.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.identify-shape",
+      "name": "IdentifyShapeTask",
+      "subdomain": "identify-shape",
+      "description": "Identify a randomly generated shape.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.login-user",
+      "name": "LoginUserTask",
+      "subdomain": "login-user",
+      "description": "Enter user login details into the form.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.login-user-popup",
+      "name": "LoginUserPopupTask",
+      "subdomain": "login-user-popup",
+      "description": "[login-user] Random popup.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.multi-layouts",
+      "name": "MultiLayoutsTask",
+      "subdomain": "multi-layouts",
+      "description": "Fill in forms of varying layouts.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.multi-orderings",
+      "name": "MultiOrderingsTask",
+      "subdomain": "multi-orderings",
+      "description": "Fill in forms with shuffled field orderings.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.navigate-tree",
+      "name": "NavigateTreeTask",
+      "subdomain": "navigate-tree",
+      "description": "Navigate a file tree to find a specified file or folder.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.number-checkboxes",
+      "name": "NumberCheckboxesTask",
+      "subdomain": "number-checkboxes",
+      "description": "Draw a given number using checkboxes.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.odd-or-even",
+      "name": "OddOrEvenTask",
+      "subdomain": "odd-or-even",
+      "description": "Mark each number as odd or even.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.order-food",
+      "name": "OrderFoodTask",
+      "subdomain": "order-food",
+      "description": "Order food items from a menu.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.phone-book",
+      "name": "PhoneBookTask",
+      "subdomain": "phone-book",
+      "description": "Find a contact in a phone book.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.read-table",
+      "name": "ReadTableTask",
+      "subdomain": "read-table",
+      "description": "Read information out from a table.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.read-table-2",
+      "name": "ReadTable2Task",
+      "subdomain": "read-table-2",
+      "description": "Read multiple pieces of information out from a table.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.resize-textarea",
+      "name": "ResizeTextareaTask",
+      "subdomain": "resize-textarea",
+      "description": "Resize a textarea in a given direction.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.right-angle",
+      "name": "RightAngleTask",
+      "subdomain": "right-angle",
+      "description": "Given two points, add a third point to create a right angle.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.scroll-text",
+      "name": "ScrollTextTask",
+      "subdomain": "scroll-text",
+      "description": "Scroll through a text area element and enter last word into text area.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.scroll-text-2",
+      "name": "ScrollText2Task",
+      "subdomain": "scroll-text-2",
+      "description": "Scroll through a text area in a given direction.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.search-engine",
+      "name": "SearchEngineTask",
+      "subdomain": "search-engine",
+      "description": "Search through a bunch of results to find a specified link.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.sign-agreement",
+      "name": "SignAgreementTask",
+      "subdomain": "sign-agreement",
+      "description": "Sign a user agreement.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.simple-algebra",
+      "name": "SimpleAlgebraTask",
+      "subdomain": "simple-algebra",
+      "description": "Solve for X.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.simple-arithmetic",
+      "name": "SimpleArithmeticTask",
+      "subdomain": "simple-arithmetic",
+      "description": "Perform some arithmetic math operations.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.social-media",
+      "name": "SocialMediaTask",
+      "subdomain": "social-media",
+      "description": "Interact with a social media feed.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.social-media-all",
+      "name": "SocialMediaAllTask",
+      "subdomain": "social-media-all",
+      "description": "[social-media] Do some action on all matching entries.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.social-media-some",
+      "name": "SocialMediaSomeTask",
+      "subdomain": "social-media-some",
+      "description": "[social-media] Do some action on some matching entries.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.stock-market",
+      "name": "StockMarketTask",
+      "subdomain": "stock-market",
+      "description": "Buy from the stock market below a specified price.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.terminal",
+      "name": "TerminalTask",
+      "subdomain": "terminal",
+      "description": "Use the terminal to delete a file.",
+      "nondeterministic": true
+    },
+    {
+      "id": "miniwob.text-editor",
+      "name": "TextEditorTask",
+      "subdomain": "text-editor",
+      "description": "Modify a text's style in a text-editor.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.text-transform",
+      "name": "TextTransformTask",
+      "subdomain": "text-transform",
+      "description": "Enter slightly transformed text into a text box.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.tic-tac-toe",
+      "name": "TicTacToeTask",
+      "subdomain": "tic-tac-toe",
+      "description": "Win a game of tic-tac-toe.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.unicode-test",
+      "name": "UnicodeTestTask",
+      "subdomain": "unicode-test",
+      "description": "Click on the button with the correct Unicode text.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.use-autocomplete",
+      "name": "UseAutocompleteTask",
+      "subdomain": "use-autocomplete",
+      "description": "Use autocomplete element efficiently.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.use-autocomplete-nodelay",
+      "name": "UseAutocompleteNodelayTask",
+      "subdomain": "use-autocomplete-nodelay",
+      "description": "[use-autocomplete] Removed delay.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.use-colorwheel",
+      "name": "UseColorwheelTask",
+      "subdomain": "use-colorwheel",
+      "description": "Use a color wheel.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.use-colorwheel-2",
+      "name": "UseColorwheel2Task",
+      "subdomain": "use-colorwheel-2",
+      "description": "Use a color wheel given specific random color.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.use-slider",
+      "name": "UseSliderTask",
+      "subdomain": "use-slider",
+      "description": "Use a slider to select a particular value.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.use-slider-2",
+      "name": "UseSlider2Task",
+      "subdomain": "use-slider-2",
+      "description": "Use sliders to create a given combination.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.use-spinner",
+      "name": "UseSpinnerTask",
+      "subdomain": "use-spinner",
+      "description": "Use a spinner to select given number.",
+      "nondeterministic": false
+    },
+    {
+      "id": "miniwob.visual-addition",
+      "name": "VisualAdditionTask",
+      "subdomain": "visual-addition",
+      "description": "Count the total number of blocks.",
+      "nondeterministic": true
+    }
+  ]
+}

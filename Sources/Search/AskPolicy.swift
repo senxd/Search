@@ -4,29 +4,34 @@ import Foundation
 // Drive (the gate) and Mind (the cards). Splitting the value types here keeps
 // Mind.swift a state contract and Drive.swift an ops file.
 
-/// What a session is allowed to do — Aside's read-only/guard/full-access
+/// What a session is allowed to do, with confirmation or full access
 /// in this codebase's voice. Chats carry one (consent is already
 /// chat-scoped); socket sessions default to .full — the same-uid socket is
 /// the trust boundary, the mode is for the agent.
 enum AskMode: String, Codable {
-    /// Read-class ops only; anything else is refused outright.
-    case read
     /// Reads and writes are free; destructive and privileged ops ask first.
     case `guard`
     /// Everything the door allows — door-bound ops still refuse by origin.
     case full
 
+    // Migrate old saved chats/routines without keeping Read as an API mode.
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer()
+        let raw = try value.decode(String.self)
+        if raw == "read" { self = .guard }
+        else if let mode = Self(rawValue: raw) { self = mode }
+        else { throw DecodingError.dataCorruptedError(in: value, debugDescription: "Unknown Ask mode") }
+    }
+
     var label: String {
         switch self {
-        case .read: "Read"
-        case .guard: "Guard"
+        case .guard: "Confirm"
         case .full: "Full"
         }
     }
 
     var icon: String {
         switch self {
-        case .read: "eye"
         case .guard: "shield"
         case .full: "bolt.shield"
         }
@@ -89,7 +94,7 @@ struct AskQuestion: Identifiable, Equatable, Codable {
 /// tab screenshot) is async, and the op's finish is parked meanwhile.
 enum Policy {
     /// What a parked op becomes — `allow` dispatches, `deny` answers the
-    /// refusal (read mode refuses rather than asks), `ask` parks the
+    /// refusal, `ask` parks the
     /// finish on a card.
     enum Verdict: Equatable {
         case allow
@@ -132,9 +137,10 @@ enum Policy {
             // filesystem write hiding inside a read op.
             return args["path"] is String ? .write : .read
         case "tabs.open", "tabs.attach", "tabs.detach", "tabs.select", "tabs.surface", "agent.lease",
+             "page.highlight", "page.clearHighlight",
              "page.back", "page.forward",
              "act.hover", "act.scroll", "act.click", "act.clickAt", "act.fill",
-             "act.type", "act.press", "act.select", "act.check":
+             "act.type", "act.press", "act.select", "act.check", "act.drag":
             return .write
         case "page.go", "page.reload":
             // On a bench tab: write — it's the agent's own to walk. On a
@@ -156,6 +162,7 @@ enum Policy {
             // Mind.newChat calls tabs.ungrantAll, emptying the grant
             // registry and denying every parked card. open/stop just move
             // the panel.
+            if args["status"] as? Bool == true { return .read }
             return (args["send"] is String || args["steer"] is String
                     || args["new"] as? Bool == true) ? .privileged : .write
         default:
@@ -213,11 +220,8 @@ enum Policy {
     @MainActor
     static func check(_ op: String, args: [String: Any], mode: AskMode, tab: Tab?,
                       remembered: Set<AlwaysKey>) -> Verdict {
-        let klass = classify(op, args: args, tab: tab)
         switch mode {
         case .full: return .allow
-        case .read:
-            return klass.rawValue <= OpClass.read.rawValue ? .allow : .deny("\(op) is above read mode")
         case .guard:
             return categories(op, args: args, tab: tab).contains(where: { $0.enabled }) ? .ask : .allow
         }
@@ -232,6 +236,7 @@ enum Policy {
             // needs a review before the agent replaces its page.
             return tab?.bench == true ? [] : [.destructive]
         case "page.files": return [.sharing]
+        case "act.drag": return [.unverified]
         case "page.dialog": return args["accept"] as? Bool == false ? [] : [.unverified]
         case "page.dialogs": return []
         case "page.eval", "page.code", "inspector.send": return [.unverified]

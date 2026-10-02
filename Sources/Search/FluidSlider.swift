@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Hit slop — expands a view's hit region without touching layout. Used
 /// for the slider's -8px horizontal pointer margins: a plain
@@ -6,9 +7,14 @@ import SwiftUI
 /// shape can reach past it.
 private struct FluidSliderSlop: Shape {
     var horizontal: CGFloat = 0
-    var vertical: CGFloat = 0
+    var top: CGFloat = 0
+    var bottom: CGFloat = 0
     func path(in rect: CGRect) -> Path {
-        Path(rect.insetBy(dx: -horizontal, dy: -vertical))
+        Path(CGRect(
+            x: rect.minX - horizontal, y: rect.minY - top,
+            width: rect.width + horizontal * 2,
+            height: rect.height + top + bottom
+        ))
     }
 }
 
@@ -175,6 +181,9 @@ struct FluidSlider: View {
     @State private var dotScale: CGFloat = 1
     @State private var editing: Int? = nil
     @State private var editText = ""
+    /// The displayText's iBeam push — tracked so teardown/startEdit can
+    /// pop it when the Text is destroyed mid-hover.
+    @State private var iBeamHover = false
     @FocusState private var editFocused: Bool
     // Scrubber — displayed fill fraction + zero-offset (motion values).
     @State private var scrubP: CGFloat? = nil
@@ -226,6 +235,10 @@ struct FluidSlider: View {
         }
         .onChange(of: value0) { _, _ in externalSync(0) }
         .onChange(of: value1) { _, _ in externalSync(1) }
+        // Engine swap remounts the compact engine in the source — px
+        // state derived for the comfortable lane is stale, so force a
+        // fresh initial sync on the next measure.
+        .onChange(of: usesCompact) { _, _ in ready = false; pxSynced = false }
         .onChange(of: effMin) { _, _ in externalSync(0); externalSync(1) }
         .onChange(of: effMax) { _, _ in externalSync(0); externalSync(1) }
         .opacity(isDisabled ? 0.5 : 1)
@@ -316,6 +329,7 @@ struct FluidSlider: View {
             }
         }
         .frame(height: 32)
+        .coordinateSpace(name: "fluidSliderTrack")
         .background(
             GeometryReader { geo in
                 Color.clear.onAppear { trackW = geo.size.width }
@@ -421,6 +435,16 @@ struct FluidSlider: View {
             pipsLayer
             // z2 — opaque pads under the texts so no pip shows through.
             occluders
+            // z3 — hover preview bar: fill edge → snapped edge. Same
+            // z-index as the fill/handle and EARLIER in DOM order, so
+            // they paint over it (slider.tsx:1455 before 1517/1528).
+            if let p = preview, !pressed {
+                Rectangle()
+                    .fill(FluidTone.accent.opacity(0.4))
+                    .frame(width: abs(p.width))
+                    .offset(x: p.left)
+                    .transition(.opacity)
+            }
             // z3 — the fill.
             Rectangle()
                 .fill(FluidTone.active)
@@ -434,15 +458,6 @@ struct FluidSlider: View {
                 .offset(x: handleX)
                 .animation(FluidSpring.fast, value: handleX)
                 .animation(FluidSpring.fast, value: handleColor)
-            // z3 — hover preview bar: fill edge → snapped edge, under the
-            // text (source renders it z-[3] below the z-[4] label row).
-            if let p = preview, !pressed {
-                Rectangle()
-                    .fill(FluidTone.accent.opacity(0.4))
-                    .frame(width: abs(p.width))
-                    .offset(x: p.left)
-                    .transition(.opacity)
-            }
             // z4 — label + value.
             HStack {
                 if let label {
@@ -469,14 +484,8 @@ struct FluidSlider: View {
             Rectangle()
                 .fill(FluidTone.active)
                 .frame(width: max(0, displayedP * trackW))
-            // z10 — the handle line, 2px at left: p*W - 9 + zo.
-            RoundedRectangle(cornerRadius: 1)
-                .fill(handleColor)
-                .frame(width: 2)
-                .padding(.vertical, activeUI ? 7 : 8)
-                .offset(x: scrubHandleX)
-                .animation(FluidSpring.fast, value: handleColor)
-            // Hover preview under the text (source's z-[3] below z-10).
+            // z3 — hover preview: over the z-auto fill, under the z-10
+            // handle line and text (slider.tsx:1456 before 1588).
             if let p = preview, !pressed {
                 Rectangle()
                     .fill(FluidTone.accent.opacity(0.4))
@@ -484,6 +493,13 @@ struct FluidSlider: View {
                     .offset(x: p.left)
                     .transition(.opacity)
             }
+            // z10 — the handle line, 2px at left: p*W - 9 + zo.
+            RoundedRectangle(cornerRadius: 1)
+                .fill(handleColor)
+                .frame(width: 2)
+                .padding(.vertical, activeUI ? 7 : 8)
+                .offset(x: scrubHandleX)
+                .animation(FluidSpring.fast, value: handleColor)
             // z10 — label + value, px-4.
             HStack(spacing: 12) {
                 if let label {
@@ -504,7 +520,11 @@ struct FluidSlider: View {
                 .contentShape(Rectangle())
                 .offset(x: displayedP * trackW - 8 + displayedZO)
                 .highPriorityGesture(
-                    DragGesture(minimumDistance: 0)
+                    // The strip is 8pt wide — gesture locations in its own
+                    // space read ~0-8 regardless of pointer position; the
+                    // named space lands them in container coordinates like
+                    // the source's clientX → container-rect mapping.
+                    DragGesture(minimumDistance: 0, coordinateSpace: .named("fluidSliderTrack"))
                         .onChanged { g in
                             guard !isDisabled else { return }
                             if !pressed { pressed = true; focusedThumb = 0; keyboard = false }
@@ -550,14 +570,22 @@ struct FluidSlider: View {
         // Positions match the source's `justify-between` inside px-3.
         Canvas { ctx, size in
             let n = pips.count
-            guard n > 1 else { return }
+            guard n >= 1 else { return }
             let inset: CGFloat = 12
             let span = max(0, size.width - inset * 2 - 5)
             for (i, pip) in pips.enumerated() {
-                let x = inset + span * CGFloat(i) / CGFloat(n - 1)
+                // Pixel-aligned so the 5px dot doesn't straddle a
+                // boundary; a lone pip parks at the left edge
+                // (slider.tsx:1156).
+                let x = n > 1
+                    ? (inset + span * CGFloat(i) / CGFloat(n - 1)).rounded()
+                    : inset
                 let active = pip == value0
                 ctx.fill(
-                    Path(ellipseIn: CGRect(x: x, y: (size.height - 5) / 2, width: 5, height: 5)),
+                    Path(ellipseIn: CGRect(
+                        x: x, y: ((size.height - 5) / 2).rounded(),
+                        width: 5, height: 5
+                    )),
                     with: .color(active ? FluidTone.foreground : FluidTone.mutedForeground.opacity(0.3))
                 )
             }
@@ -586,6 +614,10 @@ struct FluidSlider: View {
                             startPoint: .leading, endPoint: .trailing
                         )
                     )
+                    // Animate inside the mask — the sibling-scope
+                    // animation on the fill doesn't reach in here, and
+                    // the reveal edge tracks the fill edge in the source.
+                    .animation(FluidSpring.fast, value: fillWidth)
             }
         }
     }
@@ -610,6 +642,9 @@ struct FluidSlider: View {
 
     private func computePreview(at x: CGFloat) {
         guard trackW > 0 else { return }
+        // Source's `if (pipCount <= 1) return` — a degenerate grid would
+        // paint a full-left bar (slider.tsx:1218).
+        if variant == .pips, pipCount <= 1 { preview = nil; return }
         let v = comfortableValue(at: x)
         let snappedX = range.upperBound == range.lowerBound
             ? 0 : CGFloat((v - range.lowerBound) / (range.upperBound - range.lowerBound)) * trackW
@@ -695,7 +730,20 @@ struct FluidSlider: View {
             alignment: .top
         )
         .frame(maxWidth: .infinity)
-        .contentShape(Rectangle())
+        // The hit area lives HERE, not on the overflowing track — a
+        // contentShape on a parent can't gate a child's, but hit delivery
+        // to a child outside the parent's bounds is unreliable, so the
+        // area's region covers the track's real rect plus the -8px
+        // margins (slider.tsx:1376-1383). For top/bottom/tooltip the 36px
+        // track overflows the shorter area by 16px at the bottom.
+        .contentShape(FluidSliderSlop(
+            horizontal: 8,
+            // Tooltip mode reserves the top 16px for the chip — the
+            // source's hit div covers only the visual track, so the pad
+            // stays dead (negative top shrinks the region).
+            top: pos == .tooltip ? -16 : 0,
+            bottom: (pos == .left || pos == .right) ? 0 : 16
+        ))
         .onHover { h in
             guard !isDisabled else { return }
             hoverChanged(h)
@@ -707,6 +755,11 @@ struct FluidSlider: View {
             case .ended: break
             }
         }
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { compactDragChanged($0.location.x) }
+                .onEnded { _ in compactDragEnded() }
+        )
     }
 
     /// The 36px track div: capsule bg (z0), step dots (z1), thumbs (z10),
@@ -731,15 +784,6 @@ struct FluidSlider: View {
                 Color.clear.onAppear { measure(geo.size.width) }
                     .onChange(of: geo.size.width) { _, w in measure(w) }
             }
-        )
-        // The -8px horizontal hit extension (slider.tsx:1376-1383) — the
-        // inset contentShape expands the hit region itself; x in the
-        // margin clamps inside compactDragChanged.
-        .contentShape(FluidSliderSlop(horizontal: 8))
-        .highPriorityGesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { compactDragChanged($0.location.x) }
-                .onEnded { _ in compactDragEnded() }
         )
     }
 
@@ -804,7 +848,11 @@ struct FluidSlider: View {
             for p in dotPercents {
                 let x = Self.thumb / 2 + CGFloat(p) * (size.width - Self.thumb)
                 ctx.fill(
-                    Path(ellipseIn: CGRect(x: x - s / 2, y: size.height / 2 - s / 2, width: s, height: s)),
+                    Path(ellipseIn: CGRect(
+                        x: (x - s / 2).rounded(),
+                        y: (size.height / 2 - s / 2).rounded(),
+                        width: s, height: s
+                    )),
                     with: .color(FluidTone.mutedForeground.opacity(0.3))
                 )
             }
@@ -971,10 +1019,11 @@ struct FluidSlider: View {
         }
         if !pxSynced {
             guard w > 0 else { return }
+            // trackW first — vpx derives usable = trackW - 20 from it.
+            trackW = w
             px0 = vpx(value0)
             px1 = isRange ? vpx(value1) : 0
             pxSynced = true
-            trackW = w
             return
         }
         guard w != trackW, w > 0 else { return }
@@ -1069,12 +1118,20 @@ struct FluidSlider: View {
             Text(format(val(i)))
                 .contentShape(Rectangle())
                 .onTapGesture { startEdit(i) }
-                .onHover { h in h ? NSCursor.iBeam.push() : NSCursor.pop() }
+                .onHover { h in
+                    // Balanced push/pop — the Text is destroyed when the
+                    // editor mounts, so teardownHover + startEdit pop too.
+                    // Disabled sliders show pointer-events-none — no iBeam.
+                    guard h != iBeamHover, !(h && isDisabled) else { return }
+                    iBeamHover = h
+                    if h { NSCursor.iBeam.push() } else { NSCursor.pop() }
+                }
         }
     }
 
     private func startEdit(_ i: Int) {
         guard !isDisabled else { return }
+        if iBeamHover { iBeamHover = false; NSCursor.pop() }
         editing = i
         editText = Self.defaultFormat(val(i))
         editFocused = true
@@ -1084,7 +1141,7 @@ struct FluidSlider: View {
     /// NaN or Escape just closes the editor.
     private func commitEdit() {
         guard let i = editing else { return }
-        if let parsed = Double(editText.trimmingCharacters(in: .whitespaces)) {
+        if let parsed = Self.parseLeadingDouble(editText) {
             emit(i, snapValue(min(max(effMin, parsed), effMax)))
         }
         editing = nil
@@ -1096,10 +1153,23 @@ struct FluidSlider: View {
         editFocused = false
     }
 
+    /// parseFloat — the longest valid leading prefix, nil when none.
+    private static func parseLeadingDouble(_ s: String) -> Double? {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        return t.withCString { ptr -> Double? in
+            var end: UnsafeMutablePointer<CChar>?
+            let v = strtod(ptr, &end)
+            return end == UnsafeMutablePointer(mutating: ptr) ? nil : v
+        }
+    }
+
     // MARK: - Keyboard (the hidden Radix slider's key map)
 
     private func handleKey(_ press: KeyPress) -> KeyPress.Result {
-        guard !isDisabled, editing == nil, focusedThumb != nil else { return .ignored }
+        // dragging/pressed drop keys like the source's handleRadixChange
+        // early-return — pointer interaction owns the value mid-drag.
+        guard !isDisabled, !dragging, !pressed,
+              editing == nil, focusedThumb != nil else { return .ignored }
         let shift = press.modifiers.contains(.shift)
         switch press.key {
         case .leftArrow, .downArrow:                    // "from-left" back keys
@@ -1121,6 +1191,10 @@ struct FluidSlider: View {
     /// aligned values move `direction*multiplier` steps, unaligned ones
     /// round to the next step in the direction.
     private func nudge(thumb i: Int, direction: Int, multiplier: Int) {
+        // Gate here, not per caller — VoiceOver's adjustable action and
+        // the keyboard map both route through this (Radix disabled thumbs
+        // refuse interaction entirely).
+        guard !isDisabled else { return }
         let cur = val(i)
         let next: Double
         if let sv = stepValues {
@@ -1149,6 +1223,7 @@ struct FluidSlider: View {
     /// Radix's updateValues → getNextSortedValues: write the thumb's value,
     /// re-sort (keys can cross thumbs), focus follows the moved value.
     private func commitSorted(thumb i: Int, value v: Double) {
+        guard !isDisabled else { return }
         var vs = isRange ? [value0, value1] : [value0]
         vs[i] = v
         vs.sort()
@@ -1160,9 +1235,10 @@ struct FluidSlider: View {
     // MARK: - Shared hover + focus-visible modality
 
     private func hoverChanged(_ h: Bool) {
+        let was = hovered
         withAnimation(.easeOut(duration: 0.08)) { hovered = h }
         if h {
-            NSCursor.resizeLeftRight.push()
+            if !was { NSCursor.resizeLeftRight.push() }
             withAnimation(FluidSpring.moderate) { dotScale = 1.25 }
             tipTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 100_000_000)
@@ -1174,7 +1250,9 @@ struct FluidSlider: View {
                 }
             }
         } else {
-            NSCursor.pop()
+            // A stray post-teardown hover(false) mustn't pop a cursor we
+            // never pushed — the stack is app-wide.
+            if was { NSCursor.pop() }
             withAnimation(FluidSpring.moderate) { dotScale = 1 }
             tipTask?.cancel()
             withAnimation(FluidSpring.fast) { showTip = false; preview = nil }
@@ -1182,13 +1260,25 @@ struct FluidSlider: View {
     }
 
     /// The push/pop pair can unbalance if the view dies mid-hover (the
-    /// cursor push survives teardown) — pop once on disappear.
+    /// cursor push survives teardown) — pop once on disappear, and drop
+    /// any live preview/chip so a remount can't flash stale chrome.
     private func teardownHover() {
         if hovered {
             hovered = false
             NSCursor.pop()
         }
+        if iBeamHover {
+            iBeamHover = false
+            NSCursor.pop()
+        }
         tipTask?.cancel()
+        preview = nil
+        showTip = false
+        pressed = false
+        dragging = false
+        editing = nil
+        editFocused = false
+        focusedThumb = nil
     }
 
     /// :focus-visible — a keyDown in this window means keyboard modality
@@ -1196,16 +1286,16 @@ struct FluidSlider: View {
     /// focus shows none). Mirrors the sidebar menu's monitor pair.
     private func installMonitors() {
         guard monitors.isEmpty else { return }
-        monitors.append(NSEvent.addLocalMonitorForEvents(
+        if let m = NSEvent.addLocalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         ) { [weak viewRef] event in
             if let w = event.window, w === viewRef?.view?.window { keyboard = false }
             return event
-        }!)
-        monitors.append(NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak viewRef] event in
+        } { monitors.append(m) }
+        if let m = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak viewRef] event in
             if let w = event.window, w === viewRef?.view?.window { keyboard = true }
             return event
-        }!)
+        } { monitors.append(m) }
     }
 }
 

@@ -155,6 +155,13 @@ final class AgentSocket {
         case "ping":
             answer(["pong": true])
         case "subscribe":
+            let mode: AskMode?
+            if let value = args["mode"] {
+                guard let raw = value as? String, let parsed = AskMode(rawValue: raw) else {
+                    answer(["error": "subscribe mode needs guard|full"]); return
+                }
+                mode = parsed
+            } else { mode = nil }
             let events = args["events"] as? [String] ?? ["*"]
             session.wants = Set(events)
             // A subscribe-only session still has to hear things, so the
@@ -165,7 +172,7 @@ final class AgentSocket {
                 // `mode` sets this session's own leash as it signs on —
                 // agent.mode in word form (permissions.md §1). Only the
                 // session's own, never anyone else's.
-                if let mode = (args["mode"] as? String).flatMap(AskMode.init(rawValue:)) {
+                if let mode {
                     (drive as? Drive)?.setMode(mode, for: .socket(session.token))
                 }
             }

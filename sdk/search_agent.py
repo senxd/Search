@@ -147,6 +147,8 @@ def _locator(target):
     → the query keys drive.js resolves."""
     if target is None:
         return {}
+    if isinstance(target, dict):
+        return dict(target)
     if target.startswith("css:"):
         return {"css": target[4:]}
     if target.startswith("text:"):
@@ -517,6 +519,14 @@ class Agent:
         """Keep the live agent tab as a normal user tab, including its draft."""
         return self.call("tabs.surface", tab=tab, foreground=bool(foreground))
 
+    def highlight(self, tab, target, duration=8, scroll=True):
+        """Outline one element temporarily. Respects Settings > Ask; does not select the tab."""
+        return self.call("page.highlight", tab=tab, duration=duration, scroll=scroll, **_locator(target))
+
+    def clear_highlight(self, tab):
+        """Dismiss this session's outline, including when highlights are disabled."""
+        return self.call("page.clearHighlight", tab=tab)
+
     def inspector_attach(self, tab):
         """Discover real WebKit protocol targets, commands, parameters and events."""
         return self.call("inspector.attach", tab=tab)
@@ -595,7 +605,9 @@ class Agent:
         return self.call("page.snapshot", **args)
 
     def screenshot(self, tab, path=None, marks=False, width=None):
-        """A PNG of the page → {path,width,height,format,data(b64)}.
+        """A page image → {path,width,height,viewport,scale,format,data(b64)}.
+        Default image pixels match CSS action coordinates. For an explicit
+        width, divide image coordinates by scale before clicking or dragging.
         ``marks`` has drive.js draw index boxes first; ``width`` rescales.
         With no ``path`` the image lands in a tmp file whose name is
         handed to the server, and that path comes back in the result."""
@@ -668,8 +680,10 @@ class Agent:
                          **_act_args("type", target, args))
 
     def press(self, tab, key, target=None, modifiers=None, **args):
-        """act.press — "Enter","Tab","Escape","Backspace","a"…+modifiers;
-        a real NSEvent, focused on ``target`` first when one is given."""
+        """Press a named key or chord such as ``cmd+a`` with real NSEvents.
+        Search runs on macOS: use ``cmd`` for editing shortcuts. Modifier
+        names and aliases are case-insensitive; invalid keys are rejected.
+        Focuses ``target`` first when one is given."""
         args["key"] = key
         if modifiers is not None:
             args["modifiers"] = list(modifiers)
@@ -713,6 +727,33 @@ class Agent:
         {ok,at,tier,element?}."""
         return self.call("act.clickAt", tab=tab, x=x, y=y, **args)
 
+    def drag(self, tab, source, to, steps=None, **args):
+        """act.drag — drag a source locator to another locator or a viewport
+        point (x, y), optionally following a continuous viewport path.
+        Returns after the native mouse gesture completes."""
+        args["source"] = list(source) if isinstance(source, (tuple, list)) else _locator(source)
+        args["to"] = list(to) if isinstance(to, (tuple, list)) else _locator(to)
+        if steps is not None:
+            args["steps"] = steps
+        return self.call("act.drag", tab=tab, **args)
+
+    def save_pdf(self, tab):
+        """page.pdf — render the current page to a session-scoped artifact."""
+        return self.call("page.pdf", tab=tab)
+
+    def artifacts(self, tab=None):
+        """→ metadata for this session's saved PDFs and completed downloads."""
+        args = {} if tab is None else {"tab": tab}
+        return self.call("artifact.list", **args).get("artifacts", [])
+
+    def downloads(self, tab=None):
+        """Completed downloads owned by this session, with readable metadata."""
+        return [item for item in self.artifacts(tab) if item.get("kind") == "download"]
+
+    def artifact_read(self, artifact_id, offset=0, length=48_000):
+        """Read a binary artifact chunk as base64, scoped to this session."""
+        return self.call("artifact.read", id=artifact_id, offset=offset, length=length)
+
     # ------------------------------------------------------------ meta
 
     def lease(self, tab, on=True):
@@ -749,6 +790,14 @@ class Agent:
         ``a.call("ui.ask", send="…")`` → {open, ok, chat}, and ``steer``
         / ``stop_ask`` feed and kill the running turn."""
         return self.call("ui.ask", open=bool(on))
+
+    def ask_status(self):
+        """→ current in-app Ask chat, model, turn activity, and waiting state."""
+        return self.call("ui.ask", status=True)
+
+    def ask_new_chat(self):
+        """Start a fresh empty in-app chat when no Ask turn is running."""
+        return self.call("ui.ask", new=True)
 
     def steer(self, text):
         """ui.ask — a follow-up for the in-app agent's live turn →

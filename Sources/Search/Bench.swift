@@ -3,6 +3,12 @@ import AuthenticationServices
 import SwiftUI
 import WebKit
 
+/// The hidden bench window gives WebKit an active view for pointer movement.
+/// It stays off screen and never becomes the application's actual key window.
+private final class BenchRoomWindow: NSWindow {
+    override var isKeyWindow: Bool { true }
+}
+
 // A way for a script on this Mac to drive the browser you already have open,
 // in tabs of its own, without ever taking the window from you.
 //
@@ -23,6 +29,14 @@ import WebKit
 @MainActor
 final class Bench {
     static let shared = Bench()
+    static var miniWoBViewport: NSSize? {
+        guard Store.testing else { return nil }
+        switch ProcessInfo.processInfo.environment["SEARCH_BENCHMARK"] {
+        case "miniwob": return NSSize(width: 332, height: 214)
+        case "broad": return NSSize(width: 1440, height: 900)
+        default: return nil
+        }
+    }
     private var awake: NSObjectProtocol?
 
     private weak var browser: Browser?
@@ -107,6 +121,9 @@ final class Bench {
     func start(for browser: Browser) {
         guard !running else { return }
         self.browser = browser
+        if Store.testing, ProcessInfo.processInfo.environment["SEARCH_BENCHMARK"] == "miniwob" {
+            BenchmarkSignals.install()
+        }
         // Nor App Nap, which a test run behind other windows falls into.
         if Store.testing, !Store.measuring, awake == nil {
             awake = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Bench")
@@ -285,6 +302,12 @@ final class Bench {
         let verb = request["do"] as? String ?? ""
 
         switch verb {
+        case "agent-run":
+            guard Store.testing, ProcessInfo.processInfo.environment["SEARCH_BENCHMARK"] == "broad" else {
+                answer(["error": "agent-run requires an isolated broad benchmark world"]); return
+            }
+            BenchmarkRuns.shared.handle(request, answer)
+
         case "guard-test":
             guard Store.testing else { answer(["error": "guard-test only works on a --test run"]); return }
             GuardTesting.handle(request, answer)
@@ -1480,6 +1503,8 @@ final class Bench {
             if let on = request["sidebar"] as? Bool { browser.prefs.sidebar = on }
             if let on = request["spaces"] as? Bool { browser.prefs.usesSpaces = on }
             if let on = request["hides"] as? Bool { browser.prefs.sideHides = on }
+            if let on = request["agentFocus"] as? Bool { browser.prefs.agentFocus = on }
+            if let on = request["agentHighlights"] as? Bool { browser.prefs.agentHighlights = on }
             if let on = request["folded"] as? Bool { browser.folded = on }
             if let on = request["peek"] as? Bool { browser.peeking = on }
             // The Ask rail: its own toggle, and the ask pref it rides on.
@@ -2039,18 +2064,34 @@ final class Bench {
     /// The `built` check keeps the question from being the reason a view
     /// exists — a sleeping tab stays asleep.
     func house(_ tab: Tab) {
-        guard tab.built != nil, tab.web.window == nil else { return }
-        let window = room ?? makeRoom()
-        tab.web.frame = window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-        tab.web.autoresizingMask = [.width, .height]
-        window.contentView?.addSubview(tab.web)
+        guard let web = tab.built else { return }
+        house(web)
     }
+
+    /// MiniWoB keeps pages in the off-screen host after logical selection,
+    /// so page geometry and WebKit's active native-input route stay fixed.
+    func house(_ web: PageView) {
+        let viewport = Self.miniWoBViewport
+        if let existing = web.window, !isRoom(existing), viewport == nil { return }
+        let window = room ?? makeRoom()
+        let bounds = window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        if web.window !== window { web.removeFromSuperview() }
+        web.frame = NSRect(origin: bounds.origin, size: viewport ?? bounds.size)
+        web.autoresizingMask = viewport == nil ? [.width, .height] : []
+        // Disable occlusion tracking before the view enters its off-screen
+        // window. WebKit may decide to throttle it as it attaches otherwise.
+        web.keepRenderingWhileHoused()
+        if web.superview !== window.contentView { window.contentView?.addSubview(web) }
+    }
+
+    func isRoom(_ window: NSWindow) -> Bool { window === room }
 
     private func makeRoom() -> NSWindow {
         // Off every screen, and never key or main: it exists so that a web
         // view has a window, and for nothing else.
-        let window = NSWindow(
-            contentRect: NSRect(x: -20000, y: -20000, width: 1280, height: 800),
+        let viewport = Self.miniWoBViewport ?? NSSize(width: 1280, height: 800)
+        let window = BenchRoomWindow(
+            contentRect: NSRect(origin: NSPoint(x: -20000, y: -20000), size: viewport),
             styleMask: [.borderless],
             backing: .buffered,
             defer: false

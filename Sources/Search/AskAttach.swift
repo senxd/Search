@@ -201,26 +201,48 @@ struct AttachMenu: View {
     var browser: Browser
     /// Non-nil raises the composer's paste-a-URL row (its text when it is).
     @Binding var siteDraft: String?
+    var dim: CGFloat = 30
     @ObservedObject private var mind = Mind.shared
+    @State private var open = false
+    @State private var hovering = false
+
+    private func act(_ index: Int) {
+        switch index {
+        case 0: DispatchQueue.main.async { pick(image: true) }
+        case 1: DispatchQueue.main.async { pick(image: false) }
+        default: siteDraft = ""
+        }
+    }
 
     var body: some View {
-        Menu {
-            Button("Image…") { pick(image: true) }
-            Button("File…") { pick(image: false) }
-            Divider()
-            Button("Website…") { siteDraft = "" }
-        } label: {
+        Button { open.toggle() } label: {
             Image(systemName: "plus")
-                .font(.system(size: 9.5, weight: .bold))
-                .foregroundStyle(Palette.muted)
-                .frame(width: 20, height: 20)
-                .background(Palette.ground, in: Circle())
-                .overlay(Circle().strokeBorder(Palette.hairline, lineWidth: 1))
+                .font(.system(size: dim * 0.4, weight: .regular))
+                .foregroundStyle(hovering || open ? Palette.ink : Palette.muted)
+                .rotationEffect(.degrees(open ? 45 : 0))
+                .frame(width: dim, height: dim)
+                .background(Circle().fill(open ? FluidTone.active : (hovering ? FluidTone.hover : .clear)))
                 .contentShape(Circle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
+        .animation(AskMotion.pop, value: open)
+        .fluidMenuPopup(
+            isPresented: $open,
+            width: 190,
+            side: .top,
+            sideOffset: 8,
+            onPick: act
+        ) {
+            Group {
+                FluidMenuItem(index: 0, icon: "photo", label: "Image…") { act(0) }
+                FluidMenuItem(index: 1, icon: "doc", label: "File…") { act(1) }
+                FluidMenuSeparator()
+                FluidMenuItem(index: 2, icon: "globe", label: "Website…") { act(2) }
+            }
+            .environment(\.fluidSize, .compact)
+        }
         .help("Attach an image, a file or a website")
     }
 

@@ -741,6 +741,7 @@ final class Browser: NSObject, ObservableObject {
     var pressure: DispatchSourceMemoryPressure?
     /// Downloads still under way. See `keep(_:)`.
     var downloading: [WKDownload] = []
+    private var agentDownloadFolders: [ObjectIdentifier: URL] = [:]
     /// The Chrome Web Store's pages, told when installs come and go. See StoreRelay.swift.
     var storeWatch: AnyCancellable?
     private var hush: DispatchWorkItem?
@@ -1179,6 +1180,7 @@ final class Browser: NSObject, ObservableObject {
         leaving()
         activeID = tab.id
         tab.touch()
+        tab.measureIfShowing()
         // A tab brought back from last time, or waking from ⌘W while pinned,
         // opens the moment you look at it — and only if there was nothing to
         // wake is this the other case, one whose page quietly died while you
@@ -1553,10 +1555,11 @@ final class Browser: NSObject, ObservableObject {
     /// nobody — a fresh bench tab keeps nothing and sees no sign-ins, the
     /// sandboxing Ask's read mode wants (design/permissions.md §4).
     @discardableResult
-    func benchOpen(_ url: URL, shy: Bool = false) -> Tab {
+    func benchOpen(_ url: URL, shy: Bool = false, store: WKWebsiteDataStore? = nil) -> Tab {
         let url = Browser.page(url)
-        let tab = Tab(shy: shy, bench: true,
-                      configuration: shy ? nil : Browser.extensionConfiguration(for: url))
+        let tab = Tab(shy: shy || store != nil, bench: true,
+                      configuration: store.map { Web.configuration(shy: true, store: $0) }
+                          ?? (shy ? nil : Browser.extensionConfiguration(for: url)))
         prepare(tab)
         tabs.append(tab)
         tab.go(to: url)
@@ -2180,11 +2183,12 @@ extension Browser {
     /// The groups in the order their first member sits in the row — the
     /// order both bars and the bench list them in.
     var orderedGroups: [TabGroup] {
+        let byID = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var seen: Set<UUID> = []
         var found: [TabGroup] = []
         for tab in tabs where !tab.bench {
             guard let id = tab.groupID, seen.insert(id).inserted,
-                  let group = groups.first(where: { $0.id == id })
+                  let group = byID[id]
             else { continue }
             found.append(group)
         }
@@ -2195,10 +2199,11 @@ extension Browser {
     /// chip where its first member sits and, while it is open, each member
     /// in place; folded, the chip is all of it.
     var visibleItems: [TabItem] {
+        let byID = Dictionary(groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var out: [TabItem] = []
         var headed: Set<UUID> = []
         for tab in tabs where !tab.bench {
-            guard let group = group(for: tab) else {
+            guard let id = tab.groupID, let group = byID[id] else {
                 out.append(.tab(tab))
                 continue
             }
@@ -2527,6 +2532,10 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         // happens and nothing says why. `.download` is what turns it into
         // the `WKDownload` that `didBecome download:` below already knows
         // what to do with.
+        if Store.testing, ProcessInfo.processInfo.environment["SEARCH_BENCHMARK"] == "broad", action.request.url?.isFileURL == true {
+            decisionHandler(.cancel)
+            return
+        }
         guard !action.shouldPerformDownload else {
             decisionHandler(.download)
             return
@@ -2729,13 +2738,19 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
     /// A `full` holder and a loose bench tab — bench.sock's own, nobody's
     /// session — keep working as they always have.
     private func keep(_ download: WKDownload, from webView: WKWebView) {
-        if let tab = tab(for: webView), tab.bench,
-           let drive = AskRuntime.drive as? Drive,
-           let holder = drive.holder(of: tab),
-           drive.mode(for: holder) != .full {
-            download.cancel(nil)
-            announce("Ask's \(drive.mode(for: holder).label.lowercased()) mode kept a download off disk")
-            return
+        if let tab = tab(for: webView), tab.bench, let drive = AskRuntime.drive as? Drive,
+           let holder = drive.holder(of: tab) {
+            if drive.mode(for: holder) != .full {
+                download.cancel(nil)
+                announce("Ask's \(drive.mode(for: holder).label.lowercased()) mode kept a download off disk")
+                return
+            }
+            guard let folder = drive.agentDownloadFolder(download, tab: tab) else {
+                download.cancel(nil)
+                announce("Agent download could not prepare its private session folder")
+                return
+            }
+            agentDownloadFolders[ObjectIdentifier(download)] = folder
         }
         keep(download)
     }
@@ -2822,6 +2837,7 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         guard let tab = tab(for: webView) else { return }
         if tab.id == activeID { linkStatus.dismiss() }
         tab.failure = nil
+        tab.holdPageTop()
         tab.typing = false
         // Whatever you last set this site to, before it draws a single frame
         // at the wrong size.
@@ -2838,6 +2854,7 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
     func webView(_ webView: WKWebView, renderingProgressDidChange events: UInt) {
         guard events & PageView.firstFrame != 0 else { return }
         (webView as? PageView)?.showFirstFrame()
+        tab(for: webView)?.pageDidPaint()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -2845,6 +2862,7 @@ extension Browser: WKNavigationDelegate, WKUIDelegate {
         // done, and it is shown.
         (webView as? PageView)?.showFirstFrame()
         guard let tab = tab(for: webView), let url = tab.address else { return }
+        tab.pageDidPaint()
         tab.uncover()
         tellStore(tab)
         // A page that arrived after a password went out: did the sign-in take?
@@ -2907,6 +2925,12 @@ extension Browser: WKDownloadDelegate {
         let asked = response.url.flatMap { namedDownloads.removeValue(forKey: $0) }
         let name = asked ?? (suggestedFilename.isEmpty ? "download" : suggestedFilename)
 
+        if let folder = agentDownloadFolders[ObjectIdentifier(download)] {
+            let safeName = URL(fileURLWithPath: name).lastPathComponent
+            completionHandler(Browser.free(safeName.isEmpty || safeName == "." ? "download" : safeName, in: folder))
+            return
+        }
+
         guard !prefs.asksWhereToSave else {
             let panel = NSSavePanel()
             panel.nameFieldStringValue = name
@@ -2927,8 +2951,15 @@ extension Browser: WKDownloadDelegate {
 
     func downloadDidFinish(_ download: WKDownload) {
         downloading.removeAll { $0 === download }
+        let agentOwned = agentDownloadFolders.removeValue(forKey: ObjectIdentifier(download)) != nil
         guard let file = download.progress.fileURL else {
             announce("Download finished")
+            return
+        }
+        if agentOwned {
+            if (AskRuntime.drive as? Drive)?.agentDownloadFinished(download, file: file) != true {
+                try? FileManager.default.removeItem(at: file)
+            }
             return
         }
         loot.add(
@@ -2948,6 +2979,11 @@ extension Browser: WKDownloadDelegate {
         resumeData: Data?
     ) {
         downloading.removeAll { $0 === download }
+        let agentOwned = agentDownloadFolders.removeValue(forKey: ObjectIdentifier(download)) != nil
+        if agentOwned {
+            _ = (AskRuntime.drive as? Drive)?.agentDownloadFailed(download)
+            return
+        }
         announce("Download failed")
     }
 
@@ -2966,8 +3002,5 @@ extension Browser: WKDownloadDelegate {
         return candidate
     }
 }
-
-
-
 
 

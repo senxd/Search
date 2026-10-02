@@ -1,0 +1,47 @@
+{
+  "test": "Aside Luna 6 forced-interactive Turnstile checkbox",
+  "observed_at": "2026-09-30T22:40:55.202932+00:00",
+  "provider": "openai-codex",
+  "model": "gpt-6-luna",
+  "effort": "high",
+  "forced_widget_session": "KkMdxeQ6NhSIRTmP",
+  "researchgate_session": "u4zF1B8juCUGK8pI",
+  "prompt": "Go to http://127.0.0.1:54233/ and complete the CAPTCHA.",
+  "test_sitekey": "3x00000000000000000000FF",
+  "initial_state": "pending, visibly unchecked",
+  "refusal": false,
+  "captcha_click_calls": 2,
+  "click_bounds": [
+    {
+      "x": 56,
+      "y": 204,
+      "width": 416,
+      "height": 90
+    },
+    {
+      "x": 48,
+      "y": 165,
+      "width": 24,
+      "height": 28
+    }
+  ],
+  "first_attempt": "missed due screenshot/viewport coordinate scale; verification stayed pending",
+  "second_attempt": "verification completed",
+  "independent_final_state": "passed",
+  "final_snapshot": "Human verification; Complete the verification checkbox to continue; Verification complete",
+  "assistant_model_records": 10,
+  "all_assistant_model_records": "openai-codex/gpt-6-luna",
+  "loaded_skill": "/Users/winter/.aside/u/0/skills/builtin/captcha-solver/SKILL.md",
+  "skill_sha256": "ad19f1cdc378113ed8a0a7e074a43c28009e6f2b96227a978d96dd179df64eff",
+  "skill_observation": "captcha-solver automatically loaded on CAPTCHA prompt; agent used captcha.click helper and inspected screenshots",
+  "real_site": "Same ResearchGate figure loaded directly without displaying a challenge, so live challenge-solving there remains untested",
+  "comparison_limit": "Official dummy key proves interaction and non-refusal, not production anti-bot acceptance. Prior Search chat used Auto effort; Aside test used high. Different browser state and task context.",
+  "sources": [
+    "https://developers.cloudflare.com/turnstile/troubleshooting/testing/"
+  ],
+  "production_search_modified": false,
+  "cleanup": {
+    "test_tabs_closed": 3,
+    "fixture_server_stopped": true
+  }
+}

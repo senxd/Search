@@ -36,228 +36,372 @@ enum AskChips {
             }
         }
 
-    /// The reasoning efforts a thinking wire takes — nil is "auto", the
-    /// provider's own call; each with the word its menu reads and the
-    /// short form the chip wears.
-    static let efforts: [(value: String?, title: String, chip: String)] = [
-        (nil, "Auto", "auto"),
-        ("off", "Off", "off"),
-        ("low", "Low", "low"),
-        ("medium", "Medium", "med"),
-        ("high", "High", "high"),
+    /// One reasoning level the composer can offer. `value` nil is Auto:
+    /// the request leaves the field off and the model uses its default.
+    struct Effort: Equatable {
+        var value: String?
+        var title: String
+    }
+
+    /// Levels this model actually accepts, Auto first. A pick stored for
+    /// another model is not offered here — `wireEffort` says what this
+    /// model will be sent instead. harness.js `effortLevel` is the same map.
+    static func efforts(provider: String, model: String) -> [Effort] {
+        [Effort(value: nil, title: "Auto")] + nativeEfforts(provider: provider, model: model)
+    }
+
+    /// The `reasoning.effort` token to send, or nil to send nothing.
+    /// "off" is the old stored word for switching reasoning off.
+    static func wireEffort(_ stored: String?, provider: String, model: String) -> String? {
+        guard let stored, !stored.isEmpty else { return nil }
+        return effortMap(provider: provider, model: model)[stored]
+    }
+
+    /// Menu rows are the tokens the model takes unchanged. Aliases such
+    /// as "off" resolve through `wireEffort` onto one of these.
+    private static func nativeEfforts(provider: String, model: String) -> [Effort] {
+        let map = effortMap(provider: provider, model: model)
+        let order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        let titles = [
+            "none": "Off", "minimal": "Minimal", "low": "Low", "medium": "Medium",
+            "high": "High", "xhigh": "Extra high", "max": "Max",
+        ]
+        return order.compactMap { token in
+            guard map[token] == token, let title = titles[token] else { return nil }
+            return Effort(value: token, title: title)
+        }
+    }
+
+    /// Codex gpt-6-luna: none, low, medium (its default), high, xhigh, max.
+    /// It has no "minimal" — that word 400s, and "off" is a real none.
+    private static let codexLuna: [String: String] = [
+        "off": "none", "none": "none", "minimal": "low",
+        "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max",
     ]
+
+    /// OpenRouter's own ladder, for a model without a tighter table.
+    /// "off" is a real disable (`none`).
+    private static let openrouter: [String: String] = [
+        "off": "none", "none": "none", "minimal": "minimal",
+        "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max",
+    ]
+
+    /// Z.ai GLM-5.3 Flash accepts only low, high, and max. Anything else
+    /// errors, and thinking cannot be turned off, so the floor is low.
+    /// medium folds up to high; xhigh folds up to max.
+    private static let glmFlash: [String: String] = [
+        "off": "low", "none": "low", "minimal": "low",
+        "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max",
+    ]
+
+    private static let tables: [String: [String: String]] = [
+        "codex/gpt-6-luna": codexLuna,
+        "openrouter/z-ai/glm-5.3-flash": glmFlash,
+    ]
+
+    private static func effortMap(provider: String, model: String) -> [String: String] {
+        if let table = tables["\(provider)/\(model)"] { return table }
+        if provider == "codex" { return codexLuna }
+        if provider == "openrouter" { return openrouter }
+        return [:]
+    }
 }
 
-/// The model as a capsule — a menu of the providers' sections behind a
-/// press, a check on the pair on duty. `short` is the header's, just
-/// the model's name; the composer's wears the provider with it.
-struct ModelSelector: View {
+/// The quiet handle every composer pick wears — a word and a chevron on
+/// the floor, a wash under the pointer, a deeper one while its list is up.
+struct AskPick: View {
+    var icon: String? = nil
+    var provider: String? = nil
+    let text: String
+    var open = false
+    var trouble = false
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                if let provider {
+                    ProviderLogo(provider: provider)
+                } else if let icon {
+                    Image(systemName: icon)
+                        .font(.system(size: 9.5, weight: .medium))
+                }
+                Text(text)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 150)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+                    .rotationEffect(.degrees(open ? 180 : 0))
+            }
+            .foregroundStyle(trouble ? FluidTone.destructive : (hovering || open ? Palette.ink : Palette.muted))
+            .padding(.horizontal, 8)
+            .frame(height: 24)
+            .background(Capsule().fill(open ? FluidTone.active : (hovering ? FluidTone.hover : .clear)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(Motion.quick, value: hovering)
+        .animation(AskMotion.pop, value: open)
+    }
+}
+
+private struct AskPickRow {
+    let index: Int
+    let act: () -> Void
+}
+
+private extension View {
+    func askPopup<Rows: View>(
+        _ open: Binding<Bool>,
+        checked: Int?,
+        width: CGFloat = 230,
+        rows: [AskPickRow],
+        @ViewBuilder content: @escaping () -> Rows
+    ) -> some View {
+        fluidMenuPopup(
+            isPresented: open,
+            checkedIndex: checked,
+            width: width,
+            maxHeight: 380,
+            side: .top,
+            align: .start,
+            sideOffset: 6,
+            selectionAck: 0.16,
+            onPick: { i in rows.first { $0.index == i }?.act() }
+        ) {
+            content().environment(\.fluidSize, .compact)
+        }
+    }
+}
+
+/// The brain, as a pick — the providers' sections in a Fluid list, a
+/// check on the pair on duty, and the way to Settings under them.
+struct ModelChip: View {
     var browser: Browser
     var short = false
     @ObservedObject private var mind = Mind.shared
+    @State private var open = false
 
-    /// A provider's models — plus the current one when it isn't a
-    /// listed name (a custom model typed in Settings), so the check
-    /// still lands somewhere.
-    private func items(in group: (name: String, provider: String, models: [(title: String, model: String)])) -> [(title: String, model: String)] {
-        var items = group.models
-        if mind.model.provider == group.provider,
-           !items.contains(where: { $0.model == mind.model.model }) {
-            items.append((title: mind.model.model, model: mind.model.model))
+    private struct Section {
+        let index: Int
+        let name: String
+        let provider: String
+        let models: [(title: String, model: String)]
+    }
+
+    private var sections: [Section] {
+        AskChips.providers.enumerated().map { i, group in
+            var models = group.models
+            if mind.model.provider == group.provider,
+               !models.contains(where: { $0.model == mind.model.model }) {
+                models.append((title: mind.model.label, model: mind.model.model))
+            }
+            return Section(index: i, name: group.name, provider: group.provider, models: models.map { (AskModel(provider: group.provider, model: $0.model).label, $0.model) })
         }
-        return items
+    }
+
+    private var settingsIndex: Int { AskChips.providers.count }
+
+    private var checked: Int? {
+        sections.first { $0.provider == mind.model.provider }?.index
+    }
+
+    private var rows: [AskPickRow] {
+        [AskPickRow(index: settingsIndex) { browser.openInternal(.settings, section: "ask") }]
+    }
+
+    private func current(_ section: Section) -> Int? {
+        guard section.provider == mind.model.provider else { return nil }
+        return section.models.firstIndex { $0.model == mind.model.model }
+    }
+
+    private func pick(_ section: Section, _ i: Int) {
+        guard section.models.indices.contains(i) else { return }
+        mind.model = AskModel(provider: section.provider, model: section.models[i].model)
     }
 
     var body: some View {
-        Menu {
-            ForEach(AskChips.providers, id: \.provider) { group in
-                Section(group.name) {
-                    ForEach(items(in: group), id: \.model) { item in
-                        Button {
-                            mind.model = AskModel(provider: group.provider, model: item.model)
-                        } label: {
-                            if mind.model == AskModel(provider: group.provider, model: item.model) {
-                                Label(item.title, systemImage: "checkmark")
-                            } else {
-                                Text(item.title)
-                            }
+        AskPick(provider: mind.model.provider, text: mind.model.label, open: open, trouble: mind.engine == nil) {
+            open.toggle()
+        }
+        .askPopup($open, checked: checked, width: 200, rows: rows) {
+            FluidMenuLabel("Provider", size: .compact)
+            ForEach(sections, id: \.index) { section in
+                FluidSubmenu(
+                    index: section.index,
+                    label: section.name,
+                    detail: current(section).map { section.models[$0].title },
+                    checked: section.provider == mind.model.provider,
+                    width: 230,
+                    checkedIndex: current(section),
+                    onPick: { pick(section, $0) }
+                ) {
+                    ForEach(Array(section.models.enumerated()), id: \.offset) { i, item in
+                        FluidMenuItem(index: i, label: item.title, checked: i == current(section)) {
+                            pick(section, i)
                         }
                     }
                 }
             }
-            Divider()
-            Button("Settings…") {
-                // The ask section of the settings page — the page hears the
-                // section asked for even when it is already open.
+            FluidMenuSeparator()
+            FluidMenuItem(index: settingsIndex, icon: "gearshape", label: "Settings…") {
                 browser.openInternal(.settings, section: "ask")
             }
-        } label: {
-            StatusChip(text: short ? mind.model.label : mind.model.readout)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
         .fixedSize()
+        .help(mind.engine == nil
+              ? "No engine is up — sends will land in a dead chat"
+              : "The model the next turn runs on")
     }
 }
 
-/// The brain and how hard it thinks as one capsule — the mock's
-/// "GPT-6 Luna · med ⌄". Its menu holds the providers' model sections
-/// and, while the wire takes one, the effort rows beneath them —
-/// effort is a property of a model that can use it, not a second menu.
-struct ModelChip: View {
-    var browser: Browser
-    @ObservedObject private var mind = Mind.shared
+typealias ModelSelector = ModelChip
 
-    /// The current chat's effort; with no chat open, the Settings
-    /// default the next chat is born with. nil reads "auto".
+/// How hard the brain thinks — only drawn while the wire in play can.
+struct EffortChip: View {
+    @ObservedObject private var mind = Mind.shared
+    @State private var open = false
+
     private var effort: String? {
         mind.current?.effort ?? Store.settings.string(forKey: "ask.effort")
     }
 
-    /// The chip's effort tail only counts while a reasoning wire is
-    /// in play — the next turn's pick or the wire the open chat is on.
     private var canReason: Bool {
         mind.model.canReason || (mind.current?.canReason ?? false)
     }
 
-    private var effortChip: String {
-        AskChips.efforts.first { ($0.value ?? "auto") == (effort ?? "auto") }?.chip ?? "auto"
+    /// The brain the next turn actually asks. A custom model id keeps its
+    /// provider and its own name, slashes and all.
+    private var brain: (provider: String, model: String) {
+        if mind.model.canReason { return (mind.model.provider, mind.model.model) }
+        let id = mind.current?.model ?? ""
+        if let slash = id.firstIndex(of: "/") {
+            return (String(id[..<slash]), String(id[id.index(after: slash)...]))
+        }
+        return (mind.model.provider, mind.model.model)
     }
 
-    /// A provider's models — plus the current one when it isn't a
-    /// listed name (a custom model typed in Settings), so the check
-    /// still lands somewhere.
-    private func items(in group: (name: String, provider: String, models: [(title: String, model: String)])) -> [(title: String, model: String)] {
-        var items = group.models
-        if mind.model.provider == group.provider,
-           !items.contains(where: { $0.model == mind.model.model }) {
-            items.append((title: mind.model.model, model: mind.model.model))
+    private var ladder: [AskChips.Effort] {
+        AskChips.efforts(provider: brain.provider, model: brain.model)
+    }
+
+    /// What this model will be sent for the stored pick, so a level it
+    /// does not accept shows as the one that goes out.
+    private var resolved: String? {
+        AskChips.wireEffort(effort, provider: brain.provider, model: brain.model)
+    }
+
+    private var checked: Int? {
+        ladder.firstIndex { $0.value == resolved }
+    }
+
+    private var rows: [AskPickRow] {
+        ladder.enumerated().map { i, item in
+            AskPickRow(index: i) { mind.setEffort(item.value) }
         }
-        return items
     }
 
     var body: some View {
-        Menu {
-            ForEach(AskChips.providers, id: \.provider) { group in
-                Section(group.name) {
-                    ForEach(items(in: group), id: \.model) { item in
-                        Button {
-                            mind.model = AskModel(provider: group.provider, model: item.model)
-                        } label: {
-                            if mind.model == AskModel(provider: group.provider, model: item.model) {
-                                Label(item.title, systemImage: "checkmark")
-                            } else {
-                                Text(item.title)
-                            }
-                        }
+        if canReason {
+            AskPick(icon: "brain", text: ladder.first { $0.value == resolved }?.title ?? "Auto", open: open) {
+                open.toggle()
+            }
+            .askPopup($open, checked: checked, width: 190, rows: rows) {
+                FluidMenuLabel("Reasoning", size: .compact)
+                ForEach(Array(ladder.enumerated()), id: \.offset) { i, item in
+                    FluidMenuItem(index: i, label: item.title, checked: i == checked) {
+                        mind.setEffort(item.value)
                     }
                 }
             }
-            if canReason {
-                Divider()
-                Section("Effort") {
-                    ForEach(AskChips.efforts, id: \.title) { item in
-                        Button {
-                            mind.setEffort(item.value)
-                        } label: {
-                            if (effort ?? "auto") == (item.value ?? "auto") {
-                                Label(item.title, systemImage: "checkmark")
-                            } else {
-                                Text(item.title)
-                            }
-                        }
-                    }
-                }
-            }
-            Divider()
-            Button("Settings…") {
-                browser.openInternal(.settings, section: "ask")
-            }
-        } label: {
-            StatusChip(text: canReason
-                       ? "\(mind.model.readout) · \(effortChip)"
-                       : mind.model.readout,
-                       trouble: mind.engine == nil)
+            .fixedSize()
+            .help("How hard this model reasons — only the levels it accepts")
+            .transition(.opacity)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help(mind.engine == nil
-              ? "No engine is up — sends will land in a dead chat"
-              : "The model and how hard it reasons")
     }
 }
 
-/// The mode as the same kind of capsule — the leash the next turn runs
-/// under (design/permissions.md §1), drawn whether or not a chat is
-/// open: with none, it edits the default a chat is born with.
+/// The leash the next turn runs under (design/permissions.md §1), drawn
+/// whether or not a chat is open: with none, it edits the default a chat
+/// is born with.
 struct ModeMenu: View {
     @ObservedObject private var mind = Mind.shared
+    @State private var open = false
 
-    /// The current chat's leash; with no chat open, the Settings
-    /// default the next chat is born with (the chip edits that).
+    private static let modes: [AskMode] = [.guard, .full]
+
     private var mode: AskMode {
         mind.current?.mode
             ?? AskMode(rawValue: Store.settings.string(forKey: "ask.mode") ?? "") ?? .guard
     }
 
+    private static func detail(_ mode: AskMode) -> String {
+        switch mode {
+        case .guard: return "Asks before it acts"
+        case .full: return "Acts on its own"
+        }
+    }
+
+    private var rows: [AskPickRow] {
+        Self.modes.enumerated().map { i, item in AskPickRow(index: i) { mind.setMode(item) } }
+    }
+
     var body: some View {
-        Menu {
-            ForEach([AskMode.read, .guard, .full], id: \.self) { item in
-                Button {
-                    mind.setMode(item)
-                } label: {
-                    if mode == item {
-                        Label(item.label, systemImage: "checkmark")
-                    } else {
-                        Label(item.label, systemImage: item.icon)
+        AskPick(icon: mode.icon, text: mode.label, open: open) { open.toggle() }
+            .askPopup($open, checked: Self.modes.firstIndex(of: mode), width: 210, rows: rows) {
+                ForEach(Array(Self.modes.enumerated()), id: \.offset) { i, item in
+                    FluidMenuItem(index: i, icon: item.icon, label: item.label, detail: Self.detail(item), checked: item == mode) {
+                        mind.setMode(item)
                     }
                 }
             }
-        } label: {
-            StatusChip(icon: mode.icon, text: mode.label)
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("What the agent may do — Read, Guard or Full")
+            .fixedSize()
+            .help("What the agent may do: Confirm or Full")
     }
 }
 
-/// The capsule both composer menus wear — a status chip that is also
-/// the menu's handle (design/chatux.md). Draws a word, an optional
-/// mark and a hidden-indicator chevron; the chip knows no semantics.
+/// The row under the composer: the leash, the brain and its effort.
+struct AskComposerBar: View {
+    var browser: Browser
+    @ObservedObject private var mind = Mind.shared
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ModeMenu()
+            ModelChip(browser: browser)
+            EffortChip()
+            Spacer(minLength: 0)
+        }
+        .animation(AskMotion.pop, value: mind.model.canReason)
+    }
+}
+
+/// A status word with an optional mark — the chips' old capsule, kept for
+/// the places that only show a state.
 struct StatusChip: View {
     var icon: String? = nil
     let text: String
-    /// Red when the thing it names is broken — the model chip wears it
-    /// while no engine is up, so a dead host reads on the send button's
-    /// neighbour instead of failing silently (fullscreen-ux §7).
     var trouble = false
 
     var body: some View {
         HStack(spacing: 4) {
             if let icon {
                 Image(systemName: icon)
-                    .font(.system(size: 7.5, weight: .bold))
+                    .font(.system(size: 8.5, weight: .medium))
             }
             Text(text)
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: 10.5, weight: .medium))
                 .lineLimit(1)
-                // A long model id shrinks to fit rather than growing
-                // the composer (design/chatux.md — 170pt, mid-cut).
                 .truncationMode(.middle)
                 .frame(maxWidth: 170)
-            Image(systemName: "chevron.up.chevron.down")
-                .font(.system(size: 6.5, weight: .bold))
         }
         .foregroundStyle(trouble ? FluidTone.destructive : Palette.muted)
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
-        .background(trouble ? FluidTone.destructiveLight : Palette.ground.opacity(0.6),
-                    in: Capsule())
-        .overlay(Capsule().strokeBorder(
-            trouble ? FluidTone.destructive.opacity(0.4) : Palette.hairline, lineWidth: 1))
         .contentShape(Capsule())
     }
 }

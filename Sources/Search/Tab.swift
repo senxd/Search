@@ -136,6 +136,50 @@ enum Web {
 /// own tabs use, the page's JavaScript none the wiser. The names are asked
 /// for first, the way `inspector(_:on:)` above asks, and a WebKit without
 /// them leaves the tab heard rather than falling over.
+/// The colour across the top of a page, and ink that still reads on it.
+/// The live tab is filled with it so the tab and the page are one surface.
+struct PageTop: Equatable {
+    var red: CGFloat
+    var green: CGFloat
+    var blue: CGFloat
+
+    var color: Color { Color(.sRGB, red: red, green: green, blue: blue, opacity: 1) }
+
+    /// Light enough that the tab's ink has to be the dark one.
+    var light: Bool {
+        func lift(_ u: CGFloat) -> CGFloat {
+            u <= 0.04045 ? u / 12.92 : pow((u + 0.055) / 1.055, 2.4)
+        }
+        // Where dark ink and light ink trade places. Above it the page is
+        // light enough that the tab's title has to be dark.
+        return 0.2126 * lift(red) + 0.7152 * lift(green) + 0.0722 * lift(blue) > 0.25
+    }
+
+    var ink: Color { Color(.sRGB, white: light ? 0.09 : 0.93, opacity: 1) }
+    var muted: Color { Color(.sRGB, white: light ? 0.42 : 0.72, opacity: 1) }
+
+    init(red: CGFloat, green: CGFloat, blue: CGFloat) {
+        func byte(_ u: CGFloat) -> CGFloat { (u * 255).rounded() / 255 }
+        self.red = byte(min(1, max(0, red)))
+        self.green = byte(min(1, max(0, green)))
+        self.blue = byte(min(1, max(0, blue)))
+    }
+
+    init?(css: String) {
+        let parts = css.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        guard parts.count == 3 else { return nil }
+        self.init(red: parts[0] / 255, green: parts[1] / 255, blue: parts[2] / 255)
+    }
+
+    init?(color: NSColor) {
+        guard let c = color.usingColorSpace(.sRGB) else { return nil }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        c.getRed(&r, green: &g, blue: &b, alpha: &a)
+        guard a > 0.95 else { return nil }
+        self.init(red: r, green: g, blue: b)
+    }
+}
+
 enum Muter {
     /// `_mediaMutedState` is a bitmask. Its low bit is the page's own
     /// sound, the only one a tab's speaker should touch: the others are the
@@ -199,6 +243,14 @@ final class Tab: ObservableObject, Identifiable {
     /// How far down the page you are, nought to one. The tab's own pill fills
     /// with it.
     @Published var reading: Double = 0
+    /// The colour across the top of the page. Nil on a blank tab, one of our
+    /// own pages, or until the page has painted — the live tab wears it so
+    /// the two meet without a seam.
+    @Published var pageTop: PageTop?
+    /// False from the moment a new document starts until it has painted.
+    /// Measuring earlier reads the empty page, which is white, and the tab
+    /// flashes it.
+    private var pageTopReady = false
 
     /// True while the page has been stripped back to its article.
     @Published private(set) var reader = false
@@ -526,6 +578,12 @@ final class Tab: ObservableObject, Identifiable {
             web.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in
                 MainActor.assumeIsolated { self?.canGoForward = self?.built?.canGoForward ?? false }
             },
+            // The page's own background, once WebKit has one. The sample
+            // still asks the top of the viewport — a header there is what
+            // the tab actually sits against.
+            web.observe(\.underPageBackgroundColor, options: [.new]) { [weak self] _, _ in
+                MainActor.assumeIsolated { self?.measurePageTop() }
+            },
         ]
 
         relay.tab = self
@@ -797,6 +855,8 @@ final class Tab: ObservableObject, Identifiable {
         // address back over the page's.
         if let page = NativePage(url: url) {
             title = page.title
+            pageTop = nil
+            pageTopReady = false
             discard()
             return
         }
@@ -806,7 +866,107 @@ final class Tab: ObservableObject, Identifiable {
             failure = "There is no such page."
             return
         }
+        // Hold the colour already on the tab until the new page paints.
+        pageTopReady = false
         web.open(url)
+    }
+
+    /// A new document has started. Keep whatever colour the tab wears until
+    /// there is a page to measure — the empty one is white.
+    func holdPageTop() {
+        pageTopReady = false
+    }
+
+    /// The page has painted. Read the colour across its top, and once more
+    /// a beat later: stylesheets often land after the first frame.
+    func pageDidPaint() {
+        pageTopReady = true
+        measurePageTop()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, self.pageTopReady else { return }
+            self.measurePageTop()
+        }
+    }
+
+    /// The tab is on screen and its page, if it has one, has already painted.
+    /// A session coming back never gets a fresh "did finish", so the row
+    /// asks when it shows the tab.
+    func measureIfShowing() {
+        if !loading, built?.unpainted != true {
+            pageTopReady = true
+        }
+        measurePageTop()
+        // The first ask can land before the page has a width, and then the
+        // only colour on offer is the page's own rather than a header's.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self, self.pageTopReady else { return }
+            self.measurePageTop()
+        }
+    }
+
+    /// The background at the top of the viewport — a header's, if one is
+    /// there, otherwise the page's own. Translucent layers are folded
+    /// together on the way up so a tinted bar doesn't get thrown out.
+    static let topProbe = """
+    (function () {
+      function parse(c) {
+        if (!c) return null;
+        c = String(c).trim();
+        var m = c.match(/rgba?\\(([0-9.]+)[ ,]+([0-9.]+)[ ,]+([0-9.]+)(?:[ ,/]+([0-9.]+%?))?\\)/);
+        if (m) return pack(+m[1] / 255, +m[2] / 255, +m[3] / 255, alpha(m[4]));
+        m = c.match(/color\\(srgb ([0-9.]+) ([0-9.]+) ([0-9.]+)(?: \\/ ([0-9.]+%?))?\\)/);
+        if (m) return pack(+m[1], +m[2], +m[3], alpha(m[4]));
+        return null;
+      }
+      function alpha(v) {
+        if (v == null) return 1;
+        return v.charAt(v.length - 1) === '%' ? parseFloat(v) / 100 : parseFloat(v);
+      }
+      function pack(r, g, b, a) {
+        if (!(a > 0)) return null;
+        return { r: r, g: g, b: b, a: a };
+      }
+      function over(front, back) {
+        var a = front.a + back.a * (1 - front.a);
+        if (!(a > 0)) return front;
+        return {
+          r: (front.r * front.a + back.r * back.a * (1 - front.a)) / a,
+          g: (front.g * front.a + back.g * back.a * (1 - front.a)) / a,
+          b: (front.b * front.a + back.b * back.a * (1 - front.a)) / a,
+          a: a
+        };
+      }
+      function of(el) {
+        var acc = { r: 0, g: 0, b: 0, a: 0 };
+        for (var n = el; n && n !== document && acc.a < 0.98; n = n.parentElement) {
+          var c = parse(getComputedStyle(n).backgroundColor);
+          if (c) acc = over(acc, c);
+        }
+        if (!(acc.a > 0.9)) return null;
+        return Math.round(acc.r * 255) + ',' + Math.round(acc.g * 255) + ',' + Math.round(acc.b * 255);
+      }
+      var w = window.innerWidth || 0;
+      if (w < 2) return null;
+      return of(document.elementFromPoint(w / 2, 1))
+          || of(document.elementFromPoint(Math.min(24, w - 1), 1))
+          || of(document.body)
+          || of(document.documentElement);
+    })()
+    """
+
+    private func measurePageTop() {
+        guard pageTopReady, !bench, let web = built, !isBlank, native == nil else {
+            if isBlank || native != nil, pageTop != nil { pageTop = nil }
+            return
+        }
+        let fallback = PageTop(color: web.underPageBackgroundColor)
+        web.evaluateJavaScript(Tab.topProbe) { [weak self] value, _ in
+            MainActor.assumeIsolated {
+                guard let self, self.pageTopReady else { return }
+                let next = (value as? String).flatMap(PageTop.init(css:)) ?? fallback
+                if next != self.pageTop { self.pageTop = next }
+            }
+        }
     }
 
     /// Brought back from the last session: everything the row needs to draw it,
@@ -1251,6 +1411,50 @@ final class MiddleRelay: NSObject, WKScriptMessageHandler {
 
 /// A web view that reads the two-finger swipe for itself.
 final class PageView: WKWebView {
+    var syntheticMousePoint = NSPoint.zero
+
+    /// A page housed in Bench's offscreen room is still live work for its
+    /// caller. Keep WebKit from treating the far-offscreen window as occluded
+    /// so page-world requestAnimationFrame and native animations can advance.
+    private var roomOcclusionBeforeAgent: Bool?
+
+    @MainActor
+    func keepRenderingWhileHoused() {
+        guard roomOcclusionBeforeAgent == nil else { return }
+        let get = NSSelectorFromString("_windowOcclusionDetectionEnabled")
+        let set = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:")
+        guard responds(to: get), responds(to: set) else { return }
+        typealias Getter = @convention(c) (AnyObject, Selector) -> Bool
+        typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
+        let wasEnabled = unsafeBitCast(method(for: get), to: Getter.self)(self, get)
+        unsafeBitCast(method(for: set), to: Setter.self)(self, set, false)
+        roomOcclusionBeforeAgent = wasEnabled
+        refreshRoomVisibility()
+    }
+
+    @MainActor
+    func restoreRenderingAfterAgent() {
+        if let wasEnabled = roomOcclusionBeforeAgent {
+            let set = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:")
+            if responds(to: set) {
+                typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
+                unsafeBitCast(method(for: set), to: Setter.self)(self, set, wasEnabled)
+            }
+            roomOcclusionBeforeAgent = nil
+            refreshRoomVisibility()
+        }
+        if let window, Bench.shared.isRoom(window) {
+            removeFromSuperview()
+            assert(self.window == nil, "released agent view stayed in the Bench room")
+        }
+    }
+
+    @MainActor
+    private func refreshRoomVisibility() {
+        guard let window, Bench.shared.isRoom(window) else { return }
+        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: window)
+    }
+
     /// What extensions added to the right-click menu, at the end of it.
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         super.willOpenMenu(menu, with: event)
@@ -1485,6 +1689,7 @@ final class PageView: WKWebView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window == nil { stopPinchLink() }
+        if let window, !Bench.shared.isRoom(window) { restoreRenderingAfterAgent() }
     }
 
     static func hookPinch() {

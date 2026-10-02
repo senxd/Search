@@ -10,6 +10,9 @@ import SwiftUI
 // (120ms after a 160ms delay so the thumb visibly narrows first).
 // `orientation` ports the source prop: "vertical" (default),
 // "horizontal", or "both" — the touch-primary branch is N/A on macOS.
+// The edge-fade mask is opt-in (`fadeSize`): the source viewport carries
+// no fade by default — `.scroll-fade` is a per-consumer class
+// (scroll-area.tsx:126-135).
 
 /// Which axes get scrollbars — scroll-area.tsx's `orientation`.
 enum FluidScrollAxis {
@@ -19,8 +22,10 @@ enum FluidScrollAxis {
 /// `FluidScrollArea { content }` — a ScrollView drop-in.
 struct FluidScrollArea<Content: View>: NSViewRepresentable {
     @ViewBuilder var content: () -> Content
-    /// scroll-fade's `--scroll-fade-size` (48px default).
-    var fadeSize: CGFloat = 48
+    /// scroll-fade's `--scroll-fade-size` — nil (the default) applies no
+    /// mask; the source's `.scroll-fade` is an opt-in viewportClassName,
+    /// not part of ScrollArea itself (scroll-area.tsx:126-135).
+    var fadeSize: CGFloat? = nil
     /// scroll-divider's hairlines at scrolled-away edges.
     var dividers = false
     /// scroll-divider's `--scroll-divider-inset` — horizontal inset for the
@@ -57,6 +62,8 @@ struct FluidScrollArea<Content: View>: NSViewRepresentable {
         scroll.fadeSize = fadeSize
         scroll.dividerInset = dividerInset
         context.coordinator.orientation = orientation
+        context.coordinator.dividers = dividers
+        context.coordinator.syncDividers()
         context.coordinator.syncThumbs()
         context.coordinator.sizeDocument()
         context.coordinator.updateThumbs()
@@ -71,12 +78,13 @@ struct FluidScrollArea<Content: View>: NSViewRepresentable {
         private var thumbV: FluidScrollThumb?
         private var thumbH: FluidScrollThumb?
         private var observers: [NSObjectProtocol] = []
-        private var linger: Task<Void, Never>?
+        private var linger: Timer?
         private var hovering = false { didSet { applyVisibility() } }
         private var trackHover = false { didSet { applyVisibility() } }
         private var scrolling = false { didSet { applyVisibility() } }
         private var dividerTop: CALayer?
         private var dividerBottom: CALayer?
+        var dividers = false
         /// One gradient layer for the life of the scroll view — recreating
         /// and reattaching a mask every scroll tick shows up in samples.
         private var fadeMask: CAGradientLayer?
@@ -89,6 +97,7 @@ struct FluidScrollArea<Content: View>: NSViewRepresentable {
             self.scroll = scroll
             self.host = host
             self.orientation = orientation
+            self.dividers = dividers
 
             if showsV {
                 let thumb = FluidScrollThumb(axis: .vertical)
@@ -105,7 +114,33 @@ struct FluidScrollArea<Content: View>: NSViewRepresentable {
             scroll.hoverChanged = { [weak self] inside in
                 self?.hovering = inside
             }
-            if dividers {
+            syncDividers()
+
+            let nc = NotificationCenter.default
+            observers.append(nc.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: scroll.contentView, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.didScroll() }
+            })
+            observers.append(nc.addObserver(
+                forName: NSView.frameDidChangeNotification,
+                object: scroll, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.sizeDocument(); self?.updateThumbs(); self?.updateFades()
+                }
+            })
+            sizeDocument()
+            updateThumbs()
+            updateFades()
+        }
+
+        /// The scroll-edge hairlines — mounts on attach and stays in step
+        /// with a live `dividers` toggle through updateNSView.
+        func syncDividers() {
+            guard let scroll else { return }
+            if dividers, dividerTop == nil {
                 let top = CALayer(), bottom = CALayer()
                 for layer in [top, bottom] {
                     layer.backgroundColor = NSColor(FluidTone.border).cgColor
@@ -114,26 +149,11 @@ struct FluidScrollArea<Content: View>: NSViewRepresentable {
                     scroll.contentView.superview?.layer?.addSublayer(layer)
                 }
                 dividerTop = top; dividerBottom = bottom
+            } else if !dividers {
+                dividerTop?.removeFromSuperlayer()
+                dividerBottom?.removeFromSuperlayer()
+                dividerTop = nil; dividerBottom = nil
             }
-
-            let nc = NotificationCenter.default
-            observers.append(nc.addObserver(
-                forName: NSView.boundsDidChangeNotification,
-                object: scroll.contentView, queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.didScroll() }
-            })
-            observers.append(nc.addObserver(
-                forName: NSView.frameDidChangeNotification,
-                object: scroll, queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.sizeDocument(); self?.updateThumbs(); self?.updateFades()
-                }
-            })
-            sizeDocument()
-            updateThumbs()
-            updateFades()
         }
 
         /// Keeps the mounted thumbs in step with `orientation` (a live
@@ -168,6 +188,7 @@ struct FluidScrollArea<Content: View>: NSViewRepresentable {
         }
 
         deinit {
+            linger?.invalidate()
             observers.forEach { NotificationCenter.default.removeObserver($0) }
         }
 
@@ -202,12 +223,18 @@ struct FluidScrollArea<Content: View>: NSViewRepresentable {
         private func didScroll() {
             updateThumbs()
             updateFades()
-            scrolling = true
-            linger?.cancel()
-            linger = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 600_000_000)
-                guard !Task.isCancelled else { return }
-                self?.scrolling = false
+            if !scrolling { scrolling = true }
+            if let linger {
+                linger.fireDate = Date(timeIntervalSinceNow: 0.6)
+            } else {
+                let timer = Timer(timeInterval: 0.6, repeats: false) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.scrolling = false
+                        self?.linger = nil
+                    }
+                }
+                linger = timer
+                RunLoop.main.add(timer, forMode: .common)
             }
         }
 
@@ -216,65 +243,73 @@ struct FluidScrollArea<Content: View>: NSViewRepresentable {
         /// fade is fully opaque (no fade); it opens up over the first
         /// `fadeSize` points of travel. Symmetric at the far edge. The mask
         /// runs along the scroll axis (`.scroll-fade` down, `.scroll-fade-x`
-        /// across); `.both` fades vertically, matching `.scroll-fade`.
+        /// across); `.both` fades vertically, matching `.scroll-fade`. A
+        /// nil `fadeSize` applies no mask — the source viewport has no fade
+        /// by default, `.scroll-fade` is opt-in per consumer.
         func updateFades() {
             guard let scroll, let doc = scroll.documentView else { return }
             let clip = scroll.contentView
-            let size = scroll.fadeSize
 
             let offY = clip.bounds.origin.y
             let travelY = doc.bounds.height - clip.bounds.height
             let offX = clip.bounds.origin.x
             let travelX = doc.bounds.width - clip.bounds.width
 
-            let mask: CAGradientLayer
-            if let existing = fadeMask {
-                mask = existing
-            } else {
-                mask = CAGradientLayer()
-                fadeMask = mask
-            }
-            mask.frame = clip.bounds
-
-            if orientation == .horizontal {
-                let clipW = clip.bounds.width
-                guard clipW > 0 else { return }
-                let overflowing = travelX > 0
-                let leadK = overflowing ? min(1, max(0, offX) / size) : 0
-                let tailK = overflowing ? min(1, max(0, travelX - offX) / size) : 0
-                let leadA = 1 - leadK, tailA = 1 - tailK
-                let p1 = min(size / clipW, 0.5), p2 = max(1 - size / clipW, 0.5)
-                mask.startPoint = CGPoint(x: 0, y: 0.5)
-                mask.endPoint = CGPoint(x: 1, y: 0.5)
-                mask.colors = [
-                    NSColor.black.withAlphaComponent(leadA).cgColor,
-                    NSColor.black.cgColor,
-                    NSColor.black.cgColor,
-                    NSColor.black.withAlphaComponent(tailA).cgColor,
-                ]
-                mask.locations = [0, p1 as NSNumber, p2 as NSNumber, 1]
-            } else {
-                let clipH = clip.bounds.height
-                guard clipH > 0 else { return }
-                let overflowing = travelY > 0
-                let topK = overflowing ? min(1, max(0, offY) / size) : 0
-                let botK = overflowing ? min(1, max(0, travelY - offY) / size) : 0
-                let topA = 1 - topK, botA = 1 - botK
-                let p1 = min(size / clipH, 0.5), p2 = max(1 - size / clipH, 0.5)
-                mask.startPoint = CGPoint(x: 0.5, y: 0)
-                mask.endPoint = CGPoint(x: 0.5, y: 1)
-                mask.colors = [
-                    NSColor.black.withAlphaComponent(topA).cgColor,
-                    NSColor.black.cgColor,
-                    NSColor.black.cgColor,
-                    NSColor.black.withAlphaComponent(botA).cgColor,
-                ]
-                mask.locations = [0, p1 as NSNumber, p2 as NSNumber, 1]
-            }
-            clip.wantsLayer = true
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            if clip.layer?.mask !== mask { clip.layer?.mask = mask }
+            if let size = scroll.fadeSize, size > 0 {
+                let mask: CAGradientLayer
+                if let existing = fadeMask {
+                    mask = existing
+                } else {
+                    mask = CAGradientLayer()
+                    fadeMask = mask
+                }
+                mask.frame = clip.bounds
+
+                if orientation == .horizontal {
+                    let clipW = clip.bounds.width
+                    if clipW > 0 {
+                        let overflowing = travelX > 0
+                        let leadK = overflowing ? min(1, max(0, offX) / size) : 0
+                        let tailK = overflowing ? min(1, max(0, travelX - offX) / size) : 0
+                        let leadA = 1 - leadK, tailA = 1 - tailK
+                        let p1 = min(size / clipW, 0.5), p2 = max(1 - size / clipW, 0.5)
+                        mask.startPoint = CGPoint(x: 0, y: 0.5)
+                        mask.endPoint = CGPoint(x: 1, y: 0.5)
+                        mask.colors = [
+                            NSColor.black.withAlphaComponent(leadA).cgColor,
+                            NSColor.black.cgColor,
+                            NSColor.black.cgColor,
+                            NSColor.black.withAlphaComponent(tailA).cgColor,
+                        ]
+                        mask.locations = [0, p1 as NSNumber, p2 as NSNumber, 1]
+                    }
+                } else {
+                    let clipH = clip.bounds.height
+                    if clipH > 0 {
+                        let overflowing = travelY > 0
+                        let topK = overflowing ? min(1, max(0, offY) / size) : 0
+                        let botK = overflowing ? min(1, max(0, travelY - offY) / size) : 0
+                        let topA = 1 - topK, botA = 1 - botK
+                        let p1 = min(size / clipH, 0.5), p2 = max(1 - size / clipH, 0.5)
+                        mask.startPoint = CGPoint(x: 0.5, y: 0)
+                        mask.endPoint = CGPoint(x: 0.5, y: 1)
+                        mask.colors = [
+                            NSColor.black.withAlphaComponent(topA).cgColor,
+                            NSColor.black.cgColor,
+                            NSColor.black.cgColor,
+                            NSColor.black.withAlphaComponent(botA).cgColor,
+                        ]
+                        mask.locations = [0, p1 as NSNumber, p2 as NSNumber, 1]
+                    }
+                }
+                clip.wantsLayer = true
+                if clip.layer?.mask !== mask { clip.layer?.mask = mask }
+            } else if clip.layer?.mask != nil {
+                clip.layer?.mask = nil
+                fadeMask = nil
+            }
             if let top = dividerTop, let bottom = dividerBottom {
                 let overflowing = travelY > 0
                 let w = scroll.bounds.width, inset = scroll.dividerInset
@@ -311,8 +346,9 @@ struct FluidScrollArea<Content: View>: NSViewRepresentable {
 /// reveals when the pointer enters anywhere in the region.
 final class FluidScrollView: NSScrollView {
     var hoverChanged: ((Bool) -> Void)?
-    /// scroll-fade size — the mask ramps over this much travel at each edge.
-    var fadeSize: CGFloat = 48
+    /// scroll-fade size — the mask ramps over this much travel at each
+    /// edge. nil applies no mask (`.scroll-fade` is opt-in in the source).
+    var fadeSize: CGFloat? = nil
     /// --scroll-divider-inset — horizontal inset on the edge hairlines.
     var dividerInset: CGFloat = 0
 
@@ -383,16 +419,28 @@ final class FluidScrollThumb: NSView {
     }
 
     func setVisible(_ visible: Bool) {
+        // A held drag keeps the bar up even with the pointer off the
+        // strip — the source's pointer capture keeps `hovering` true.
+        let visible = visible || dragging
         guard visible != shown else { return }
         shown = visible
         hideTask?.cancel()
         if visible {
+            // pointer-events restored — a pointer already inside the strip
+            // widens the thumb on reveal, like CSS :hover landing once
+            // data-[visible] flips.
+            if let loc = window?.mouseLocationOutsideOfEventStream,
+               bounds.contains(convert(loc, from: nil)) {
+                hovered = true
+                layoutThumb()
+                onHover?(true)
+            }
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.16; ctx.timingFunction = .init(name: .easeOut)
                 self.animator().alphaValue = 1
             }
         } else {
-            // Wait out the thumb's 150ms shrink before fading, so the thumb
+            // Wait out the thumb's 160ms shrink before fading, so the thumb
             // visibly narrows back first instead of the fade masking it.
             hovered = false
             layoutThumb()
@@ -405,6 +453,13 @@ final class FluidScrollThumb: NSView {
                 }
             }
         }
+    }
+
+    /// pointer-events-none while hidden — the always-mounted 10pt strip
+    /// must not eat clicks or hovers on content along the edge
+    /// (scroll-area.tsx:182).
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        shown ? super.hitTest(point) : nil
     }
 
     /// Flush against the edge; `corner` shortens the track 10pt so a
@@ -452,20 +507,35 @@ final class FluidScrollThumb: NSView {
     }
 
     private func layoutThumb() {
+        // The position mirrors the scroll/drag — snap it. Size and tint
+        // are state, so they tween: the source transitions
+        // background-color/width/height 160ms ease-in-out
+        // (scroll-area.tsx:194-195).
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         // 2pt off the container edge — the -translate nudge.
+        let center: CGPoint
+        let size: CGSize
         if axis == .vertical {
-            thumb.frame = CGRect(
-                x: trackW - thumbW - 2, y: 4 + thumbPos,
-                width: thumbW, height: thumbLength
+            center = CGPoint(
+                x: trackW - thumbW / 2 - 2, y: 4 + thumbPos + thumbLength / 2
             )
+            size = CGSize(width: thumbW, height: thumbLength)
         } else {
-            thumb.frame = CGRect(
-                x: 4 + thumbPos, y: trackW - thumbW - 2,
-                width: thumbLength, height: thumbW
+            center = CGPoint(
+                x: 4 + thumbPos + thumbLength / 2, y: trackW - thumbW / 2 - 2
             )
+            size = CGSize(width: thumbLength, height: thumbW)
         }
+        thumb.position = center
+        CATransaction.commit()
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.16)
+        CATransaction.setAnimationTimingFunction(
+            CAMediaTimingFunction(name: .easeInEaseOut)
+        )
+        thumb.bounds = CGRect(origin: .zero, size: size)
         thumb.cornerRadius = thumbW / 2
         thumb.backgroundColor = thumbColor.cgColor
         CATransaction.commit()
@@ -479,9 +549,11 @@ final class FluidScrollThumb: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
+        guard shown else { return }
         hovered = true; layoutThumb(); onHover?(true)
     }
     override func mouseExited(with event: NSEvent) {
+        guard shown else { return }
         hovered = false; layoutThumb(); onHover?(false)
     }
 

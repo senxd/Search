@@ -5,6 +5,7 @@ const posts = [], events = [];
 let waiting;
 window.__native = {post(m) {
   posts.push(m);
+  if (m.kind === 'permissions') setTimeout(() => __h._tool(m.id, { mode: 'guard', confirmationCriteria: ['Sending messages', 'Destructive actions'] }), 0);
   if (m.kind === 'event') events.push(m);
   if (m.kind === 'tool') waiting = m;
   if (m.kind === 'fetch') setTimeout(() => {

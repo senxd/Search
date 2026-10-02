@@ -157,10 +157,10 @@ Fallback: scoped copy + "keep in lockstep" comment — worse.
 
 ## 4. Permissions
 
-- `routine.mode` default `.guard`; `.read` for digest routines; `.full`
+- `routine.mode` defaults to `.guard`, shown as Confirm; `.full`
   selectable with a warning. `Policy.check` escalation applies identically.
 - Dangerous ops while unattended: **park, not auto-deny** — `.waiting` + badge
-  + notification. `.read` mode available for never-ask routines.
+  + notification. Full is the only mode that bypasses confirmations.
 - `ask.user`: `onAsk` injection → `run.waitingQuestion` — never `Mind.pose`,
   never pops the rail, no 300s clock; second `ask_user` per run → `busy`
   decline.

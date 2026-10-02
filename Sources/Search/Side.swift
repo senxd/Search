@@ -102,10 +102,7 @@ struct SideBar: View {
         // Rows on their way to or from another space stay in the column.
         .clipped()
         .onAppear { SpaceSwipe.shared.start(for: browser) }
-        .background(landing ? Palette.hover : Palette.ground)
-        .overlay(alignment: .trailing) {
-            Rectangle().fill(Palette.hairline).frame(width: 1)
-        }
+        .background(landing ? Palette.hover : (prefs.opaqueWindow ? Palette.floor : Palette.glass))
         .overlay(alignment: .trailing) { edge }
         .onDrop(of: [.url, .text], isTargeted: $landing) { providers in
             browser.take(providers)
@@ -195,40 +192,24 @@ struct SideBar: View {
                         pinned
                             .padding(.bottom, 10)
                     }
-                    // A row too long for the window scrolls between the pins
-                    // and the foot, rather than running under the lights at one
-                    // end and the foot at the other. While it fits it stays a
-                    // plain stack, and the space under it is still the
-                    // window's to be dragged by. Inside the page: the swipe
-                    // between spaces moves the page, scroll and all.
-                    ViewThatFits(in: .vertical) {
-                        rows
-                        ScrollViewReader { proxy in
-                            // The scroll view reaches into the margin on
-                            // the right and the rows keep it inside, so the
-                            // system's bar lands in the margin beside them
-                            // rather than over the cross on the tab under the
-                            // pointer. The column's edge lies over that margin
-                            // and answers first, so the bar never fights the
-                            // resize; the wheel and the trackpad still scroll.
-                            ScrollView(.vertical) {
-                                rows.padding(.trailing, 10)
-                            }
-                            .padding(.trailing, -10)
-                            // The tab you go to is the tab you see — ⌘1–⌘9,
-                            // ⇧⌘], a link opening beside the one on screen.
-                            // Rows are named by their item, so a tab in a
-                            // folded group reveals the header standing for
-                            // it rather than a row it doesn't have.
-                            .onChange(of: browser.activeID) { _, id in
-                                guard let tab = browser.tabs.first(where: { $0.id == id }) else { return }
-                                withAnimation(Motion.glide) {
-                                    proxy.scrollTo(browser.visibleID(for: tab))
+                    GeometryReader { geometry in
+                        // Keep the empty floor draggable when the rows fit.
+                        if rowsEnd - Metrics.strip - pinBlockHeight <= geometry.size.height {
+                            rows
+                        } else {
+                            ScrollViewReader { proxy in
+                                ScrollView(.vertical) {
+                                    rows.padding(.trailing, 10)
                                 }
-                            }
-                            .onAppear {
-                                if let tab = browser.active {
-                                    proxy.scrollTo(browser.visibleID(for: tab), anchor: .center)
+                                .padding(.trailing, -10)
+                                .onChange(of: browser.activeID) { _, id in
+                                    guard let tab = browser.tabs.first(where: { $0.id == id }) else { return }
+                                    reveal(tab, using: proxy, animated: true)
+                                }
+                                .onAppear {
+                                    if let tab = browser.active {
+                                        reveal(tab, using: proxy, animated: false)
+                                    }
                                 }
                             }
                         }
@@ -240,6 +221,22 @@ struct SideBar: View {
         }
         .padding(.horizontal, 10)
         .frame(width: prefs.sideWidth, alignment: .topLeading)
+    }
+
+    /// A distant group's lazy rows exist only after its header is revealed.
+    private func reveal(_ tab: Tab, using proxy: ScrollViewProxy, animated: Bool) {
+        let target = browser.visibleID(for: tab)
+        if let group = browser.group(for: tab), group.expanded {
+            proxy.scrollTo(TabItem.group(group).id, anchor: .center)
+            DispatchQueue.main.async {
+                guard browser.activeID == tab.id else { return }
+                if animated {
+                    withAnimation(Motion.glide) { proxy.scrollTo(target, anchor: .center) }
+                } else { proxy.scrollTo(target, anchor: .center) }
+            }
+        } else if animated {
+            withAnimation(Motion.glide) { proxy.scrollTo(target, anchor: .center) }
+        } else { proxy.scrollTo(target, anchor: .center) }
     }
 
     /// Another space's rows, drawn with the same pieces as this one's so the
@@ -298,14 +295,6 @@ struct SideBar: View {
     /// from what was drawn rather than measured: a measurement would arrive a
     /// frame late, and for one frame the whole column would drag the window.
     private var rowsEnd: CGFloat {
-        let pins = browser.pinnedCount
-        let cols = SideBar.pinColumns(pins)
-        let pinRows = pins == 0 ? 0 : (pins + cols - 1) / cols
-        // The pin block is its rows of cells plus the air the shared card
-        // keeps above and below them, then the gap under the block itself.
-        let pinBlock = pinRows == 0 ? 0
-            : CGFloat(pinRows) * pinHeight + CGFloat(pinRows - 1) * SideBar.pinGap
-                + 2 * SideBar.blockPad + 10
         // The loose column as it is actually drawn: a block is its rows plus
         // the air it keeps around them, a tab on its own is a row — and a
         // folded group's members draw nothing at all.
@@ -323,7 +312,18 @@ struct SideBar: View {
                     + 2 * SideBar.blockPad
             }
         }
-        return Metrics.strip + pinBlock + loose + SideBar.gap + SideBar.row + 8
+        return Metrics.strip + pinBlockHeight + loose + SideBar.gap + SideBar.row + 8
+    }
+
+    private var pinBlockHeight: CGFloat {
+        let pins = browser.pinnedCount
+        let cols = SideBar.pinColumns(pins)
+        let pinRows = pins == 0 ? 0 : (pins + cols - 1) / cols
+        // The pin block is its rows of cells plus the air the shared card
+        // keeps above and below them, then the gap under the block itself.
+        return pinRows == 0 ? 0
+            : CGFloat(pinRows) * pinHeight + CGFloat(pinRows - 1) * SideBar.pinGap
+                + 2 * SideBar.blockPad + 10
     }
 
     // MARK: - the pinned squares
@@ -556,16 +556,25 @@ struct SideBar: View {
     }
 
     private var loose: some View {
-        let origins = drawnOrigins
-        return VStack(spacing: SideBar.gap) {
+        let items = looseItems
+        let pieces = Self.pieces(from: items)
+        let origins = Self.drawnOrigins(in: pieces)
+        let indices = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($0.element.id, $0.offset) })
+        let counts = Dictionary(browser.tabs.filter { !$0.bench && $0.groupID != nil }
+            .map { ($0.groupID!, 1) }, uniquingKeysWith: +)
+        let titles = Dictionary(uniqueKeysWithValues: browser.orderedGroups.filter { $0.name?.isEmpty != false }
+            .enumerated().map { ($0.element.id, "Group \($0.offset + 1)") })
+        return LazyVStack(spacing: SideBar.gap) {
             // See the grid: the drag is measured in the column's space, not
             // the row's, so a row that has just moved keeps its bearings.
             ForEach(pieces) { piece in
                 switch piece {
                 case .row(let tab):
-                    row(tab, tint: nil, origins: origins)
+                    row(tab, tint: nil, index: indices[TabItem.tab(tab).id] ?? 0, origins: origins)
                 case .block(let group, let members):
-                    block(group, members: members, origins: origins)
+                    block(group, members: members, indices: indices, origins: origins,
+                          title: group.name.flatMap { $0.isEmpty ? nil : $0 } ?? titles[group.id] ?? "Group",
+                          count: counts[group.id] ?? 0)
                 }
             }
         }
@@ -577,7 +586,9 @@ struct SideBar: View {
     /// folded run contributes just its header. Computed rather than measured,
     /// the way `rowsEnd` is, so a drag can ask before layout answers; a
     /// block's padding is why the edges aren't one even stride apart.
-    private var drawnOrigins: [CGFloat] {
+    private var drawnOrigins: [CGFloat] { Self.drawnOrigins(in: pieces) }
+
+    private static func drawnOrigins(in pieces: [Piece]) -> [CGFloat] {
         var out: [CGFloat] = []
         var y: CGFloat = 0
         for piece in pieces {
@@ -599,10 +610,9 @@ struct SideBar: View {
 
     /// One loose row — standing on the ground, or a member inside a group's
     /// block where `tint` blends its washes into the card under it.
-    private func row(_ tab: Tab, tint: Color?, origins: [CGFloat]) -> some View {
+    private func row(_ tab: Tab, tint: Color?, index: Int, origins: [CGFloat]) -> some View {
         // The drag's index is the row's place among the drawn items, not the
         // tabs' — a folded group's members hold tabs but draw no rows.
-        let index = looseItems.firstIndex { $0.id == TabItem.tab(tab).id } ?? 0
         let held = dragging == tab.id
         return SideRow(
             browser: browser,
@@ -630,17 +640,18 @@ struct SideBar: View {
     /// tinted card that reaches a little past them so the block reads as a
     /// piece apart — and so the rows keep their own pitch and the drag math
     /// never has to know a block is there.
-    private func block(_ group: TabGroup, members: [Tab], origins: [CGFloat]) -> some View {
+    private func block(_ group: TabGroup, members: [Tab], indices: [String: Int], origins: [CGFloat],
+                       title: String, count: Int) -> some View {
         let held = groupDragging == group.id
         // The slot the block sits in: its header's place among the loose
         // items, since everything drawn above a header belongs to others.
-        let now = looseItems.firstIndex { $0.id == TabItem.group(group).id } ?? 0
-        return VStack(spacing: SideBar.gap) {
-            head(group, title: browser.groupTitle(group),
-                 count: browser.groupCount(group), interactive: true,
+        let now = indices[TabItem.group(group).id] ?? 0
+        return LazyVStack(spacing: SideBar.gap) {
+            head(group, title: title,
+                 count: count, interactive: true,
                  index: now, origins: origins)
             ForEach(members) { tab in
-                row(tab, tint: group.tint, origins: origins)
+                row(tab, tint: group.tint, index: indices[TabItem.tab(tab).id] ?? 0, origins: origins)
                     // Named the way the scroll reveal asks — ForEach's own
                     // tag is the tab's UUID, but `visibleID` answers the
                     // item's, and the two never matched.

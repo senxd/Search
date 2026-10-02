@@ -1,9 +1,20 @@
 import WebKit
 
-/// Native sheets are parked only after an attached agent explicitly opts in.
+/// Native sheets are parked for opted-in agents and isolated benchmark seats.
 @MainActor
 final class AgentInteractions {
     static let shared = AgentInteractions()
+    enum PendingWatch {
+        case unavailable
+        case alreadyPending
+        case watching(UUID)
+    }
+    private struct Watcher {
+        let session: DriveOrigin
+        let requestToken: String?
+        let found: () -> Void
+        let cancelled: () -> Void
+    }
     final class Pending {
         let id = UUID().uuidString
         let kind: String
@@ -34,6 +45,27 @@ final class AgentInteractions {
         var pending: Pending?
     }
     private var owners: [ObjectIdentifier: Owner] = [:]
+    private var watchers: [ObjectIdentifier: [UUID: Watcher]] = [:]
+
+    func watchPending(_ web: WKWebView, session: DriveOrigin? = nil, requestToken: String? = nil, found: @escaping () -> Void,
+                      cancelled: @escaping () -> Void) -> PendingWatch {
+        let key = ObjectIdentifier(web)
+        guard let owner = owners[key], session == nil || owner.session == session else { return .unavailable }
+        guard owner.pending == nil else { return .alreadyPending }
+        let id = UUID()
+        watchers[key, default: [:]][id] = Watcher(session: owner.session, requestToken: requestToken,
+                                                   found: found, cancelled: cancelled)
+        return .watching(id)
+    }
+
+    func hasWatcher(_ web: WKWebView, requestToken: String) -> Bool {
+        watchers[ObjectIdentifier(web)]?.values.contains { $0.requestToken == requestToken } ?? false
+    }
+
+    func stopWatching(_ key: ObjectIdentifier, id: UUID) {
+        watchers[key]?.removeValue(forKey: id)
+        if watchers[key]?.isEmpty == true { watchers[key] = nil }
+    }
 
     func configure(_ web: WKWebView, session: DriveOrigin, enabled: Bool,
                    event: @escaping ([String: Any]) -> Void) -> [String: Any] {
@@ -43,7 +75,7 @@ final class AgentInteractions {
         }
         if enabled {
             if owners[key] == nil { owners[key] = Owner(session: session, event: event) }
-        } else { clear(web) }
+        } else { clear(web, settleWatchers: false) }
         return status(web, session: session)
     }
 
@@ -65,6 +97,9 @@ final class AgentInteractions {
         owner.pending = pending
         owners[key] = owner
         owner.event(pending.description)
+        let found = (watchers[key] ?? [:]).values.filter { $0.session == owner.session }
+        watchers[key] = nil
+        for watcher in found { watcher.found() }
         // A disconnected or idle agent must not strand a page indefinitely.
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 120)
@@ -94,6 +129,11 @@ final class AgentInteractions {
             guard let paths = args["paths"] as? [String], pending.multiple || paths.count <= 1 else {
                 return ["error": "paths must match the file chooser's selection limit"]
             }
+            if paths.isEmpty {
+                owners[key]?.pending = nil
+                pending.finish(false, nil, nil)
+                return ["ok": true]
+            }
             urls = []
             for path in paths {
                 let expanded = (path as NSString).expandingTildeInPath
@@ -114,8 +154,10 @@ final class AgentInteractions {
         return ["ok": true]
     }
 
-    func clear(_ web: WKWebView) {
-        owners.removeValue(forKey: ObjectIdentifier(web))?.pending?.finish(false, nil, nil)
+    func clear(_ web: WKWebView, settleWatchers: Bool = true) {
+        let key = ObjectIdentifier(web)
+        cancelWatchers(for: key, settle: settleWatchers)
+        owners.removeValue(forKey: key)?.pending?.finish(false, nil, nil)
     }
 
     func release(_ web: WKWebView, session: DriveOrigin) {
@@ -126,5 +168,14 @@ final class AgentInteractions {
         for key in Array(owners.keys) where owners[key]?.session == session {
             owners.removeValue(forKey: key)?.pending?.finish(false, nil, nil)
         }
+        for key in Array(watchers.keys) { cancelWatchers(for: key, session: session, settle: true) }
+    }
+
+    private func cancelWatchers(for key: ObjectIdentifier, session: DriveOrigin? = nil, settle: Bool) {
+        guard let current = watchers[key] else { return }
+        let cancelled = current.filter { session == nil || $0.value.session == session }
+        for id in cancelled.keys { watchers[key]?.removeValue(forKey: id) }
+        if watchers[key]?.isEmpty == true { watchers[key] = nil }
+        if settle { for watcher in cancelled.values { watcher.cancelled() } }
     }
 }

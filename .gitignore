@@ -7,6 +7,7 @@ build/
 
 # Python tooling byproducts (sdk/, ./ask).
 __pycache__/
+Runtime/ask/node_modules/
 
 # Signing material that's tied to one Apple Developer account and should
 # never be committed, even though the scripts happily run without it.

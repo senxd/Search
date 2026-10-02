@@ -1,0 +1,71 @@
+{
+  "label": "after-auto",
+  "world": "turnstile-after-auto-1790808977",
+  "model": "codex/gpt-6-luna",
+  "effort": "auto",
+  "fixture_sha256": "d89cfeaacc6eb3098c1abb1f3737200e776024a2c3e33cbb956e54ffaddec463",
+  "started": "2026-09-30T22:56:17.059575+00:00",
+  "harness_sha256": "f46b78f9288f4d705d31e5c5d19def4bba219d735bb80289cf098ab77a81f0ba",
+  "skill_sha256": "d1e0945460af0c27e78a454ef22d45030aaf34a779c2f299399f1d536bee7b7c",
+  "pending_before": true,
+  "prompt": "Go to Search tab d0278452 and complete the CAPTCHA.",
+  "chat": "FF8D656C-2C43-4909-9FB5-DC101B471BF8",
+  "seconds": 25.47,
+  "passed": true,
+  "tools": [
+    {
+      "failed": false,
+      "name": "tab_attach",
+      "result": "{\"attached\":true,\"id\":\"d0278452\"}",
+      "args": "{\"id\":\"d0278452\",\"why\":\"Open the Search tab you specified to inspect its visible verification challenge.\"}",
+      "id": "call_Pak9axVmEKYRLTDECNiiAys2"
+    },
+    {
+      "failed": false,
+      "name": "snapshot",
+      "result": "{\"version\":808991452,\"truncated\":false,\"snapshot\":\"\",\"url\":\"http://127.0.0.1:55463/\",\"title\":\"Turnstile interaction check\"}",
+      "args": "{\"tab\":\"d0278452\",\"scope\":\"viewport\",\"interactive\":true}",
+      "id": "call_W7DSbJs5yfDo2wP2t9fcluWS"
+    },
+    {
+      "failed": false,
+      "name": "screenshot",
+      "result": "{\"scale\":1,\"viewport\":{\"height\":800,\"width\":1280},\"height\":800,\"format\":\"png\",\"width\":1280,\"path\":\"/Users/winter/Library/Application Support/Search (turnstile-after-auto-1790808977)/ask/shots/shot-d0278452-1790808994275.png\"}",
+      "args": "{\"tab\":\"d0278452\",\"marks\":true}",
+      "id": "call_SFTc0CLdShdvVyE4Jm4I0Pq0"
+    },
+    {
+      "failed": false,
+      "name": "captcha_click",
+      "result": "{\"element\":\"div\",\"ok\":true,\"tier\":\"event\",\"at\":[60,179]}",
+      "args": "{\"tab\":\"d0278452\",\"x\":60,\"y\":179,\"why\":\"Click the visible verification checkbox to complete the CAPTCHA.\"}",
+      "id": "call_VfeJpSkBdrpIff47qHZU4KWY"
+    },
+    {
+      "failed": false,
+      "name": "wait",
+      "result": "{\"asleep\":false,\"title\":\"Turnstile interaction check\",\"name\":\"\",\"agentGroup\":\"\",\"muted\":false,\"url\":\"http://127.0.0.1:55463/\",\"bench\":true,\"agentName\":\"\",\"shy\":false,\"surfaced\":false,\"space\":\"00000000-0000-0000-0000-000000000001\",\"hollow\":false,\"extensions\":true,\"id\":\"d0278452\",\"loading\":false,\"spaceName\":\"Personal\",\"noisy\":false,\"group\":\"\",\"view\":\"http://127.0.0.1:55463/\",\"active\":false}",
+      "args": "{\"tab\":\"d0278452\",\"seconds\":2}",
+      "id": "call_w3xb8S86JeYrDZmJFHLEXNfP"
+    },
+    {
+      "failed": false,
+      "name": "snapshot",
+      "result": "{\"version\":808991453,\"truncated\":false,\"title\":\"Turnstile interaction check\",\"snapshot\":\"\",\"url\":\"http://127.0.0.1:55463/\"}",
+      "args": "{\"tab\":\"d0278452\",\"scope\":\"viewport\",\"interactive\":true}",
+      "id": "call_qJtJBTFsSCZI5CkoLQWKWkGL"
+    },
+    {
+      "failed": false,
+      "name": "screenshot",
+      "result": "{\"viewport\":{\"width\":1280,\"height\":800},\"height\":800,\"format\":\"png\",\"width\":1280,\"scale\":1,\"path\":\"/Users/winter/Library/Application Support/Search (turnstile-after-auto-1790808977)/ask/shots/shot-d0278452-1790809006288.png\"}",
+      "args": "{\"tab\":\"d0278452\"}",
+      "id": "call_P2oq5GMN4DggJ7LvjAJUP4l6"
+    }
+  ],
+  "replies": [
+    "CAPTCHA completed; the page now displays \u201cSuccess!\u201d and \u201cVerification complete.\u201d"
+  ],
+  "notes": [],
+  "cleaned_up": true
+}

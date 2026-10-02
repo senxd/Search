@@ -9,13 +9,32 @@ enum GuardPage {
       var verb = String(op || '').replace(/^act\./, '');
       var query = {};
       var payloadTextOp = /^(fill|type|press|clickAt)$/.test(verb);
-      ['ref', 'loc', 'css'].forEach(function (k) {
-        if (args[k] !== undefined) query[k] = args[k];
-      });
-      if (!payloadTextOp && args.text !== undefined) query.text = args.text;
-      var target;
+      if (verb === 'drag') query = Array.isArray(args.source) ? { at: args.source } : (args.source || {});
+      else {
+        ['ref', 'loc', 'css'].forEach(function (k) {
+          if (args[k] !== undefined) query[k] = args[k];
+        });
+        if (!payloadTextOp && args.text !== undefined) query.text = args.text;
+      }
+      var target, dragTarget = null, dragPoint = null, dragStart = null;
       try {
         if (op === 'guard.context') { target = document.body || document.documentElement; }
+        else if (verb === 'drag') {
+          if (Array.isArray(args.source)) dragStart = [+args.source[0], +args.source[1]];
+          target = d.resolve(query);
+          if (dragStart && (!dragStart.every(Number.isFinite) || dragStart[0] < 0 || dragStart[1] < 0 ||
+              dragStart[0] >= (window.innerWidth || 1024) || dragStart[1] >= (window.innerHeight || 768)))
+            return { error: 'drag source must be inside the viewport', code: 'NOT_FOUND' };
+          if (args.to && typeof args.to === 'object' && !Array.isArray(args.to) &&
+              ['ref', 'loc', 'css', 'text', 'at'].some(function (key) { return args.to[key] != null; })) {
+            dragTarget = d.resolve(args.to);
+          } else {
+            dragPoint = Array.isArray(args.to) ? [+args.to[0], +args.to[1]] : args.to && typeof args.to === 'object' ? [+args.to.x, +args.to.y] : [NaN, NaN];
+            if (!dragPoint.every(Number.isFinite) || dragPoint[0] < 0 || dragPoint[1] < 0 ||
+                dragPoint[0] >= (window.innerWidth || 1024) || dragPoint[1] >= (window.innerHeight || 768))
+              return { error: 'drag destination must be inside the viewport', code: 'NOT_FOUND' };
+          }
+        }
         else if (verb === 'clickAt') {
           var p = Array.isArray(args.at) ? args.at : (args.x !== undefined ? [args.x, args.y] : null);
           if (!p || !document.elementFromPoint) return { error: 'click target cannot be resolved', code: 'NOT_FOUND' };
@@ -108,7 +127,11 @@ enum GuardPage {
       var categories = [];
       var add = function (c) { if (categories.indexOf(c) < 0) categories.push(c); };
       var has = function (re) { return re.test(words); };
+      if (verb === 'drag') add('unverified');
       var key = String(args.key || '');
+      var keyParts = key.length > 1 ? key.split('+').map(function (part) { return part.trim(); }) : [key];
+      var hasKeyModifiers = (args.modifiers && args.modifiers.length) || keyParts.length > 1;
+      key = keyParts[keyParts.length - 1];
       var enterKey = /^(Enter|Return)$/i.test(key);
       var activationKey = /^(Enter|Return| |Space|Spacebar)$/i.test(key);
       var keyboardCommit = verb === 'press' && enterKey && (target.isContentEditable || /^(INPUT|TEXTAREA)$/.test(target.tagName));
@@ -116,7 +139,7 @@ enum GuardPage {
       var composerKey = (keyboardCommit || typeSubmit) && /message|reply|chat|comment/i.test([attr(target, 'placeholder'), attr(target, 'aria-label'), attr(target, 'name'), attr(target, 'role')].join(' '));
       var actionInput = target.tagName === 'INPUT' && /^(submit|button|image|reset|checkbox|radio)$/i.test(attr(target, 'type'));
       var keyboardActivation = verb === 'press' && activationKey && (target.tagName === 'BUTTON' || actionInput || !!link || /button|menuitem/.test(attr(target, 'role')));
-      var unknownShortcut = verb === 'press' && !/^(Tab|Escape|Esc|ArrowUp|ArrowDown|ArrowLeft|ArrowRight|Home|End|PageUp|PageDown|Enter|Return| |Space|Spacebar)$/i.test(key) && (args.modifiers && args.modifiers.length || /^(Delete|Backspace)$/i.test(key));
+      var unknownShortcut = verb === 'press' && !/^(Tab|Escape|Esc|ArrowUp|ArrowDown|ArrowLeft|ArrowRight|Home|End|PageUp|PageDown|Enter|Return| |Space|Spacebar)$/i.test(key) && (hasKeyModifiers || /^(Delete|Backspace)$/i.test(key));
       var clickable = target.tagName === 'BUTTON' || actionInput || /button|menuitem/.test(attr(target, 'role')) || !!link || target.tagName === 'FORM' || ((keyboardCommit || typeSubmit) && !!form) || composerKey || keyboardActivation;
       var isCommit = verb === 'submit' || verb === 'check' || verb === 'select' || keyboardCommit || typeSubmit || keyboardActivation || (verb === 'click' || verb === 'clickAt');
       var personal = fields.some(function (f) { return /^(email|tel|text|number|date)$/i.test(f.type || 'text') && /name|email|phone|address|birth|title|postcode|zip|personal/i.test((f.name || '') + ' ' + (f.label || '')); });
@@ -153,17 +176,21 @@ enum GuardPage {
         fingerprint: JSON.stringify({documentId:docId, url:doc.location.href, fields:fields, surrounding:surrounding})
       };
       var label = subject || (valueIsLabel ? control.value : '') || verb;
+      if (verb === 'drag') label = 'drag ' + (dragStart ? dragStart.join(',') : (subject || rawText(target) || describeTarget(target))) + ' to ' +
+        (dragTarget ? (rawText(dragTarget) || describeTarget(dragTarget)) : dragPoint.join(','));
       if (label.length > 500) return { error: 'action label is too large to inspect safely', code: 'EVIDENCE_TOO_LARGE' };
       var summary = categories.length ? (label + ' on ' + ((new URL(doc.location.href)).host)) : '';
       var destinationHost = '';
       try { destinationHost = destination ? new URL(destination, doc.location.href).host : ''; } catch (e) {}
-      var details = categories.length ? [formId && formId.fields.length ? 'Fields: ' + shownFields.map(function (f) { return f.label + (f.value ? ' = ' + f.value : ''); }).join(', ') : '', destinationHost ? 'Destination: ' + destinationHost : '', subject ? 'Control: ' + redact(subject) : ''].filter(Boolean).join('. ') : '';
+      var details = categories.length ? [verb === 'drag' ? 'From: ' + redact(dragStart ? dragStart.join(',') : rawText(target) || describeTarget(target)) + '. To: ' + redact(dragTarget ? rawText(dragTarget) || describeTarget(dragTarget) : dragPoint.join(',')) : '', formId && formId.fields.length ? 'Fields: ' + shownFields.map(function (f) { return f.label + (f.value ? ' = ' + f.value : ''); }).join(', ') : '', destinationHost ? 'Destination: ' + destinationHost : '', subject ? 'Control: ' + redact(subject) : ''].filter(Boolean).join('. ') : '';
       if (categories.length && !sensitive && surrounding) details += '\nPage context: ' + surrounding;
       if (details.length > 8000) return { error: 'page evidence is too large to inspect safely', code: 'EVIDENCE_TOO_LARGE' };
-      var fingerprint = JSON.stringify({ surrounding: surrounding, url: doc.location.href, documentId: docId, target: tgt, form: formId, destination: destination, text: rawText(target), action: op, key: key, modifiers: args.modifiers || [], payload: { text: args.text, values: args.values, on: args.on, x: args.x, y: args.y, at: args.at, button: args.button, double: args.double } });
+      var fingerprint = JSON.stringify({ surrounding: surrounding, url: doc.location.href, documentId: docId, target: tgt, form: formId, destination: destination, dragFrom: dragStart || identity(target), dragTo: dragTarget ? identity(dragTarget) : dragPoint, dragPath: args.path || [], text: rawText(target), action: op, key: key, modifiers: args.modifiers || [], payload: { text: args.text, values: args.values, on: args.on, x: args.x, y: args.y, at: args.at, button: args.button, double: args.double } });
       var out = { categories: categories, summary: summary, details: details, actionLabel: label, fingerprint: fingerprint, sensitive: sensitive, url: doc.location.href };
       if (target.__driveRef && target.__driveRef.ref) out.targetRef = target.__driveRef.ref;
       return out;
+
+      function describeTarget(el) { return el.tagName.toLowerCase() + (el.id ? '#' + el.id : ''); }
     }
     """#
 }
